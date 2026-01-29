@@ -1,5 +1,7 @@
 Godot_v4.6-stable_linux.x86_64
 /simulation
+/Genesis
+/models
 
 # Python
 __pycache__/
