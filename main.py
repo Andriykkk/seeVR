@@ -307,6 +307,97 @@ class Scene:
 scene = Scene()
 
 
+class Camera:
+    """First-person camera with WASD + mouse look"""
+
+    def __init__(self, position=(0, 5, 15), yaw=-90.0, pitch=-15.0):
+        self.pos = list(position)
+        self.yaw = yaw
+        self.pitch = pitch
+        self.speed = 10.0
+        self.sensitivity = 0.5
+        self._last_mouse = None
+
+        # Computed vectors
+        self.direction = [0, 0, -1]
+        self.right = [1, 0, 0]
+        self.up = [0, 1, 0]
+        self._update_vectors()
+
+    def _update_vectors(self):
+        rad_yaw = math.radians(self.yaw)
+        rad_pitch = math.radians(self.pitch)
+
+        # Direction
+        self.direction = [
+            math.cos(rad_pitch) * math.cos(rad_yaw),
+            math.sin(rad_pitch),
+            math.cos(rad_pitch) * math.sin(rad_yaw)
+        ]
+        length = math.sqrt(sum(x * x for x in self.direction))
+        self.direction = [x / length for x in self.direction]
+
+        # Right (cross product with world up)
+        world_up = [0, 1, 0]
+        self.right = [
+            self.direction[1] * world_up[2] - self.direction[2] * world_up[1],
+            self.direction[2] * world_up[0] - self.direction[0] * world_up[2],
+            self.direction[0] * world_up[1] - self.direction[1] * world_up[0]
+        ]
+        length = math.sqrt(sum(x * x for x in self.right))
+        self.right = [x / length for x in self.right]
+
+        # Up (cross product of right and direction)
+        self.up = [
+            self.right[1] * self.direction[2] - self.right[2] * self.direction[1],
+            self.right[2] * self.direction[0] - self.right[0] * self.direction[2],
+            self.right[0] * self.direction[1] - self.right[1] * self.direction[0]
+        ]
+
+    def handle_input(self, window, dt):
+        # Keyboard movement
+        if window.is_pressed('w'):
+            rad_yaw = math.radians(self.yaw)
+            self.pos[0] += math.cos(rad_yaw) * self.speed * dt
+            self.pos[2] += math.sin(rad_yaw) * self.speed * dt
+        if window.is_pressed('s'):
+            rad_yaw = math.radians(self.yaw)
+            self.pos[0] -= math.cos(rad_yaw) * self.speed * dt
+            self.pos[2] -= math.sin(rad_yaw) * self.speed * dt
+        if window.is_pressed('a'):
+            rad_yaw = math.radians(self.yaw - 90)
+            self.pos[0] += math.cos(rad_yaw) * self.speed * dt
+            self.pos[2] += math.sin(rad_yaw) * self.speed * dt
+        if window.is_pressed('d'):
+            rad_yaw = math.radians(self.yaw + 90)
+            self.pos[0] += math.cos(rad_yaw) * self.speed * dt
+            self.pos[2] += math.sin(rad_yaw) * self.speed * dt
+        if window.is_pressed(ti.ui.SPACE):
+            self.pos[1] += self.speed * dt
+        if window.is_pressed(ti.ui.SHIFT):
+            self.pos[1] -= self.speed * dt
+
+        # Mouse look (right-click drag)
+        curr_mouse = window.get_cursor_pos()
+        if window.is_pressed(ti.ui.RMB) and self._last_mouse is not None:
+            dx = (curr_mouse[0] - self._last_mouse[0]) * 200
+            dy = (curr_mouse[1] - self._last_mouse[1]) * 200
+            self.yaw += dx * self.sensitivity
+            self.pitch = max(-89, min(89, self.pitch + dy * self.sensitivity))
+        self._last_mouse = curr_mouse
+
+        self._update_vectors()
+
+    def apply_to_ti_camera(self, ti_camera):
+        """Apply position/rotation to Taichi UI camera for rasterization"""
+        ti_camera.position(self.pos[0], self.pos[1], self.pos[2])
+        ti_camera.lookat(
+            self.pos[0] + self.direction[0],
+            self.pos[1] + self.direction[1],
+            self.pos[2] + self.direction[2]
+        )
+
+
 @ti.kernel
 def update_physics(dt: ti.f32):
     for i in range(scene.num_vertices[None]):
@@ -458,101 +549,28 @@ def main():
     window = ti.ui.Window("Taichi Scene", (WIDTH, HEIGHT), vsync=True)
     canvas = window.get_canvas()
     ti_scene = ti.ui.Scene()
-    camera = ti.ui.Camera()
+    ti_camera = ti.ui.Camera()
 
-    camera.position(0, 5, 15)
-    camera.lookat(0, 0, 0)
-    camera.up(0, 1, 0)
-
-    camera_pos = [0.0, 5.0, 15.0]
-    camera_yaw = -90.0
-    camera_pitch = -15.0
-    camera_speed = 10.0
-    mouse_sensitivity = 0.5
-    last_mouse_pos = None
+    camera = Camera(position=(0, 5, 15), yaw=-90, pitch=-15)
 
     while window.running:
         dt = 1.0 / 60.0
 
-        # Keyboard
-        if window.is_pressed('w'):
-            rad_yaw = math.radians(camera_yaw)
-            camera_pos[0] += math.cos(rad_yaw) * camera_speed * dt
-            camera_pos[2] += math.sin(rad_yaw) * camera_speed * dt
-        if window.is_pressed('s'):
-            rad_yaw = math.radians(camera_yaw)
-            camera_pos[0] -= math.cos(rad_yaw) * camera_speed * dt
-            camera_pos[2] -= math.sin(rad_yaw) * camera_speed * dt
-        if window.is_pressed('a'):
-            rad_yaw = math.radians(camera_yaw - 90)
-            camera_pos[0] += math.cos(rad_yaw) * camera_speed * dt
-            camera_pos[2] += math.sin(rad_yaw) * camera_speed * dt
-        if window.is_pressed('d'):
-            rad_yaw = math.radians(camera_yaw + 90)
-            camera_pos[0] += math.cos(rad_yaw) * camera_speed * dt
-            camera_pos[2] += math.sin(rad_yaw) * camera_speed * dt
-        if window.is_pressed(ti.ui.SPACE):
-            camera_pos[1] += camera_speed * dt
-        if window.is_pressed(ti.ui.SHIFT):
-            camera_pos[1] -= camera_speed * dt
-
-        # Mouse
-        curr_mouse = window.get_cursor_pos()
-        if window.is_pressed(ti.ui.RMB) and last_mouse_pos is not None:
-            dx = (curr_mouse[0] - last_mouse_pos[0]) * 200
-            dy = (curr_mouse[1] - last_mouse_pos[1]) * 200
-            camera_yaw += dx * mouse_sensitivity
-            camera_pitch = max(-89, min(89, camera_pitch + dy * mouse_sensitivity))
-        last_mouse_pos = curr_mouse
-
-        # Camera vectors
-        rad_yaw = math.radians(camera_yaw)
-        rad_pitch = math.radians(camera_pitch)
-
-        cam_dir = [
-            math.cos(rad_pitch) * math.cos(rad_yaw),
-            math.sin(rad_pitch),
-            math.cos(rad_pitch) * math.sin(rad_yaw)
-        ]
-        length = math.sqrt(sum(x * x for x in cam_dir))
-        cam_dir = [x / length for x in cam_dir]
-
-        world_up = [0, 1, 0]
-        cam_right = [
-            cam_dir[1] * world_up[2] - cam_dir[2] * world_up[1],
-            cam_dir[2] * world_up[0] - cam_dir[0] * world_up[2],
-            cam_dir[0] * world_up[1] - cam_dir[1] * world_up[0]
-        ]
-        length = math.sqrt(sum(x * x for x in cam_right))
-        cam_right = [x / length for x in cam_right]
-
-        cam_up = [
-            cam_right[1] * cam_dir[2] - cam_right[2] * cam_dir[1],
-            cam_right[2] * cam_dir[0] - cam_right[0] * cam_dir[2],
-            cam_right[0] * cam_dir[1] - cam_right[1] * cam_dir[0]
-        ]
-
-        # Physics
+        camera.handle_input(window, dt)
         update_physics(dt)
 
-        # Render
         if use_raytracing:
             raytrace(
-                camera_pos[0], camera_pos[1], camera_pos[2],
-                cam_dir[0], cam_dir[1], cam_dir[2],
-                cam_right[0], cam_right[1], cam_right[2],
-                cam_up[0], cam_up[1], cam_up[2]
+                camera.pos[0], camera.pos[1], camera.pos[2],
+                camera.direction[0], camera.direction[1], camera.direction[2],
+                camera.right[0], camera.right[1], camera.right[2],
+                camera.up[0], camera.up[1], camera.up[2]
             )
             canvas.set_image(scene.pixels)
         else:
-            look_x = camera_pos[0] + cam_dir[0]
-            look_y = camera_pos[1] + cam_dir[1]
-            look_z = camera_pos[2] + cam_dir[2]
+            camera.apply_to_ti_camera(ti_camera)
 
-            camera.position(camera_pos[0], camera_pos[1], camera_pos[2])
-            camera.lookat(look_x, look_y, look_z)
-
-            ti_scene.set_camera(camera)
+            ti_scene.set_camera(ti_camera)
             ti_scene.ambient_light((0.2, 0.2, 0.2))
             ti_scene.point_light(pos=(10, 10, 10), color=(1, 1, 1))
 
