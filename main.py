@@ -2,6 +2,7 @@ import taichi as ti
 import random
 import math
 import argparse
+from benchmark import benchmark, enable_benchmark, is_enabled_benchmark
 
 ti.init(arch=ti.gpu)
 
@@ -38,6 +39,7 @@ class Scene:
         self._vertex_count = 0
         self._triangle_count = 0
 
+    @benchmark
     def add_sphere(self, center, radius, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0), segments=16):
         """Add a UV sphere as triangles"""
         cx, cy, cz = center
@@ -94,6 +96,7 @@ class Scene:
         self.object_starts.append((start_vertex, self._vertex_count - start_vertex))
         return len(self.object_starts) - 1
 
+    @benchmark
     def add_box(self, center, size, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0)):
         """Add a box as 12 triangles"""
         cx, cy, cz = center
@@ -142,6 +145,7 @@ class Scene:
         self.object_starts.append((start_vertex, self._vertex_count - start_vertex))
         return len(self.object_starts) - 1
 
+    @benchmark
     def add_plane(self, center, normal, size, color=(0.5, 0.5, 0.5)):
         """Add a plane as 2 triangles"""
         nx, ny, nz = normal
@@ -196,6 +200,7 @@ class Scene:
         self.num_vertices[None] = self._vertex_count
         self.num_triangles[None] = self._triangle_count
 
+    @benchmark
     def add_mesh_from_obj(self, filename, center=(0, 0, 0), size=1.0, rotation=(0, 0, 0), color=(1.0, 1.0, 1.0), velocity=(0, 0, 0)):
         """Load mesh from OBJ file, scaled to fit within given size
 
@@ -354,6 +359,7 @@ class Camera:
             self.right[0] * self.direction[1] - self.right[1] * self.direction[0]
         ]
 
+    @benchmark
     def handle_input(self, window, dt):
         # Keyboard movement
         if window.is_pressed('w'):
@@ -481,6 +487,43 @@ def raytrace(cam_pos_x: ti.f32, cam_pos_y: ti.f32, cam_pos_z: ti.f32,
             scene.pixels[i, j] = ti.Vector([0.1, 0.1, 0.15])
 
 
+# Benchmarked wrappers for kernels (ti.sync() needed for accurate GPU timing)
+@benchmark
+def run_physics(dt):
+    update_physics(dt)
+    if is_enabled_benchmark():
+        ti.sync()
+
+
+@benchmark
+def run_raytrace(cam):
+    raytrace(
+        cam.pos[0], cam.pos[1], cam.pos[2],
+        cam.direction[0], cam.direction[1], cam.direction[2],
+        cam.right[0], cam.right[1], cam.right[2],
+        cam.up[0], cam.up[1], cam.up[2]
+    )
+    if is_enabled_benchmark():
+        ti.sync()
+
+
+@benchmark
+def run_rasterize(ti_scene, ti_camera, canvas, cam):
+    cam.apply_to_ti_camera(ti_camera)
+    ti_scene.set_camera(ti_camera)
+    ti_scene.ambient_light((0.2, 0.2, 0.2))
+    ti_scene.point_light(pos=(10, 10, 10), color=(1, 1, 1))
+    ti_scene.mesh(
+        scene.vertices,
+        indices=scene.indices,
+        per_vertex_color=scene.vertex_colors,
+        two_sided=True
+    )
+    canvas.scene(ti_scene)
+    if is_enabled_benchmark():
+        ti.sync()
+
+
 def create_demo_scene():
     """Create demo scene - dragon inside a room"""
     room_size = 10
@@ -557,31 +600,13 @@ def main():
         dt = 1.0 / 60.0
 
         camera.handle_input(window, dt)
-        update_physics(dt)
+        run_physics(dt)
 
         if use_raytracing:
-            raytrace(
-                camera.pos[0], camera.pos[1], camera.pos[2],
-                camera.direction[0], camera.direction[1], camera.direction[2],
-                camera.right[0], camera.right[1], camera.right[2],
-                camera.up[0], camera.up[1], camera.up[2]
-            )
+            run_raytrace(camera)
             canvas.set_image(scene.pixels)
         else:
-            camera.apply_to_ti_camera(ti_camera)
-
-            ti_scene.set_camera(ti_camera)
-            ti_scene.ambient_light((0.2, 0.2, 0.2))
-            ti_scene.point_light(pos=(10, 10, 10), color=(1, 1, 1))
-
-            ti_scene.mesh(
-                scene.vertices,
-                indices=scene.indices,
-                per_vertex_color=scene.vertex_colors,
-                two_sided=True
-            )
-
-            canvas.scene(ti_scene)
+            run_rasterize(ti_scene, ti_camera, canvas, camera)
 
         window.show()
 
