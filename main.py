@@ -1,8 +1,7 @@
 import taichi as ti
-import random
 import math
 import argparse
-from benchmark import benchmark, enable_benchmark, is_enabled_benchmark
+from benchmark import benchmark, is_enabled_benchmark
 
 ti.init(arch=ti.gpu)
 
@@ -11,9 +10,14 @@ MAX_TRIANGLES = 500000
 MAX_VERTICES = 500000
 WIDTH, HEIGHT = 800, 600
 
-# Path tracing settings
-MAX_BOUNCES = 4          # How many times light can bounce
-SAMPLES_PER_PIXEL = 4    # Rays per pixel per frame (increase for quality, decrease for speed)
+# Path tracing settings (can be changed at runtime via GUI)
+class Settings:
+    def __init__(self):
+        self.max_bounces = 4
+        self.samples_per_pixel = 4
+        self.sky_intensity = 1.0
+
+settings = Settings()
 
 
 class Scene:
@@ -511,9 +515,10 @@ def trace_scene(ray_o, ray_d):
 
 # Sky color (simple gradient)
 @ti.func
-def sky_color(ray_d):
+def sky_color(ray_d, intensity: ti.f32):
     t = 0.5 * (ray_d[1] + 1.0)
-    return (1.0 - t) * ti.Vector([1.0, 1.0, 1.0]) + t * ti.Vector([0.5, 0.7, 1.0])
+    base = (1.0 - t) * ti.Vector([1.0, 1.0, 1.0]) + t * ti.Vector([0.5, 0.7, 1.0])
+    return base * intensity
 
 
 @ti.kernel
@@ -521,7 +526,8 @@ def raytrace(cam_pos_x: ti.f32, cam_pos_y: ti.f32, cam_pos_z: ti.f32,
              cam_dir_x: ti.f32, cam_dir_y: ti.f32, cam_dir_z: ti.f32,
              cam_right_x: ti.f32, cam_right_y: ti.f32, cam_right_z: ti.f32,
              cam_up_x: ti.f32, cam_up_y: ti.f32, cam_up_z: ti.f32,
-             frame: ti.i32):
+             frame: ti.i32, max_bounces: ti.i32, samples_per_pixel: ti.i32,
+             sky_intensity: ti.f32):
     cam_pos = ti.Vector([cam_pos_x, cam_pos_y, cam_pos_z])
     cam_dir = ti.Vector([cam_dir_x, cam_dir_y, cam_dir_z])
     cam_right = ti.Vector([cam_right_x, cam_right_y, cam_right_z])
@@ -535,7 +541,7 @@ def raytrace(cam_pos_x: ti.f32, cam_pos_y: ti.f32, cam_pos_z: ti.f32,
         pixel_color = ti.Vector([0.0, 0.0, 0.0])
 
         # Multiple samples per pixel
-        for sample in range(SAMPLES_PER_PIXEL):
+        for sample in range(samples_per_pixel):
             # Random seed based on pixel, frame, and sample
             seed = ti.cast(i + j * WIDTH + frame * WIDTH * HEIGHT + sample * 12345, ti.u32)
 
@@ -553,12 +559,12 @@ def raytrace(cam_pos_x: ti.f32, cam_pos_y: ti.f32, cam_pos_z: ti.f32,
             throughput = ti.Vector([1.0, 1.0, 1.0])
             color = ti.Vector([0.0, 0.0, 0.0])
 
-            for bounce in range(MAX_BOUNCES):
+            for bounce in range(max_bounces):
                 hit, t, normal, albedo = trace_scene(ray_pos, ray_dir)
 
                 if not hit:
                     # Hit sky - add sky contribution
-                    color += throughput * sky_color(ray_dir)
+                    color += throughput * sky_color(ray_dir, sky_intensity)
                     break
 
                 # Move to hit point
@@ -582,7 +588,7 @@ def raytrace(cam_pos_x: ti.f32, cam_pos_y: ti.f32, cam_pos_z: ti.f32,
 
             pixel_color += color
 
-        pixel_color /= ti.cast(SAMPLES_PER_PIXEL, ti.f32)
+        pixel_color /= ti.cast(samples_per_pixel, ti.f32)
         scene.pixels[i, j] = pixel_color
 
 
@@ -601,7 +607,10 @@ def run_raytrace(cam, frame):
         cam.direction[0], cam.direction[1], cam.direction[2],
         cam.right[0], cam.right[1], cam.right[2],
         cam.up[0], cam.up[1], cam.up[2],
-        frame
+        frame,
+        settings.max_bounces,
+        settings.samples_per_pixel,
+        settings.sky_intensity
     )
     if is_enabled_benchmark():
         ti.sync()
@@ -691,7 +700,7 @@ def main():
 
     window = ti.ui.Window("Taichi Scene", (WIDTH, HEIGHT), vsync=True)
     canvas = window.get_canvas()
-    ti_scene = ti.ui.Scene()
+    ti_scene = window.get_scene()
     ti_camera = ti.ui.Camera()
 
     camera = Camera(position=(0, 5, 15), yaw=-90, pitch=-15)
@@ -708,6 +717,14 @@ def main():
             canvas.set_image(scene.pixels)
         else:
             run_rasterize(ti_scene, ti_camera, canvas, camera)
+
+        # GUI panel
+        gui = window.get_gui()
+        gui.begin("Settings", 0.02, 0.02, 0.3, 0.25)
+        settings.max_bounces = gui.slider_int("Bounces", settings.max_bounces, 1, 16)
+        settings.samples_per_pixel = gui.slider_int("Samples", settings.samples_per_pixel, 1, 64)
+        settings.sky_intensity = gui.slider_float("Sky", settings.sky_intensity, 0.0, 3.0)
+        gui.end()
 
         frame += 1
         window.show()
