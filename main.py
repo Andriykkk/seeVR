@@ -714,6 +714,31 @@ def intersect_aabb(ray_o, ray_d, bmin, bmax, closest_t):
 
 
 @ti.func
+def trace_brute(ray_o, ray_d):
+    """Brute force - test all triangles"""
+    closest_t = ti.f32(1e10)
+    hit_normal = ti.Vector([0.0, 1.0, 0.0])
+    hit_color = ti.Vector([0.0, 0.0, 0.0])
+    hit = False
+
+    for k in range(scene.num_triangles[None]):
+        idx = k * 3
+        v0 = scene.vertices[scene.indices[idx]]
+        v1 = scene.vertices[scene.indices[idx + 1]]
+        v2 = scene.vertices[scene.indices[idx + 2]]
+        t = ray_triangle_intersect(ray_o, ray_d, v0, v1, v2)
+        if 0.001 < t < closest_t:
+            closest_t = t
+            hit_normal = get_triangle_normal(v0, v1, v2)
+            if hit_normal.dot(ray_d) > 0:
+                hit_normal = -hit_normal
+            hit_color = scene.vertex_colors[scene.indices[idx]]
+            hit = True
+
+    return hit, closest_t, hit_normal, hit_color
+
+
+@ti.func
 def trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
     """Trace ray through BVH with local stack"""
     closest_t = ti.f32(1e10)
@@ -726,26 +751,24 @@ def trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
     stack[0, 0] = 0  # Start with root
     stack_ptr = 1
 
-    for _iter in range(1000):
+    for _iter in range(64):  # BVH depth ~log2(n), 64 is plenty
         if stack_ptr <= 0:
             break
 
         stack_ptr -= 1
         node_idx = stack[0, stack_ptr]
+        node = scene.bvh_nodes[node_idx]
 
-        node_min = scene.bvh_nodes[node_idx].aabb_min
-        node_max = scene.bvh_nodes[node_idx].aabb_max
-
-        if not intersect_aabb(ray_o, ray_d, node_min, node_max, closest_t):
+        if not intersect_aabb(ray_o, ray_d, node.aabb_min, node.aabb_max, closest_t):
             continue
 
-        tri_count = ti.cast(scene.bvh_nodes[node_idx].tri_count, ti.i32)
+        tri_count = ti.cast(node.tri_count, ti.i32)
+        left_first = ti.cast(node.left_first, ti.i32)
 
         if tri_count > 0:
             # Leaf - test triangles
-            first_tri = ti.cast(scene.bvh_nodes[node_idx].left_first, ti.i32)
             for i in range(tri_count):
-                tri_idx = scene.bvh_prim_indices[first_tri + i]
+                tri_idx = scene.bvh_prim_indices[left_first + i]
                 idx = tri_idx * 3
                 v0 = scene.vertices[scene.indices[idx]]
                 v1 = scene.vertices[scene.indices[idx + 1]]
@@ -761,10 +784,9 @@ def trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
                     hit = True
         else:
             # Interior - push children
-            left = ti.cast(scene.bvh_nodes[node_idx].left_first, ti.i32)
-            stack[0, stack_ptr] = left
+            stack[0, stack_ptr] = left_first
             stack_ptr += 1
-            stack[0, stack_ptr] = left + 1
+            stack[0, stack_ptr] = left_first + 1
             stack_ptr += 1
 
     return hit, closest_t, hit_normal, hit_color
