@@ -2,6 +2,8 @@ import taichi as ti
 import math
 import argparse
 import time
+import numpy as np
+from numba import njit
 from benchmark import benchmark, is_enabled_benchmark
 
 ti.init(arch=ti.gpu)
@@ -355,87 +357,138 @@ class Scene:
         self.bvh_built = True
 
     def _build_bvh_cpu(self, n):
-        """Build BVH on CPU (deterministic)"""
-        import numpy as np
-
-        # Copy data to numpy for CPU processing
+        """Build BVH on CPU using Numba for speed"""
+        # Copy data to numpy
         centroids = self.tri_centroids.to_numpy()[:n]
-        prim_indices = list(range(n))  # Local list for partitioning
+        vertices = self.vertices.to_numpy()[:self._vertex_count]
+        indices = self.indices.to_numpy()[:n * 3]
 
-        # Initialize root
-        self.bvh_nodes[0].left_first = 0
-        self.bvh_nodes[0].tri_count = n
-        self.num_bvh_nodes[None] = 1
+        # Allocate output arrays
+        max_nodes = n * 2
+        node_aabb_min = np.zeros((max_nodes, 3), dtype=np.float32)
+        node_aabb_max = np.zeros((max_nodes, 3), dtype=np.float32)
+        node_left_first = np.zeros(max_nodes, dtype=np.uint32)
+        node_tri_count = np.zeros(max_nodes, dtype=np.uint32)
+        prim_indices = np.arange(n, dtype=np.int32)
 
-        # Stack for iterative build: (node_idx, first, count)
-        stack = [(0, 0, n)]
-        nodes_used = 1
+        # Run njit-compiled build
+        nodes_used = _build_bvh_njit(
+            n, centroids, vertices, indices,
+            node_aabb_min, node_aabb_max, node_left_first, node_tri_count,
+            prim_indices
+        )
 
-        while stack:
-            node_idx, first, count = stack.pop()
+        # Copy results back to Taichi fields
+        for i in range(nodes_used):
+            self.bvh_nodes[i].aabb_min = node_aabb_min[i].tolist()
+            self.bvh_nodes[i].aabb_max = node_aabb_max[i].tolist()
+            self.bvh_nodes[i].left_first = int(node_left_first[i])
+            self.bvh_nodes[i].tri_count = int(node_tri_count[i])
 
-            # Calculate bounds
-            aabb_min = np.array([1e30, 1e30, 1e30])
-            aabb_max = np.array([-1e30, -1e30, -1e30])
-            for i in range(first, first + count):
-                tri_idx = prim_indices[i]
-                c = centroids[tri_idx]
-                # Get actual triangle vertices for bounds
-                idx = tri_idx * 3
-                for vi in range(3):
-                    v = self.vertices[self.indices[idx + vi]]
-                    aabb_min = np.minimum(aabb_min, [v[0], v[1], v[2]])
-                    aabb_max = np.maximum(aabb_max, [v[0], v[1], v[2]])
-
-            self.bvh_nodes[node_idx].aabb_min = aabb_min.tolist()
-            self.bvh_nodes[node_idx].aabb_max = aabb_max.tolist()
-
-            # Leaf if <= 10 triangles
-            if count <= 10:
-                self.bvh_nodes[node_idx].left_first = first
-                self.bvh_nodes[node_idx].tri_count = count
-                # Write prim_indices to GPU field
-                for i in range(count):
-                    self.bvh_prim_indices[first + i] = prim_indices[first + i]
-                continue
-
-            # Find split axis (longest extent)
-            extent = aabb_max - aabb_min
-            axis = int(np.argmax(extent))
-            split_pos = aabb_min[axis] + extent[axis] * 0.5
-
-            # Partition
-            i, j = first, first + count - 1
-            while i <= j:
-                if centroids[prim_indices[i]][axis] < split_pos:
-                    i += 1
-                else:
-                    prim_indices[i], prim_indices[j] = prim_indices[j], prim_indices[i]
-                    j -= 1
-
-            left_count = i - first
-            if left_count == 0 or left_count == count:
-                # Degenerate - keep as leaf
-                self.bvh_nodes[node_idx].left_first = first
-                self.bvh_nodes[node_idx].tri_count = count
-                for i in range(count):
-                    self.bvh_prim_indices[first + i] = prim_indices[first + i]
-                continue
-
-            # Create children
-            left_idx = nodes_used
-            right_idx = nodes_used + 1
-            nodes_used += 2
-
-            # Mark parent as interior (tri_count=0 means left_first is left child)
-            self.bvh_nodes[node_idx].left_first = left_idx
-            self.bvh_nodes[node_idx].tri_count = 0
-
-            # Push children to stack
-            stack.append((right_idx, i, count - left_count))
-            stack.append((left_idx, first, left_count))
+        for i in range(n):
+            self.bvh_prim_indices[i] = int(prim_indices[i])
 
         self.num_bvh_nodes[None] = nodes_used
+
+
+@njit(cache=True)
+def _build_bvh_njit(n, centroids, vertices, indices,
+                    node_aabb_min, node_aabb_max, node_left_first, node_tri_count,
+                    prim_indices):
+    """Numba-compiled BVH build - 10-50x faster than pure Python"""
+    # Initialize root
+    node_left_first[0] = 0
+    node_tri_count[0] = n
+
+    # Stack for iterative build (pre-allocated)
+    stack_node = np.zeros(64, dtype=np.int32)
+    stack_first = np.zeros(64, dtype=np.int32)
+    stack_count = np.zeros(64, dtype=np.int32)
+    stack_ptr = 1
+    stack_node[0] = 0
+    stack_first[0] = 0
+    stack_count[0] = n
+    nodes_used = 1
+
+    while stack_ptr > 0:
+        stack_ptr -= 1
+        node_idx = stack_node[stack_ptr]
+        first = stack_first[stack_ptr]
+        count = stack_count[stack_ptr]
+
+        # Calculate bounds
+        aabb_min = np.array([1e30, 1e30, 1e30], dtype=np.float32)
+        aabb_max = np.array([-1e30, -1e30, -1e30], dtype=np.float32)
+        for i in range(first, first + count):
+            tri_idx = prim_indices[i]
+            idx = tri_idx * 3
+            for vi in range(3):
+                v_idx = indices[idx + vi]
+                for k in range(3):
+                    val = vertices[v_idx, k]
+                    if val < aabb_min[k]:
+                        aabb_min[k] = val
+                    if val > aabb_max[k]:
+                        aabb_max[k] = val
+
+        node_aabb_min[node_idx] = aabb_min
+        node_aabb_max[node_idx] = aabb_max
+
+        # Leaf if <= 10 triangles
+        if count <= 10:
+            node_left_first[node_idx] = first
+            node_tri_count[node_idx] = count
+            continue
+
+        # Find split axis (longest extent)
+        extent = aabb_max - aabb_min
+        axis = 0
+        if extent[1] > extent[0]:
+            axis = 1
+        if extent[2] > extent[axis]:
+            axis = 2
+        split_pos = aabb_min[axis] + extent[axis] * 0.5
+
+        # Partition
+        i = first
+        j = first + count - 1
+        while i <= j:
+            if centroids[prim_indices[i], axis] < split_pos:
+                i += 1
+            else:
+                tmp = prim_indices[i]
+                prim_indices[i] = prim_indices[j]
+                prim_indices[j] = tmp
+                j -= 1
+
+        left_count = i - first
+        if left_count == 0 or left_count == count:
+            # Degenerate - keep as leaf
+            node_left_first[node_idx] = first
+            node_tri_count[node_idx] = count
+            continue
+
+        # Create children
+        left_idx = nodes_used
+        right_idx = nodes_used + 1
+        nodes_used += 2
+
+        # Mark parent as interior
+        node_left_first[node_idx] = left_idx
+        node_tri_count[node_idx] = 0
+
+        # Push children to stack
+        stack_node[stack_ptr] = right_idx
+        stack_first[stack_ptr] = i
+        stack_count[stack_ptr] = count - left_count
+        stack_ptr += 1
+
+        stack_node[stack_ptr] = left_idx
+        stack_first[stack_ptr] = first
+        stack_count[stack_ptr] = left_count
+        stack_ptr += 1
+
+    return nodes_used
 
 scene = Scene()
 
