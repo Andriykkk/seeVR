@@ -8,13 +8,23 @@ ti.init(arch=ti.gpu)
 # Constants
 MAX_TRIANGLES = 500000
 MAX_VERTICES = 500000
+MAX_BVH_NODES = MAX_TRIANGLES * 2  # BVH needs at most 2N-1 nodes for N triangles
 WIDTH, HEIGHT = 800, 600
+
+# BVH Node structure (compact layout)
+BVHNode = ti.types.struct(
+    aabb_min=ti.types.vector(3, ti.f32),
+    aabb_max=ti.types.vector(3, ti.f32),
+    left_child=ti.u32,      # Left child index (right is left_child + 1)
+    first_prim=ti.u32,      # First triangle index (for leaves)
+    prim_count=ti.u32,      # Triangle count (>0 means leaf)
+)
 
 # Path tracing settings (can be changed at runtime via GUI)
 class Settings:
     def __init__(self):
-        self.max_bounces = 4
-        self.samples_per_pixel = 4
+        self.max_bounces = 2
+        self.samples_per_pixel = 2
         self.sky_intensity = 1.0
 
 settings = Settings()
@@ -39,6 +49,13 @@ class Scene:
 
         # Pixel buffer for ray tracing
         self.pixels = ti.Vector.field(3, dtype=ti.f32, shape=(WIDTH, HEIGHT))
+
+        # BVH
+        self.bvh_nodes = BVHNode.field(shape=MAX_BVH_NODES)
+        self.bvh_prim_indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)  # Reordered triangle indices
+        self.tri_centroids = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIANGLES)  # Triangle centroids
+        self.num_bvh_nodes = ti.field(dtype=ti.i32, shape=())
+        self.bvh_built = False
 
         # Initialize counts
         self.num_vertices[None] = 0
@@ -316,6 +333,127 @@ class Scene:
         self.num_vertices[None] = 0
         self.num_triangles[None] = 0
         self.object_starts.clear()
+        self.bvh_built = False
+
+    @benchmark
+    def build_bvh(self):
+        """Build BVH acceleration structure"""
+        n = self._triangle_count
+        if n == 0:
+            return
+
+        # Calculate centroids for all triangles
+        for i in range(n):
+            idx = i * 3
+            v0 = self.vertices[self.indices[idx]]
+            v1 = self.vertices[self.indices[idx + 1]]
+            v2 = self.vertices[self.indices[idx + 2]]
+            self.tri_centroids[i] = (v0 + v1 + v2) * 0.3333
+            self.bvh_prim_indices[i] = i
+
+        # Assign all triangles to root node
+        self.num_bvh_nodes[None] = 1
+        root = self.bvh_nodes[0]
+        root.left_child = 0
+        root.first_prim = 0
+        root.prim_count = n
+        self.bvh_nodes[0] = root
+
+        self._update_node_bounds(0)
+        self._subdivide(0)
+
+        self.bvh_built = True
+        print(f"BVH built: {self.num_bvh_nodes[None]} nodes for {n} triangles")
+
+    def _update_node_bounds(self, node_idx):
+        """Calculate AABB bounds for node"""
+        node = self.bvh_nodes[node_idx]
+        aabb_min = ti.Vector([1e30, 1e30, 1e30])
+        aabb_max = ti.Vector([-1e30, -1e30, -1e30])
+
+        first = node.first_prim
+        for i in range(node.prim_count):
+            tri_idx = self.bvh_prim_indices[first + i]
+            idx = tri_idx * 3
+            v0 = self.vertices[self.indices[idx]]
+            v1 = self.vertices[self.indices[idx + 1]]
+            v2 = self.vertices[self.indices[idx + 2]]
+
+            aabb_min = ti.min(aabb_min, v0)
+            aabb_min = ti.min(aabb_min, v1)
+            aabb_min = ti.min(aabb_min, v2)
+            aabb_max = ti.max(aabb_max, v0)
+            aabb_max = ti.max(aabb_max, v1)
+            aabb_max = ti.max(aabb_max, v2)
+
+        node.aabb_min = aabb_min
+        node.aabb_max = aabb_max
+        self.bvh_nodes[node_idx] = node
+
+    def _subdivide(self, node_idx):
+        """Recursively subdivide node using spatial median split"""
+        node = self.bvh_nodes[node_idx]
+
+        # Terminate recursion if 2 or fewer triangles
+        if node.prim_count <= 2:
+            return
+
+        # Determine split axis (longest extent) and position (midpoint)
+        extent = node.aabb_max - node.aabb_min
+        axis = 0
+        if extent[1] > extent[0]:
+            axis = 1
+        if extent[2] > extent[axis]:
+            axis = 2
+        split_pos = node.aabb_min[axis] + extent[axis] * 0.5
+
+        # In-place partition of prim_indices
+        i = node.first_prim
+        j = i + node.prim_count - 1
+        while i <= j:
+            if self.tri_centroids[self.bvh_prim_indices[i]][axis] < split_pos:
+                i += 1
+            else:
+                # Swap prim_indices[i] and prim_indices[j]
+                tmp = self.bvh_prim_indices[i]
+                self.bvh_prim_indices[i] = self.bvh_prim_indices[j]
+                self.bvh_prim_indices[j] = tmp
+                j -= 1
+
+        # Abort split if one side is empty
+        left_count = i - node.first_prim
+        if left_count == 0 or left_count == node.prim_count:
+            return
+
+        # Create child nodes
+        left_child_idx = self.num_bvh_nodes[None]
+        right_child_idx = self.num_bvh_nodes[None]
+        self.num_bvh_nodes[None] += 2
+
+        # Set up left child
+        left_node = self.bvh_nodes[left_child_idx]
+        left_node.first_prim = node.first_prim
+        left_node.prim_count = left_count
+        self.bvh_nodes[left_child_idx] = left_node
+
+        # Set up right child
+        right_node = self.bvh_nodes[right_child_idx]
+        right_node.first_prim = i
+        right_node.prim_count = node.prim_count - left_count
+        self.bvh_nodes[right_child_idx] = right_node
+
+        # Mark parent as interior node
+        node.left_child = left_child_idx
+        node.prim_count = 0
+        self.bvh_nodes[node_idx] = node
+
+        # Update bounds for children
+        self._update_node_bounds(left_child_idx)
+        self._update_node_bounds(right_child_idx)
+
+        # Recurse
+        self._subdivide(left_child_idx)
+        self._subdivide(right_child_idx)
 
 scene = Scene()
 
@@ -694,6 +832,7 @@ def main():
     use_raytracing = args.raytrace
 
     create_demo_scene()
+    scene.build_bvh()
 
     print(f"Scene: {scene._vertex_count} vertices, {scene._triangle_count} triangles")
     print(f"Rendering: {'Ray Tracing' if use_raytracing else 'Rasterization'}")
