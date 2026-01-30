@@ -8,6 +8,8 @@ MAX_TRIANGLES = 500000
 MAX_VERTICES = 500000
 MAX_BVH_NODES = MAX_TRIANGLES * 2
 WIDTH, HEIGHT = 800, 600
+SAMPLES = 2
+BOUNCES = 2
 
 BVHNode = ti.types.struct(
     aabb_min=ti.types.vector(3, ti.f32),
@@ -92,9 +94,50 @@ def bench_brute(cam_x: ti.f32, cam_y: ti.f32, cam_z: ti.f32,
                 ti.atomic_add(hit_count[None], 1)
 
 
+@ti.func
+def trace_bvh_single(ray_o, ray_d):
+    """Single BVH trace - returns closest_t"""
+    closest_t = ti.f32(1e10)
+    stack = ti.Matrix([[0] * 32], dt=ti.i32)
+    stack[0, 0] = 0
+    stack_ptr = 1
+
+    for _iter in range(64):
+        if stack_ptr <= 0:
+            break
+        stack_ptr -= 1
+        node_idx = stack[0, stack_ptr]
+        node = bvh_nodes[node_idx]
+
+        if not intersect_aabb(ray_o, ray_d, node.aabb_min, node.aabb_max, closest_t):
+            continue
+
+        tri_count = ti.cast(node.tri_count, ti.i32)
+        left_first = ti.cast(node.left_first, ti.i32)
+
+        if tri_count > 0:
+            for k in range(tri_count):
+                tri_idx = bvh_prim_indices[left_first + k]
+                idx = tri_idx * 3
+                v0 = vertices[indices[idx]]
+                v1 = vertices[indices[idx + 1]]
+                v2 = vertices[indices[idx + 2]]
+                t = ray_triangle_intersect(ray_o, ray_d, v0, v1, v2)
+                if 0.001 < t < closest_t:
+                    closest_t = t
+                    ti.atomic_add(hit_count[None], 1)
+        else:
+            stack[0, stack_ptr] = left_first
+            stack_ptr += 1
+            stack[0, stack_ptr] = left_first + 1
+            stack_ptr += 1
+    return closest_t
+
+
 @ti.kernel
 def bench_bvh(cam_x: ti.f32, cam_y: ti.f32, cam_z: ti.f32,
-              dir_x: ti.f32, dir_y: ti.f32, dir_z: ti.f32):
+              dir_x: ti.f32, dir_y: ti.f32, dir_z: ti.f32,
+              samples: ti.i32, bounces: ti.i32):
     cam_pos = ti.Vector([cam_x, cam_y, cam_z])
     cam_dir = ti.Vector([dir_x, dir_y, dir_z])
     cam_right = ti.Vector([1.0, 0.0, 0.0])
@@ -104,44 +147,17 @@ def bench_bvh(cam_x: ti.f32, cam_y: ti.f32, cam_z: ti.f32,
     aspect = float(WIDTH) / float(HEIGHT)
 
     for i, j in ti.ndrange(WIDTH, HEIGHT):
-        u = (2.0 * (float(i) + 0.5) / float(WIDTH) - 1.0) * aspect * fov_scale
-        v = (2.0 * (float(j) + 0.5) / float(HEIGHT) - 1.0) * fov_scale
-        ray_d = (cam_dir + u * cam_right + v * cam_up).normalized()
+        for sample in range(samples):
+            u = (2.0 * (float(i) + 0.5) / float(WIDTH) - 1.0) * aspect * fov_scale
+            v = (2.0 * (float(j) + 0.5) / float(HEIGHT) - 1.0) * fov_scale
+            ray_o = cam_pos
+            ray_d = (cam_dir + u * cam_right + v * cam_up).normalized()
 
-        closest_t = ti.f32(1e10)
-        stack = ti.Matrix([[0] * 32], dt=ti.i32)
-        stack[0, 0] = 0
-        stack_ptr = 1
-
-        for _iter in range(64):
-            if stack_ptr <= 0:
-                break
-            stack_ptr -= 1
-            node_idx = stack[0, stack_ptr]
-            node = bvh_nodes[node_idx]
-
-            if not intersect_aabb(cam_pos, ray_d, node.aabb_min, node.aabb_max, closest_t):
-                continue
-
-            tri_count = ti.cast(node.tri_count, ti.i32)
-            left_first = ti.cast(node.left_first, ti.i32)
-
-            if tri_count > 0:
-                for k in range(tri_count):
-                    tri_idx = bvh_prim_indices[left_first + k]
-                    idx = tri_idx * 3
-                    v0 = vertices[indices[idx]]
-                    v1 = vertices[indices[idx + 1]]
-                    v2 = vertices[indices[idx + 2]]
-                    t = ray_triangle_intersect(cam_pos, ray_d, v0, v1, v2)
-                    if 0.001 < t < closest_t:
-                        closest_t = t
-                        ti.atomic_add(hit_count[None], 1)
-            else:
-                stack[0, stack_ptr] = left_first
-                stack_ptr += 1
-                stack[0, stack_ptr] = left_first + 1
-                stack_ptr += 1
+            for bounce in range(bounces):
+                t = trace_bvh_single(ray_o, ray_d)
+                if t < 1e9:
+                    # Move ray origin to hit point for next bounce
+                    ray_o = ray_o + ray_d * t
 
 
 def load_obj(filename):
@@ -250,9 +266,60 @@ def init_centroids(n: ti.i32):
         bvh_prim_indices[i] = i
 
 
+def add_box(verts_list, faces_list, center, size):
+    """Add a box to the mesh"""
+    import numpy as np
+    cx, cy, cz = center
+    sx, sy, sz = size
+    hx, hy, hz = sx/2, sy/2, sz/2
+
+    base = len(verts_list)
+    # 8 vertices
+    corners = [
+        (cx-hx, cy-hy, cz-hz), (cx+hx, cy-hy, cz-hz),
+        (cx+hx, cy+hy, cz-hz), (cx-hx, cy+hy, cz-hz),
+        (cx-hx, cy-hy, cz+hz), (cx+hx, cy-hy, cz+hz),
+        (cx+hx, cy+hy, cz+hz), (cx-hx, cy+hy, cz+hz),
+    ]
+    verts_list.extend(corners)
+
+    # 12 triangles (2 per face)
+    box_faces = [
+        (0,1,2), (0,2,3),  # back
+        (4,6,5), (4,7,6),  # front
+        (0,4,5), (0,5,1),  # bottom
+        (2,6,7), (2,7,3),  # top
+        (0,3,7), (0,7,4),  # left
+        (1,5,6), (1,6,2),  # right
+    ]
+    for f in box_faces:
+        faces_list.append([base + f[0], base + f[1], base + f[2]])
+
+
 def main():
-    print("Loading dragon...")
-    verts, faces = load_obj("./models/dragon_smallest.obj")
+    import numpy as np
+    print("Loading dragon + room...")
+    dragon_verts, dragon_faces = load_obj("./models/dragon_smallest.obj")
+
+    # Build room similar to main.py
+    all_verts = list(dragon_verts)
+    all_faces = list(dragon_faces)
+    room_size = 10
+    wall_thickness = 0.5
+
+    # Floor
+    add_box(all_verts, all_faces, (0, -wall_thickness/2, 0), (room_size, wall_thickness, room_size))
+    # Ceiling
+    add_box(all_verts, all_faces, (0, room_size - wall_thickness/2, 0), (room_size, wall_thickness, room_size))
+    # Back wall
+    add_box(all_verts, all_faces, (0, room_size/2, -room_size/2 + wall_thickness/2), (room_size, room_size, wall_thickness))
+    # Left wall
+    add_box(all_verts, all_faces, (-room_size/2 + wall_thickness/2, room_size/2, 0), (wall_thickness, room_size, room_size))
+    # Right wall
+    add_box(all_verts, all_faces, (room_size/2 - wall_thickness/2, room_size/2, 0), (wall_thickness, room_size, room_size))
+
+    verts = np.array(all_verts, dtype=np.float32)
+    faces = all_faces
 
     n_verts = len(verts)
     n_tris = len(faces)
@@ -272,8 +339,8 @@ def main():
     ti.sync()
     build_bvh_cpu(n_tris, verts)
 
-    # Camera setup
-    cam_x, cam_y, cam_z = 0.0, 0.0, 10.0
+    # Camera setup (same as main.py)
+    cam_x, cam_y, cam_z = 0.0, 5.0, 15.0
     dir_x, dir_y, dir_z = 0.0, 0.0, -1.0
 
     rays_per_frame = WIDTH * HEIGHT
@@ -281,11 +348,11 @@ def main():
     # Warmup
     print("\nWarmup...")
     bench_brute(cam_x, cam_y, cam_z, dir_x, dir_y, dir_z)
-    bench_bvh(cam_x, cam_y, cam_z, dir_x, dir_y, dir_z)
+    bench_bvh(cam_x, cam_y, cam_z, dir_x, dir_y, dir_z, SAMPLES, BOUNCES)
     ti.sync()
 
-    # Benchmark brute force
-    print("\n--- Brute Force ---")
+    # Benchmark brute force (1 sample, 1 bounce - too slow otherwise)
+    print("\n--- Brute Force (1 sample, 1 bounce) ---")
     hit_count[None] = 0
     n_frames = 10
     t0 = time.perf_counter()
@@ -300,17 +367,19 @@ def main():
     print(f"FPS: {fps:.1f}")
     print(f"Mrays/s: {mrays:.2f}")
 
-    # Benchmark BVH
-    print("\n--- BVH ---")
+    # Benchmark BVH with samples and bounces
+    print(f"\n--- BVH ({SAMPLES} samples, {BOUNCES} bounces) ---")
     hit_count[None] = 0
+    n_frames = 10
+    rays_total = rays_per_frame * SAMPLES * BOUNCES
     t0 = time.perf_counter()
     for _ in range(n_frames):
-        bench_bvh(cam_x, cam_y, cam_z, dir_x, dir_y, dir_z)
+        bench_bvh(cam_x, cam_y, cam_z, dir_x, dir_y, dir_z, SAMPLES, BOUNCES)
     ti.sync()
     t1 = time.perf_counter()
     dt = t1 - t0
     fps = n_frames / dt
-    mrays = (rays_per_frame * n_frames) / dt / 1e6
+    mrays = (rays_total * n_frames) / dt / 1e6
     print(f"Time: {dt:.3f}s for {n_frames} frames")
     print(f"FPS: {fps:.1f}")
     print(f"Mrays/s: {mrays:.2f}")

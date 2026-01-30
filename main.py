@@ -1,6 +1,7 @@
 import taichi as ti
 import math
 import argparse
+import time
 from benchmark import benchmark, is_enabled_benchmark
 
 ti.init(arch=ti.gpu)
@@ -712,32 +713,6 @@ def intersect_aabb(ray_o, ray_d, bmin, bmax, closest_t):
 
     return tmax >= tmin and tmin < closest_t and tmax > 0.0
 
-
-@ti.func
-def trace_brute(ray_o, ray_d):
-    """Brute force - test all triangles"""
-    closest_t = ti.f32(1e10)
-    hit_normal = ti.Vector([0.0, 1.0, 0.0])
-    hit_color = ti.Vector([0.0, 0.0, 0.0])
-    hit = False
-
-    for k in range(scene.num_triangles[None]):
-        idx = k * 3
-        v0 = scene.vertices[scene.indices[idx]]
-        v1 = scene.vertices[scene.indices[idx + 1]]
-        v2 = scene.vertices[scene.indices[idx + 2]]
-        t = ray_triangle_intersect(ray_o, ray_d, v0, v1, v2)
-        if 0.001 < t < closest_t:
-            closest_t = t
-            hit_normal = get_triangle_normal(v0, v1, v2)
-            if hit_normal.dot(ray_d) > 0:
-                hit_normal = -hit_normal
-            hit_color = scene.vertex_colors[scene.indices[idx]]
-            hit = True
-
-    return hit, closest_t, hit_normal, hit_color
-
-
 @ti.func
 def trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
     """Trace ray through BVH with local stack"""
@@ -746,15 +721,12 @@ def trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
     hit_color = ti.Vector([0.0, 0.0, 0.0])
     hit = False
 
-    # Local stack as register values
+    # Stack size 32: worst case depth = log2(num_leaves) ≈ 14 for 100k triangles
     stack = ti.Matrix([[0] * 32], dt=ti.i32)
     stack[0, 0] = 0  # Start with root
     stack_ptr = 1
 
-    for _iter in range(64):  # BVH depth ~log2(n), 64 is plenty
-        if stack_ptr <= 0:
-            break
-
+    while stack_ptr > 0:
         stack_ptr -= 1
         node_idx = stack[0, stack_ptr]
         node = scene.bvh_nodes[node_idx]
@@ -1045,40 +1017,40 @@ def create_demo_scene():
     wall_thickness = 0.5
     half = room_size / 2
 
-    # Floor
-    scene.add_box(
-        center=(0, -wall_thickness / 2, 0),
-        size=(room_size, wall_thickness, room_size),
-        color=(0.4, 0.4, 0.4)
-    )
+    # # Floor
+    # scene.add_box(
+    #     center=(0, -wall_thickness / 2, 0),
+    #     size=(room_size, wall_thickness, room_size),
+    #     color=(0.4, 0.4, 0.4)
+    # )
 
-    # Ceiling
-    scene.add_box(
-        center=(0, room_size - wall_thickness / 2, 0),
-        size=(room_size, wall_thickness, room_size),
-        color=(0.5, 0.5, 0.5)
-    )
+    # # Ceiling
+    # scene.add_box(
+    #     center=(0, room_size - wall_thickness / 2, 0),
+    #     size=(room_size, wall_thickness, room_size),
+    #     color=(0.5, 0.5, 0.5)
+    # )
 
-    # Back wall (far from camera)
-    scene.add_box(
-        center=(0, half, -half - wall_thickness / 2),
-        size=(room_size, room_size, wall_thickness),
-        color=(0.6, 0.6, 0.7)
-    )
+    # # Back wall (far from camera)
+    # scene.add_box(
+    #     center=(0, half, -half - wall_thickness / 2),
+    #     size=(room_size, room_size, wall_thickness),
+    #     color=(0.6, 0.6, 0.7)
+    # )
 
-    # Left wall
-    scene.add_box(
-        center=(-half - wall_thickness / 2, half, 0),
-        size=(wall_thickness, room_size, room_size),
-        color=(0.7, 0.5, 0.5)
-    )
+    # # Left wall
+    # scene.add_box(
+    #     center=(-half - wall_thickness / 2, half, 0),
+    #     size=(wall_thickness, room_size, room_size),
+    #     color=(0.7, 0.5, 0.5)
+    # )
 
-    # Right wall
-    scene.add_box(
-        center=(half + wall_thickness / 2, half, 0),
-        size=(wall_thickness, room_size, room_size),
-        color=(0.5, 0.7, 0.5)
-    )
+    # # Right wall
+    # scene.add_box(
+    #     center=(half + wall_thickness / 2, half, 0),
+    #     size=(wall_thickness, room_size, room_size),
+    #     color=(0.5, 0.7, 0.5)
+    # )
 
     # Front wall is OPEN (no wall) so we can see inside
 
@@ -1090,6 +1062,30 @@ def create_demo_scene():
         color=(0.8, 0.3, 0.3),
         rotation=(0, 180, 0)
     )
+
+
+@benchmark
+def render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytracing):
+    dt = 1.0 / 60.0
+    camera.handle_input(window, dt)
+    run_physics(dt)
+
+    rays = 0
+    if use_raytracing:
+        if settings.debug_bvh:
+            run_debug_bvh(camera)
+            rays = WIDTH * HEIGHT
+        else:
+            run_raytrace(camera, frame)
+            rays = WIDTH * HEIGHT * settings.samples_per_pixel * settings.max_bounces
+        canvas.set_image(scene.pixels)
+    else:
+        run_rasterize(ti_scene, ti_camera, canvas, camera)
+
+    if is_enabled_benchmark():
+        ti.sync()
+
+    return rays
 
 
 def main():
@@ -1104,33 +1100,36 @@ def main():
     print(f"Scene: {scene._vertex_count} vertices, {scene._triangle_count} triangles")
     print(f"Rendering: {'Ray Tracing' if use_raytracing else 'Rasterization'}")
 
-    window = ti.ui.Window("Taichi Scene", (WIDTH, HEIGHT), vsync=True)
+    window = ti.ui.Window("Taichi Scene", (WIDTH, HEIGHT), vsync=False)
     canvas = window.get_canvas()
     ti_scene = window.get_scene()
     ti_camera = ti.ui.Camera()
 
     camera = Camera(position=(0, 5, 15), yaw=-90, pitch=-15)
     frame = 0
+    last_time = time.perf_counter()
+    fps_smooth = 0.0
+    mrays_smooth = 0.0
+    ema_alpha = 0.1  # Smoothing factor (lower = smoother, higher = more responsive)
 
     scene.build_bvh()
     while window.running:
-        dt = 1.0 / 60.0
+        rays = render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytracing)
 
-        camera.handle_input(window, dt)
-        run_physics(dt)
-
-        if use_raytracing:
-            if settings.debug_bvh:
-                run_debug_bvh(camera)
-            else:
-                run_raytrace(camera, frame)
-            canvas.set_image(scene.pixels)
-        else:
-            run_rasterize(ti_scene, ti_camera, canvas, camera)
+        now = time.perf_counter()
+        dt = now - last_time
+        last_time = now
+        if dt > 0:
+            fps = 1.0 / dt
+            mrays = rays * fps / 1e6
+            # Exponential moving average for smooth display
+            fps_smooth = ema_alpha * fps + (1 - ema_alpha) * fps_smooth
+            mrays_smooth = ema_alpha * mrays + (1 - ema_alpha) * mrays_smooth
 
         # GUI panel
         gui = window.get_gui()
         gui.begin("Settings", 0.02, 0.02, 0.3, 0.3)
+        gui.text(f"FPS: {fps_smooth:.1f}  Mrays/s: {mrays_smooth:.1f}")
         settings.max_bounces = gui.slider_int("Bounces", settings.max_bounces, 1, 16)
         settings.samples_per_pixel = gui.slider_int("Samples", settings.samples_per_pixel, 1, 64)
         settings.sky_intensity = gui.slider_float("Sky", settings.sky_intensity, 0.0, 3.0)
