@@ -11,13 +11,13 @@ MAX_VERTICES = 500000
 MAX_BVH_NODES = MAX_TRIANGLES * 2  # BVH needs at most 2N-1 nodes for N triangles
 WIDTH, HEIGHT = 800, 600
 
-# BVH Node structure (compact layout)
+# BVH Node structure (32 bytes, compact layout)
+# leftFirst: if triCount==0 -> left child index, else -> first triangle index
 BVHNode = ti.types.struct(
-    aabb_min=ti.types.vector(3, ti.f32),
-    aabb_max=ti.types.vector(3, ti.f32),
-    left_child=ti.i32,      # Left child index (right is left_child + 1)
-    first_prim=ti.i32,      # First triangle index (for leaves)
-    prim_count=ti.i32,      # Triangle count (>0 means leaf)
+    aabb_min=ti.types.vector(3, ti.f32),  # 12 bytes
+    aabb_max=ti.types.vector(3, ti.f32),  # 12 bytes
+    left_first=ti.u32,                     # 4 bytes
+    tri_count=ti.u32,                      # 4 bytes
 )
 
 # Path tracing settings (can be changed at runtime via GUI)
@@ -26,6 +26,7 @@ class Settings:
         self.max_bounces = 2
         self.samples_per_pixel = 2
         self.sky_intensity = 1.0
+        self.debug_bvh = False
 
 settings = Settings()
 
@@ -56,6 +57,7 @@ class Scene:
         self.tri_centroids = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIANGLES)  # Triangle centroids
         self.num_bvh_nodes = ti.field(dtype=ti.i32, shape=())
         self.bvh_stack = ti.field(dtype=ti.i32, shape=MAX_BVH_NODES)  # Stack for iterative build
+        self.traverse_stack = ti.field(dtype=ti.i32, shape=(WIDTH, HEIGHT, 64))  # Per-pixel traversal stack
         self.bvh_built = False
 
         # Initialize counts
@@ -338,15 +340,101 @@ class Scene:
 
     @benchmark
     def build_bvh(self):
-        """Build BVH acceleration structure using GPU kernels"""
+        """Build BVH acceleration structure"""
         n = self._triangle_count
         if n == 0:
             return
 
+        # GPU: compute centroids and init prim_indices
         bvh_init_centroids(n)
-        bvh_build(n)
+        ti.sync()  # Ensure GPU is done before CPU reads
 
+        # CPU: build tree (deterministic)
+        self._build_bvh_cpu(n)
         self.bvh_built = True
+
+    def _build_bvh_cpu(self, n):
+        """Build BVH on CPU (deterministic)"""
+        import numpy as np
+
+        # Copy data to numpy for CPU processing
+        centroids = self.tri_centroids.to_numpy()[:n]
+        prim_indices = list(range(n))  # Local list for partitioning
+
+        # Initialize root
+        self.bvh_nodes[0].left_first = 0
+        self.bvh_nodes[0].tri_count = n
+        self.num_bvh_nodes[None] = 1
+
+        # Stack for iterative build: (node_idx, first, count)
+        stack = [(0, 0, n)]
+        nodes_used = 1
+
+        while stack:
+            node_idx, first, count = stack.pop()
+
+            # Calculate bounds
+            aabb_min = np.array([1e30, 1e30, 1e30])
+            aabb_max = np.array([-1e30, -1e30, -1e30])
+            for i in range(first, first + count):
+                tri_idx = prim_indices[i]
+                c = centroids[tri_idx]
+                # Get actual triangle vertices for bounds
+                idx = tri_idx * 3
+                for vi in range(3):
+                    v = self.vertices[self.indices[idx + vi]]
+                    aabb_min = np.minimum(aabb_min, [v[0], v[1], v[2]])
+                    aabb_max = np.maximum(aabb_max, [v[0], v[1], v[2]])
+
+            self.bvh_nodes[node_idx].aabb_min = aabb_min.tolist()
+            self.bvh_nodes[node_idx].aabb_max = aabb_max.tolist()
+
+            # Leaf if <= 10 triangles
+            if count <= 10:
+                self.bvh_nodes[node_idx].left_first = first
+                self.bvh_nodes[node_idx].tri_count = count
+                # Write prim_indices to GPU field
+                for i in range(count):
+                    self.bvh_prim_indices[first + i] = prim_indices[first + i]
+                continue
+
+            # Find split axis (longest extent)
+            extent = aabb_max - aabb_min
+            axis = int(np.argmax(extent))
+            split_pos = aabb_min[axis] + extent[axis] * 0.5
+
+            # Partition
+            i, j = first, first + count - 1
+            while i <= j:
+                if centroids[prim_indices[i]][axis] < split_pos:
+                    i += 1
+                else:
+                    prim_indices[i], prim_indices[j] = prim_indices[j], prim_indices[i]
+                    j -= 1
+
+            left_count = i - first
+            if left_count == 0 or left_count == count:
+                # Degenerate - keep as leaf
+                self.bvh_nodes[node_idx].left_first = first
+                self.bvh_nodes[node_idx].tri_count = count
+                for i in range(count):
+                    self.bvh_prim_indices[first + i] = prim_indices[first + i]
+                continue
+
+            # Create children
+            left_idx = nodes_used
+            right_idx = nodes_used + 1
+            nodes_used += 2
+
+            # Mark parent as interior (tri_count=0 means left_first is left child)
+            self.bvh_nodes[node_idx].left_first = left_idx
+            self.bvh_nodes[node_idx].tri_count = 0
+
+            # Push children to stack
+            stack.append((right_idx, i, count - left_count))
+            stack.append((left_idx, first, left_count))
+
+        self.num_bvh_nodes[None] = nodes_used
 
 scene = Scene()
 
@@ -370,8 +458,8 @@ def bvh_update_node_bounds(node_idx: ti.i32):
     aabb_min = ti.Vector([1e30, 1e30, 1e30])
     aabb_max = ti.Vector([-1e30, -1e30, -1e30])
 
-    first = scene.bvh_nodes[node_idx].first_prim
-    count = scene.bvh_nodes[node_idx].prim_count
+    first = ti.cast(scene.bvh_nodes[node_idx].left_first, ti.i32)
+    count = ti.cast(scene.bvh_nodes[node_idx].tri_count, ti.i32)
 
     for i in range(count):
         tri_idx = scene.bvh_prim_indices[first + i]
@@ -395,9 +483,8 @@ def bvh_update_node_bounds(node_idx: ti.i32):
 def bvh_build(n: ti.i32):
     """Build BVH iteratively using a stack (runs on GPU)"""
     # Initialize root node
-    scene.bvh_nodes[0].left_child = 0
-    scene.bvh_nodes[0].first_prim = 0
-    scene.bvh_nodes[0].prim_count = n
+    scene.bvh_nodes[0].left_first = ti.cast(0, ti.u32)
+    scene.bvh_nodes[0].tri_count = ti.cast(n, ti.u32)
     scene.num_bvh_nodes[None] = 1
 
     bvh_update_node_bounds(0)
@@ -410,15 +497,15 @@ def bvh_build(n: ti.i32):
         stack_ptr -= 1
         node_idx = scene.bvh_stack[stack_ptr]
 
-        prim_count = scene.bvh_nodes[node_idx].prim_count
+        tri_count = ti.cast(scene.bvh_nodes[node_idx].tri_count, ti.i32)
 
         # Leaf node - stop subdividing
-        if prim_count <= 2:
+        if tri_count <= 2:
             continue
 
         aabb_min = scene.bvh_nodes[node_idx].aabb_min
         aabb_max = scene.bvh_nodes[node_idx].aabb_max
-        first_prim = scene.bvh_nodes[node_idx].first_prim
+        first_prim = ti.cast(scene.bvh_nodes[node_idx].left_first, ti.i32)
 
         # Find longest axis
         extent = aabb_max - aabb_min
@@ -431,7 +518,7 @@ def bvh_build(n: ti.i32):
 
         # In-place partition
         i = first_prim
-        j = i + prim_count - 1
+        j = i + tri_count - 1
         while i <= j:
             if scene.tri_centroids[scene.bvh_prim_indices[i]][axis] < split_pos:
                 i += 1
@@ -443,7 +530,7 @@ def bvh_build(n: ti.i32):
 
         # Check for degenerate split
         left_count = i - first_prim
-        if left_count == 0 or left_count == prim_count:
+        if left_count == 0 or left_count == tri_count:
             continue
 
         # Create child nodes
@@ -452,16 +539,16 @@ def bvh_build(n: ti.i32):
         scene.num_bvh_nodes[None] += 2
 
         # Left child
-        scene.bvh_nodes[left_idx].first_prim = first_prim
-        scene.bvh_nodes[left_idx].prim_count = left_count
+        scene.bvh_nodes[left_idx].left_first = ti.cast(first_prim, ti.u32)
+        scene.bvh_nodes[left_idx].tri_count = ti.cast(left_count, ti.u32)
 
         # Right child
-        scene.bvh_nodes[right_idx].first_prim = i
-        scene.bvh_nodes[right_idx].prim_count = prim_count - left_count
+        scene.bvh_nodes[right_idx].left_first = ti.cast(i, ti.u32)
+        scene.bvh_nodes[right_idx].tri_count = ti.cast(tri_count - left_count, ti.u32)
 
-        # Mark parent as interior
-        scene.bvh_nodes[node_idx].left_child = left_idx
-        scene.bvh_nodes[node_idx].prim_count = 0
+        # Mark parent as interior (tri_count=0 means left_first is left child)
+        scene.bvh_nodes[node_idx].left_first = ti.cast(left_idx, ti.u32)
+        scene.bvh_nodes[node_idx].tri_count = ti.cast(0, ti.u32)
 
         # Update bounds
         bvh_update_node_bounds(left_idx)
@@ -602,6 +689,175 @@ def get_triangle_normal(v0, v1, v2):
     return e1.cross(e2).normalized()
 
 
+@ti.func
+def intersect_aabb(ray_o, ray_d, bmin, bmax, closest_t):
+    """Ray-AABB intersection test"""
+    # Compute inverse direction to avoid division
+    inv_d = 1.0 / ray_d
+
+    tx1 = (bmin[0] - ray_o[0]) * inv_d[0]
+    tx2 = (bmax[0] - ray_o[0]) * inv_d[0]
+    tmin = ti.min(tx1, tx2)
+    tmax = ti.max(tx1, tx2)
+
+    ty1 = (bmin[1] - ray_o[1]) * inv_d[1]
+    ty2 = (bmax[1] - ray_o[1]) * inv_d[1]
+    tmin = ti.max(tmin, ti.min(ty1, ty2))
+    tmax = ti.min(tmax, ti.max(ty1, ty2))
+
+    tz1 = (bmin[2] - ray_o[2]) * inv_d[2]
+    tz2 = (bmax[2] - ray_o[2]) * inv_d[2]
+    tmin = ti.max(tmin, ti.min(tz1, tz2))
+    tmax = ti.min(tmax, ti.max(tz1, tz2))
+
+    return tmax >= tmin and tmin < closest_t and tmax > 0.0
+
+
+@ti.func
+def trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
+    """Trace ray through BVH with local stack"""
+    closest_t = ti.f32(1e10)
+    hit_normal = ti.Vector([0.0, 1.0, 0.0])
+    hit_color = ti.Vector([0.0, 0.0, 0.0])
+    hit = False
+
+    # Local stack as register values
+    stack = ti.Matrix([[0] * 32], dt=ti.i32)
+    stack[0, 0] = 0  # Start with root
+    stack_ptr = 1
+
+    for _iter in range(1000):
+        if stack_ptr <= 0:
+            break
+
+        stack_ptr -= 1
+        node_idx = stack[0, stack_ptr]
+
+        node_min = scene.bvh_nodes[node_idx].aabb_min
+        node_max = scene.bvh_nodes[node_idx].aabb_max
+
+        if not intersect_aabb(ray_o, ray_d, node_min, node_max, closest_t):
+            continue
+
+        tri_count = ti.cast(scene.bvh_nodes[node_idx].tri_count, ti.i32)
+
+        if tri_count > 0:
+            # Leaf - test triangles
+            first_tri = ti.cast(scene.bvh_nodes[node_idx].left_first, ti.i32)
+            for i in range(tri_count):
+                tri_idx = scene.bvh_prim_indices[first_tri + i]
+                idx = tri_idx * 3
+                v0 = scene.vertices[scene.indices[idx]]
+                v1 = scene.vertices[scene.indices[idx + 1]]
+                v2 = scene.vertices[scene.indices[idx + 2]]
+
+                t = ray_triangle_intersect(ray_o, ray_d, v0, v1, v2)
+                if 0.001 < t < closest_t:
+                    closest_t = t
+                    hit_normal = get_triangle_normal(v0, v1, v2)
+                    if hit_normal.dot(ray_d) > 0:
+                        hit_normal = -hit_normal
+                    hit_color = scene.vertex_colors[scene.indices[idx]]
+                    hit = True
+        else:
+            # Interior - push children
+            left = ti.cast(scene.bvh_nodes[node_idx].left_first, ti.i32)
+            stack[0, stack_ptr] = left
+            stack_ptr += 1
+            stack[0, stack_ptr] = left + 1
+            stack_ptr += 1
+
+    return hit, closest_t, hit_normal, hit_color
+
+
+@ti.func
+def debug_trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
+    """Debug: trace BVH and return info about nodes visited"""
+    closest_t = ti.f32(1e10)
+    hit_node_idx = -1
+    hit_depth = 0
+
+    # Use per-pixel stack from field - store (node_idx, depth)
+    stack_ptr = 0
+    scene.traverse_stack[px, py, 0] = 0  # Start with root node
+    stack_ptr = 1
+    depth = 0
+
+    while stack_ptr > 0:
+        stack_ptr -= 1
+        node_idx = scene.traverse_stack[px, py, stack_ptr]
+
+        node_aabb_min = scene.bvh_nodes[node_idx].aabb_min
+        node_aabb_max = scene.bvh_nodes[node_idx].aabb_max
+        tri_count = ti.cast(scene.bvh_nodes[node_idx].tri_count, ti.i32)
+        left_first = ti.cast(scene.bvh_nodes[node_idx].left_first, ti.i32)
+
+        # Test AABB intersection
+        if intersect_aabb(ray_o, ray_d, node_aabb_min, node_aabb_max, closest_t):
+            if tri_count > 0:
+                # Leaf node - record which leaf we hit
+                # Use AABB center as hit point estimate
+                center = (node_aabb_min + node_aabb_max) * 0.5
+                t_approx = (center - ray_o).dot(ray_d.normalized())
+                if t_approx > 0 and t_approx < closest_t:
+                    closest_t = t_approx
+                    hit_node_idx = node_idx
+                    hit_depth = depth
+            else:
+                # Interior node - push children
+                scene.traverse_stack[px, py, stack_ptr] = left_first
+                stack_ptr += 1
+                scene.traverse_stack[px, py, stack_ptr] = left_first + 1
+                stack_ptr += 1
+                depth += 1
+
+    return hit_node_idx, hit_depth
+
+
+@ti.kernel
+def debug_render_bvh(cam_pos_x: ti.f32, cam_pos_y: ti.f32, cam_pos_z: ti.f32,
+                     cam_dir_x: ti.f32, cam_dir_y: ti.f32, cam_dir_z: ti.f32,
+                     cam_right_x: ti.f32, cam_right_y: ti.f32, cam_right_z: ti.f32,
+                     cam_up_x: ti.f32, cam_up_y: ti.f32, cam_up_z: ti.f32):
+    """Debug: render BVH leaf nodes with colors based on node index"""
+    cam_pos = ti.Vector([cam_pos_x, cam_pos_y, cam_pos_z])
+    cam_dir = ti.Vector([cam_dir_x, cam_dir_y, cam_dir_z])
+    cam_right = ti.Vector([cam_right_x, cam_right_y, cam_right_z])
+    cam_up = ti.Vector([cam_up_x, cam_up_y, cam_up_z])
+
+    fov = 45.0
+    aspect = ti.cast(WIDTH, ti.f32) / ti.cast(HEIGHT, ti.f32)
+    fov_scale = ti.tan(fov * 0.5 * 3.14159 / 180.0)
+
+    for i, j in scene.pixels:
+        u = (2.0 * (ti.cast(i, ti.f32) + 0.5) / ti.cast(WIDTH, ti.f32) - 1.0) * aspect * fov_scale
+        v = (2.0 * (ti.cast(j, ti.f32) + 0.5) / ti.cast(HEIGHT, ti.f32) - 1.0) * fov_scale
+
+        ray_dir = (cam_dir + u * cam_right + v * cam_up).normalized()
+
+        node_idx, depth = debug_trace_bvh(cam_pos, ray_dir, i, j)
+
+        if node_idx >= 0:
+            # Color based on node index (pseudo-random color per node)
+            r = ti.cast((node_idx * 73) % 256, ti.f32) / 255.0
+            g = ti.cast((node_idx * 137) % 256, ti.f32) / 255.0
+            b = ti.cast((node_idx * 199) % 256, ti.f32) / 255.0
+            scene.pixels[i, j] = ti.Vector([r, g, b])
+        else:
+            # Sky
+            t = 0.5 * (ray_dir[1] + 1.0)
+            scene.pixels[i, j] = (1.0 - t) * ti.Vector([1.0, 1.0, 1.0]) + t * ti.Vector([0.5, 0.7, 1.0])
+
+
+def run_debug_bvh(cam):
+    debug_render_bvh(
+        cam.pos[0], cam.pos[1], cam.pos[2],
+        cam.direction[0], cam.direction[1], cam.direction[2],
+        cam.right[0], cam.right[1], cam.right[2],
+        cam.up[0], cam.up[1], cam.up[2]
+    )
+
+
 # Random number generation (PCG-based)
 @ti.func
 def rand_pcg(seed: ti.u32) -> ti.u32:
@@ -640,32 +896,6 @@ def sample_hemisphere_cosine(normal, seed1: ti.u32, seed2: ti.u32):
         sin_theta * ti.sin(phi)
     ])
     return (tangent * dir_local[0] + normal * dir_local[1] + bitangent * dir_local[2]).normalized()
-
-
-# Trace a ray and find closest hit
-@ti.func
-def trace_scene(ray_o, ray_d):
-    closest_t = ti.f32(1e10)
-    hit_normal = ti.Vector([0.0, 1.0, 0.0])
-    hit_color = ti.Vector([0.0, 0.0, 0.0])
-    hit = False
-
-    for k in range(scene.num_triangles[None]):
-        idx = k * 3
-        v0 = scene.vertices[scene.indices[idx]]
-        v1 = scene.vertices[scene.indices[idx + 1]]
-        v2 = scene.vertices[scene.indices[idx + 2]]
-        t = ray_triangle_intersect(ray_o, ray_d, v0, v1, v2)
-        if 0.001 < t < closest_t:
-            closest_t = t
-            hit_normal = get_triangle_normal(v0, v1, v2)
-            if hit_normal.dot(ray_d) > 0:
-                hit_normal = -hit_normal
-            hit_color = scene.vertex_colors[scene.indices[idx]]
-            hit = True
-
-    return hit, closest_t, hit_normal, hit_color
-
 
 # Sky color (simple gradient)
 @ti.func
@@ -714,7 +944,7 @@ def raytrace(cam_pos_x: ti.f32, cam_pos_y: ti.f32, cam_pos_z: ti.f32,
             color = ti.Vector([0.0, 0.0, 0.0])
 
             for bounce in range(max_bounces):
-                hit, t, normal, albedo = trace_scene(ray_pos, ray_dir)
+                hit, t, normal, albedo = trace_bvh(ray_pos, ray_dir, i, j)
 
                 if not hit:
                     # Hit sky - add sky contribution
@@ -860,26 +1090,29 @@ def main():
     camera = Camera(position=(0, 5, 15), yaw=-90, pitch=-15)
     frame = 0
 
+    scene.build_bvh()
     while window.running:
         dt = 1.0 / 60.0
 
         camera.handle_input(window, dt)
         run_physics(dt)
 
-        scene.build_bvh()
-
         if use_raytracing:
-            run_raytrace(camera, frame)
+            if settings.debug_bvh:
+                run_debug_bvh(camera)
+            else:
+                run_raytrace(camera, frame)
             canvas.set_image(scene.pixels)
         else:
             run_rasterize(ti_scene, ti_camera, canvas, camera)
 
         # GUI panel
         gui = window.get_gui()
-        gui.begin("Settings", 0.02, 0.02, 0.3, 0.25)
+        gui.begin("Settings", 0.02, 0.02, 0.3, 0.3)
         settings.max_bounces = gui.slider_int("Bounces", settings.max_bounces, 1, 16)
         settings.samples_per_pixel = gui.slider_int("Samples", settings.samples_per_pixel, 1, 64)
         settings.sky_intensity = gui.slider_float("Sky", settings.sky_intensity, 0.0, 3.0)
+        settings.debug_bvh = gui.checkbox("Debug BVH", settings.debug_bvh)
         gui.end()
 
         frame += 1
