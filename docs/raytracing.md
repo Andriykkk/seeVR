@@ -6,48 +6,7 @@ Ray casting	0	Direct light only
 Whitted ray tracing	2-3	Reflections, refractions
 Path tracing	100+	Global illumination, soft shadows, caustics
 Path Tracing (Most Realistic)
-
-@ti.func
-def trace_path(ray_origin, ray_dir, max_bounces):
-    color = ti.Vector([0.0, 0.0, 0.0])
-    throughput = ti.Vector([1.0, 1.0, 1.0])
-    
-    for bounce in range(max_bounces):
-        hit, t, normal, material = scene_intersect(ray_origin, ray_dir)
-        
-        if not hit:
-            color += throughput * sky_color(ray_dir)  # Environment
-            break
-        
-        hit_point = ray_origin + t * ray_dir
-        
-        # Emission (for lights)
-        color += throughput * material.emission
-        
-        # Russian roulette (probabilistic termination)
-        if bounce > 3:
-            p = max(throughput)
-            if ti.random() > p:
-                break
-            throughput /= p
-        
-        # Sample new direction based on material
-        if material.type == DIFFUSE:
-            # Cosine-weighted hemisphere sampling
-            new_dir = random_cosine_hemisphere(normal)
-            throughput *= material.albedo
-        elif material.type == METAL:
-            # Reflection
-            new_dir = reflect(ray_dir, normal)
-            throughput *= material.albedo
-        elif material.type == GLASS:
-            # Refraction (Snell's law)
-            new_dir = refract_or_reflect(ray_dir, normal, material.ior)
-            
-        ray_origin = hit_point + 0.001 * new_dir
-        ray_dir = new_dir
-    
-    return color
+ 
 Multiple Geometry Types
 
 @ti.func
@@ -128,8 +87,4 @@ O(N) → O(log N) per ray
 Summary
 For most realistic rendering:
 
-Path tracing with many bounces
-Multiple geometry: spheres, triangles, boxes, planes
-Materials: diffuse, metal, glass, emissive
-BVH for acceleration
 Many samples per pixel (100-1000) for noise reduction
