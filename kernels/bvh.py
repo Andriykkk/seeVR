@@ -102,23 +102,24 @@ def compute_all_morton_codes(num_triangles: int):
 @ti.func
 def clz(x: ti.u32) -> ti.i32:
     """Count leading zeros in 32-bit integer."""
-    if x == 0:
-        return 32
     n = 0
-    if (x & 0xFFFF0000) == 0:
-        n += 16
-        x <<= 16
-    if (x & 0xFF000000) == 0:
-        n += 8
-        x <<= 8
-    if (x & 0xF0000000) == 0:
-        n += 4
-        x <<= 4
-    if (x & 0xC0000000) == 0:
-        n += 2
-        x <<= 2
-    if (x & 0x80000000) == 0:
-        n += 1
+    if x == 0:
+        n = 32
+    else:
+        if (x & ti.u32(0xFFFF0000)) == 0:
+            n += 16
+            x <<= 16
+        if (x & ti.u32(0xFF000000)) == 0:
+            n += 8
+            x <<= 8
+        if (x & ti.u32(0xF0000000)) == 0:
+            n += 4
+            x <<= 4
+        if (x & ti.u32(0xC0000000)) == 0:
+            n += 2
+            x <<= 2
+        if (x & ti.u32(0x80000000)) == 0:
+            n += 1
     return n
 
 
@@ -128,16 +129,16 @@ def delta(i: ti.i32, j: ti.i32, n: ti.i32) -> ti.i32:
 
     Returns -1 if j is out of bounds (used to determine direction).
     """
-    if j < 0 or j >= n:
-        return -1
-
-    a = data.morton_codes[i]
-    b = data.morton_codes[j]
-
-    # If codes are equal, use index to break tie (append index bits)
-    if a == b:
-        return 32 + clz(ti.cast(i, ti.u32) ^ ti.cast(j, ti.u32))
-    return clz(a ^ b)
+    result = -1
+    if j >= 0 and j < n:
+        a = data.morton_codes[i]
+        b = data.morton_codes[j]
+        # If codes are equal, use index to break tie (append index bits)
+        if a == b:
+            result = 32 + clz(ti.cast(i, ti.u32) ^ ti.cast(j, ti.u32))
+        else:
+            result = clz(a ^ b)
+    return result
 
 
 @ti.kernel
@@ -280,6 +281,9 @@ def build_lbvh_hierarchy(n: ti.i32):
         split = i + s * d + ti.min(d, 0)
 
         # Assign children
+        left_child = 0
+        right_child = 0
+
         # Left child
         if ti.min(i, j) == split:
             left_child = n - 1 + split  # Leaf
@@ -293,6 +297,7 @@ def build_lbvh_hierarchy(n: ti.i32):
             right_child = split + 1  # Internal
 
         data.bvh_nodes[i].left_first = ti.cast(left_child, ti.u32)
+        data.bvh_nodes[i].right_child = ti.cast(right_child, ti.u32)
         data.bvh_nodes[i].tri_count = 0
 
 
@@ -317,11 +322,11 @@ def compute_leaf_aabbs(n: ti.i32):
 
 
 @ti.kernel
-def compute_internal_aabbs_level(n: ti.i32, level_start: ti.i32, level_end: ti.i32):
+def compute_internal_aabbs_level(level_start: ti.i32, level_end: ti.i32):
     """Compute AABBs for internal nodes at one level (bottom-up)."""
     for i in range(level_start, level_end):
         left_idx = ti.cast(data.bvh_nodes[i].left_first, ti.i32)
-        right_idx = left_idx + 1
+        right_idx = ti.cast(data.bvh_nodes[i].right_child, ti.i32)
 
         left_min = data.bvh_nodes[left_idx].aabb_min
         left_max = data.bvh_nodes[left_idx].aabb_max
@@ -330,6 +335,37 @@ def compute_internal_aabbs_level(n: ti.i32, level_start: ti.i32, level_end: ti.i
 
         data.bvh_nodes[i].aabb_min = ti.min(left_min, right_min)
         data.bvh_nodes[i].aabb_max = ti.max(left_max, right_max)
+
+
+def debug_print_bvh(num_triangles: int):
+    """Print BVH tree structure for debugging."""
+    n = num_triangles
+    print(f"\n=== BVH Debug (n={n} triangles) ===")
+    print(f"Total nodes: {2*n-1} (internal: {n-1}, leaves: {n})")
+    print(f"Internal nodes: [0..{n-2}], Leaf nodes: [{n-1}..{2*n-2}]")
+
+    # Print first few internal nodes
+    print("\nInternal nodes:")
+    for i in range(min(n-1, 10)):
+        node = data.bvh_nodes[i]
+        print(f"  Node {i}: left={node.left_first}, right={node.right_child}, "
+              f"tri_count={node.tri_count}, aabb_min={node.aabb_min}, aabb_max={node.aabb_max}")
+
+    # Print first few leaf nodes
+    print("\nLeaf nodes:")
+    for i in range(min(n, 10)):
+        leaf_idx = n - 1 + i
+        node = data.bvh_nodes[leaf_idx]
+        prim_idx = data.bvh_prim_indices[int(node.left_first)]
+        print(f"  Leaf {leaf_idx}: left_first={node.left_first}, tri_count={node.tri_count}, "
+              f"prim_idx={prim_idx}, aabb_min={node.aabb_min}")
+
+    # Print sort indices
+    print("\nSort indices (first 10):")
+    for i in range(min(n, 10)):
+        print(f"  sort_indices[{i}] = {data.sort_indices[i]}")
+
+    print("=== End BVH Debug ===\n")
 
 
 def build_lbvh(num_triangles: int):
@@ -342,6 +378,8 @@ def build_lbvh(num_triangles: int):
     n = num_triangles
     if n == 0:
         return
+
+    print(f"Building LBVH for {n} triangles...")
 
     # 1. Compute centroids (parallel)
     bvh_init_centroids(n)
@@ -371,11 +409,14 @@ def build_lbvh(num_triangles: int):
     # For a balanced tree, log2(n) levels
     import math
     num_levels = int(math.ceil(math.log2(n + 1))) + 1
-    for level in range(num_levels):
-        compute_internal_aabbs_level(n, 0, n - 1)
+    for _ in range(num_levels):
+        compute_internal_aabbs_level(0, n - 1)
         ti.sync()
 
     data.num_bvh_nodes[None] = 2 * n - 1
+
+    # Debug output
+    debug_print_bvh(n)
 
 
 # ============================================================================

@@ -85,9 +85,10 @@ def trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
                     hit_color = data.vertex_colors[data.indices[idx]]
                     hit = True
         else:
+            right_child = ti.cast(node.right_child, ti.i32)
             stack[0, stack_ptr] = left_first
             stack_ptr += 1
-            stack[0, stack_ptr] = left_first + 1
+            stack[0, stack_ptr] = right_child
             stack_ptr += 1
 
     return hit, closest_t, hit_normal, hit_color

@@ -18,10 +18,13 @@ MAX_BVH_NODES = MAX_TRIANGLES * 2
 WIDTH, HEIGHT = 800, 600
 
 # BVH Node structure
+# For internal nodes: left_first = left child, right_child = right child, tri_count = 0
+# For leaf nodes: left_first = first prim index, right_child unused, tri_count > 0
 BVHNode = ti.types.struct(
     aabb_min=ti.types.vector(3, ti.f32),
     aabb_max=ti.types.vector(3, ti.f32),
     left_first=ti.u32,
+    right_child=ti.u32,
     tri_count=ti.u32,
 )
 

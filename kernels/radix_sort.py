@@ -59,11 +59,12 @@ def build_chunk_histograms_pass(n: ti.i32, shift: ti.i32, src_is_main: ti.i32):
         local_hist = ti.Matrix([[0] * NUM_BUCKETS], dt=ti.i32)
 
         for i in range(start, end):
+            key = ti.u32(0)
             if src_is_main:
                 key = data.morton_codes[i]
             else:
                 key = data.morton_codes_temp[i]
-            digit = (key >> shift) & 0xFF
+            digit = ti.cast((key >> shift) & 0xFF, ti.i32)
             local_hist[0, digit] += 1
 
         # Write local histogram to global memory (one write per bucket)
@@ -127,6 +128,8 @@ def scatter_pass(n: ti.i32, shift: ti.i32, src_is_main: ti.i32):
             local_offsets[0, bucket] = chunk_offsets[chunk, bucket]
 
         for i in range(start, end):
+            key = ti.u32(0)
+            idx = 0
             if src_is_main:
                 key = data.morton_codes[i]
                 idx = data.sort_indices[i]
@@ -134,7 +137,7 @@ def scatter_pass(n: ti.i32, shift: ti.i32, src_is_main: ti.i32):
                 key = data.morton_codes_temp[i]
                 idx = data.sort_indices_temp[i]
 
-            digit = (key >> shift) & 0xFF
+            digit = ti.cast((key >> shift) & 0xFF, ti.i32)
             dest = local_offsets[0, digit]
             local_offsets[0, digit] += 1
 
@@ -161,27 +164,49 @@ def radix_sort_morton(n: int):
 
     # Initialize indices
     init_sort_indices(n)
+    ti.sync()
+
+    # Debug: verify init
+    print(f"Radix sort: n={n}, chunks={num_chunks}")
+    print(f"  After init: sort_indices[0:5] = {[data.sort_indices[i] for i in range(min(5, n))]}")
+    print(f"  Morton codes[0:5] = {[hex(data.morton_codes[i]) for i in range(min(5, n))]}")
 
     # Pass 0: bits 0-7 (main -> temp)
     clear_chunk_histograms(num_chunks)
     build_chunk_histograms_pass(n, 0, 1)  # src_is_main=1
     compute_chunk_offsets(n, num_chunks)
     scatter_pass(n, 0, 1)
+    ti.sync()
+    print(f"  After pass 0: sort_indices_temp[0:5] = {[data.sort_indices_temp[i] for i in range(min(5, n))]}")
+    print(f"  After pass 0: morton_codes_temp[0:5] = {[hex(data.morton_codes_temp[i]) for i in range(min(5, n))]}")
 
     # Pass 1: bits 8-15 (temp -> main)
     clear_chunk_histograms(num_chunks)
+    ti.sync()
     build_chunk_histograms_pass(n, 8, 0)  # src_is_main=0
+    ti.sync()
+    # Debug: check histogram
+    print(f"  Pass 1 histogram check - chunk_histograms[0, 0:5] = {[chunk_histograms[0, i] for i in range(5)]}")
     compute_chunk_offsets(n, num_chunks)
+    ti.sync()
+    print(f"  Pass 1 offsets check - chunk_offsets[0, 0:5] = {[chunk_offsets[0, i] for i in range(5)]}")
     scatter_pass(n, 8, 0)
+    ti.sync()
+    print(f"  After pass 1: sort_indices[0:5] = {[data.sort_indices[i] for i in range(min(5, n))]}")
+    print(f"  After pass 1: morton_codes[0:5] = {[hex(data.morton_codes[i]) for i in range(min(5, n))]}")
 
     # Pass 2: bits 16-23 (main -> temp)
     clear_chunk_histograms(num_chunks)
     build_chunk_histograms_pass(n, 16, 1)
     compute_chunk_offsets(n, num_chunks)
     scatter_pass(n, 16, 1)
+    ti.sync()
+    print(f"  After pass 2: sort_indices_temp[0:5] = {[data.sort_indices_temp[i] for i in range(min(5, n))]}")
 
     # Pass 3: bits 24-31 (temp -> main)
     clear_chunk_histograms(num_chunks)
     build_chunk_histograms_pass(n, 24, 0)
     compute_chunk_offsets(n, num_chunks)
     scatter_pass(n, 24, 0)
+    ti.sync()
+    print(f"  After pass 3 (final): sort_indices[0:5] = {[data.sort_indices[i] for i in range(min(5, n))]}")

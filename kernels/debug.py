@@ -33,9 +33,10 @@ def debug_trace_bvh(ray_o, ray_d, px: ti.i32, py: ti.i32):
                     hit_node_idx = node_idx
                     hit_depth = depth
             else:
+                right_child = ti.cast(data.bvh_nodes[node_idx].right_child, ti.i32)
                 data.traverse_stack[px, py, stack_ptr] = left_first
                 stack_ptr += 1
-                data.traverse_stack[px, py, stack_ptr] = left_first + 1
+                data.traverse_stack[px, py, stack_ptr] = right_child
                 stack_ptr += 1
                 depth += 1
 

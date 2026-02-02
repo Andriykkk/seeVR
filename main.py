@@ -10,8 +10,12 @@ ti.init(arch=ti.gpu)
 import kernels.data as data
 data.init_scene()
 
+# Initialize radix sort (must be after ti.init and before using LBVH)
+from kernels.radix_sort import init_radix_sort
+init_radix_sort()
+
 # Import kernels (must be after init_scene)
-from kernels.bvh import build_bvh as _build_bvh
+from kernels.bvh import build_lbvh
 from kernels.raytracing import run_raytrace
 from kernels.debug import run_debug_bvh
 
@@ -34,7 +38,6 @@ class Scene:
 
     def __init__(self):
         self.object_starts = []  # List of (start_vert, num_verts) tuples
-        self.bvh_built = False
 
     @benchmark
     def add_sphere(self, center, radius, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0), segments=16):
@@ -291,16 +294,15 @@ class Scene:
         data.num_vertices[None] = 0
         data.num_triangles[None] = 0
         self.object_starts.clear()
-        self.bvh_built = False
-
-    @benchmark
-    def build_bvh(self):
-        """Build BVH acceleration structure"""
-        _build_bvh(data.num_triangles[None], data.num_vertices[None])
-        self.bvh_built = True
-
 
 scene = Scene()
+
+@benchmark
+def run_build_bvh():
+    """Build BVH acceleration structure using GPU LBVH"""
+    build_lbvh(data.num_triangles[None])
+    if is_enabled_benchmark():
+        ti.sync()
 
 class Camera:
     """First-person camera with WASD + mouse look"""
@@ -524,7 +526,7 @@ def main():
     mrays_smooth = 0.0
     ema_alpha = 0.1  # Smoothing factor (lower = smoother, higher = more responsive)
 
-    scene.build_bvh()
+    run_build_bvh()
     while window.running:
         rays = render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytracing)
 
