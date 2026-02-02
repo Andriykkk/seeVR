@@ -26,6 +26,7 @@ BVHNode = ti.types.struct(
     left_first=ti.u32,
     right_child=ti.u32,
     tri_count=ti.u32,
+    parent_idx=ti.u32,  # Parent node index (0xFFFFFFFF for root)
 )
 
 # Global scene fields - initialized by init_scene()
@@ -51,6 +52,7 @@ radix_prefix_sum = None
 morton_codes_temp = None
 sort_indices = None
 sort_indices_temp = None
+bvh_aabb_flags = None  # Atomic flags for AABB propagation
 
 
 def init_scene():
@@ -60,7 +62,7 @@ def init_scene():
     global num_bvh_nodes, traverse_stack, bvh_build_stack
     global morton_codes, scene_aabb_min, scene_aabb_max
     global radix_histogram, radix_prefix_sum, morton_codes_temp
-    global sort_indices, sort_indices_temp
+    global sort_indices, sort_indices_temp, bvh_aabb_flags
 
     # Geometry
     vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
@@ -90,6 +92,9 @@ def init_scene():
     morton_codes_temp = ti.field(dtype=ti.u32, shape=MAX_TRIANGLES)
     sort_indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)
     sort_indices_temp = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)
+
+    # Atomic flags for AABB propagation (one per internal node)
+    bvh_aabb_flags = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)
 
     # Initialize counts
     num_vertices[None] = 0

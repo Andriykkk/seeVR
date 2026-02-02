@@ -25,6 +25,7 @@ def init_radix_sort():
     global chunk_histograms, chunk_offsets
     chunk_histograms = ti.field(dtype=ti.i32, shape=(MAX_CHUNKS, NUM_BUCKETS))
     chunk_offsets = ti.field(dtype=ti.i32, shape=(MAX_CHUNKS, NUM_BUCKETS))
+    init_prefix_sum_fields()
 
 
 @ti.kernel
@@ -72,40 +73,51 @@ def build_chunk_histograms_pass(n: ti.i32, shift: ti.i32, src_is_main: ti.i32):
             chunk_histograms[chunk, bucket] = local_hist[0, bucket]
 
 
+# Single field for prefix sum (256 values)
+bucket_starts = None
+
+
+def init_prefix_sum_fields():
+    """Initialize prefix sum field. Call after ti.init()"""
+    global bucket_starts
+    bucket_starts = ti.field(dtype=ti.i32, shape=NUM_BUCKETS)
+
+
 @ti.kernel
-def compute_chunk_offsets(n: ti.i32, num_chunks: ti.i32):
-    """Compute global offsets for each (chunk, bucket) pair.
+def compute_chunk_offsets_single_kernel(num_chunks: ti.i32):
+    """Compute bucket totals, prefix sum, and chunk offsets in one kernel.
 
-    For bucket b in chunk c, the offset is:
-      sum of all counts for buckets < b across ALL chunks
-      + sum of counts for bucket b in chunks < c
-
-    This is computed sequentially (small data - num_chunks * 256 elements).
+    Uses a single thread for the prefix sum (256 values is tiny for GPU).
+    This avoids the overhead of multiple kernel launches.
     """
-    # First pass: compute total count per bucket across all chunks
-    # and prefix sum across buckets
-    bucket_totals = ti.Matrix([[0] * NUM_BUCKETS], dt=ti.i32)
+    # Single thread does everything sequentially (faster than kernel launch overhead)
+    ti.loop_config(serialize=True)
+    for _ in range(1):
+        # Step 1: Sum chunks per bucket
+        for bucket in range(NUM_BUCKETS):
+            total = 0
+            for chunk in range(num_chunks):
+                total += chunk_histograms[chunk, bucket]
+            bucket_starts[bucket] = total
 
-    for bucket in range(NUM_BUCKETS):
-        total = 0
-        for chunk in range(num_chunks):
-            total += chunk_histograms[chunk, bucket]
-        bucket_totals[0, bucket] = total
+        # Step 2: Exclusive prefix sum
+        running = 0
+        for bucket in range(NUM_BUCKETS):
+            old_val = bucket_starts[bucket]
+            bucket_starts[bucket] = running
+            running += old_val
 
-    # Prefix sum of bucket totals (where each bucket's data starts globally)
-    bucket_starts = ti.Matrix([[0] * NUM_BUCKETS], dt=ti.i32)
-    running = 0
-    for bucket in range(NUM_BUCKETS):
-        bucket_starts[0, bucket] = running
-        running += bucket_totals[0, bucket]
+        # Step 3: Compute chunk offsets
+        for bucket in range(NUM_BUCKETS):
+            chunk_running = 0
+            for chunk in range(num_chunks):
+                chunk_offsets[chunk, bucket] = bucket_starts[bucket] + chunk_running
+                chunk_running += chunk_histograms[chunk, bucket]
 
-    # For each chunk and bucket, compute the offset
-    # offset[chunk, bucket] = bucket_starts[bucket] + sum of histogram[c, bucket] for c < chunk
-    for bucket in range(NUM_BUCKETS):
-        running_in_bucket = 0
-        for chunk in range(num_chunks):
-            chunk_offsets[chunk, bucket] = bucket_starts[0, bucket] + running_in_bucket
-            running_in_bucket += chunk_histograms[chunk, bucket]
+
+def compute_chunk_offsets(n: int, num_chunks: int):
+    """Single kernel for all prefix sum operations."""
+    compute_chunk_offsets_single_kernel(num_chunks)
 
 
 @ti.kernel
@@ -162,51 +174,16 @@ def radix_sort_morton(n: int):
 
     num_chunks = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    # Initialize indices
+    # Initialize indices and run all 4 passes
     init_sort_indices(n)
-    ti.sync()
 
-    # Debug: verify init
-    print(f"Radix sort: n={n}, chunks={num_chunks}")
-    print(f"  After init: sort_indices[0:5] = {[data.sort_indices[i] for i in range(min(5, n))]}")
-    print(f"  Morton codes[0:5] = {[hex(data.morton_codes[i]) for i in range(min(5, n))]}")
+    for pass_idx in range(4):
+        shift = pass_idx * 8
+        src_is_main = 1 if pass_idx % 2 == 0 else 0
 
-    # Pass 0: bits 0-7 (main -> temp)
-    clear_chunk_histograms(num_chunks)
-    build_chunk_histograms_pass(n, 0, 1)  # src_is_main=1
-    compute_chunk_offsets(n, num_chunks)
-    scatter_pass(n, 0, 1)
-    ti.sync()
-    print(f"  After pass 0: sort_indices_temp[0:5] = {[data.sort_indices_temp[i] for i in range(min(5, n))]}")
-    print(f"  After pass 0: morton_codes_temp[0:5] = {[hex(data.morton_codes_temp[i]) for i in range(min(5, n))]}")
-
-    # Pass 1: bits 8-15 (temp -> main)
-    clear_chunk_histograms(num_chunks)
-    ti.sync()
-    build_chunk_histograms_pass(n, 8, 0)  # src_is_main=0
-    ti.sync()
-    # Debug: check histogram
-    print(f"  Pass 1 histogram check - chunk_histograms[0, 0:5] = {[chunk_histograms[0, i] for i in range(5)]}")
-    compute_chunk_offsets(n, num_chunks)
-    ti.sync()
-    print(f"  Pass 1 offsets check - chunk_offsets[0, 0:5] = {[chunk_offsets[0, i] for i in range(5)]}")
-    scatter_pass(n, 8, 0)
-    ti.sync()
-    print(f"  After pass 1: sort_indices[0:5] = {[data.sort_indices[i] for i in range(min(5, n))]}")
-    print(f"  After pass 1: morton_codes[0:5] = {[hex(data.morton_codes[i]) for i in range(min(5, n))]}")
-
-    # Pass 2: bits 16-23 (main -> temp)
-    clear_chunk_histograms(num_chunks)
-    build_chunk_histograms_pass(n, 16, 1)
-    compute_chunk_offsets(n, num_chunks)
-    scatter_pass(n, 16, 1)
-    ti.sync()
-    print(f"  After pass 2: sort_indices_temp[0:5] = {[data.sort_indices_temp[i] for i in range(min(5, n))]}")
-
-    # Pass 3: bits 24-31 (temp -> main)
-    clear_chunk_histograms(num_chunks)
-    build_chunk_histograms_pass(n, 24, 0)
-    compute_chunk_offsets(n, num_chunks)
-    scatter_pass(n, 24, 0)
-    ti.sync()
-    print(f"  After pass 3 (final): sort_indices[0:5] = {[data.sort_indices[i] for i in range(min(5, n))]}")
+        clear_chunk_histograms(num_chunks)
+        build_chunk_histograms_pass(n, shift, src_is_main)
+        ti.sync()  # Histogram must complete before prefix sum
+        compute_chunk_offsets(n, num_chunks)
+        ti.sync()  # Offsets must complete before scatter
+        scatter_pass(n, shift, src_is_main)

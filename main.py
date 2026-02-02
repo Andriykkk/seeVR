@@ -1,4 +1,5 @@
 import taichi as ti
+import numpy as np
 import math
 import argparse
 import time
@@ -31,6 +32,31 @@ class Settings:
         self.debug_bvh = False
 
 settings = Settings()
+
+
+# GPU kernels for batch data copying
+@ti.kernel
+def _copy_vertices_batch(verts: ti.types.ndarray(dtype=ti.f32, ndim=2), offset: ti.i32):
+    for i in range(verts.shape[0]):
+        data.vertices[offset + i] = ti.Vector([verts[i, 0], verts[i, 1], verts[i, 2]])
+
+
+@ti.kernel
+def _copy_velocities_batch(vel: ti.types.ndarray(dtype=ti.f32, ndim=1), offset: ti.i32, count: ti.i32):
+    for i in range(count):
+        data.velocities[offset + i] = ti.Vector([vel[0], vel[1], vel[2]])
+
+
+@ti.kernel
+def _copy_indices_batch(indices: ti.types.ndarray(dtype=ti.i32, ndim=1), offset: ti.i32):
+    for i in range(indices.shape[0]):
+        data.indices[offset + i] = indices[i]
+
+
+@ti.kernel
+def _copy_colors_batch(color: ti.types.ndarray(dtype=ti.f32, ndim=1), offset: ti.i32, count: ti.i32):
+    for i in range(count):
+        data.vertex_colors[offset + i] = ti.Vector([color[0], color[1], color[2]])
 
 
 class Scene:
@@ -209,84 +235,63 @@ class Scene:
                 if not parts:
                     continue
                 if parts[0] == 'v':
-                    x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
-                    raw_verts.append((x, y, z))
+                    raw_verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
                 elif parts[0] == 'f':
-                    indices = []
-                    for p in parts[1:]:
-                        idx = int(p.split('/')[0]) - 1
-                        indices.append(idx)
+                    indices = [int(p.split('/')[0]) - 1 for p in parts[1:]]
                     for i in range(1, len(indices) - 1):
                         faces.append((indices[0], indices[i], indices[i + 1]))
 
         if not raw_verts:
             return -1
 
-        # Calculate bounding box
-        min_x = min(v[0] for v in raw_verts)
-        max_x = max(v[0] for v in raw_verts)
-        min_y = min(v[1] for v in raw_verts)
-        max_y = max(v[1] for v in raw_verts)
-        min_z = min(v[2] for v in raw_verts)
-        max_z = max(v[2] for v in raw_verts)
+        num_verts = len(raw_verts)
+        num_faces = len(faces)
 
-        # Mesh center and dimensions
-        mesh_center = ((min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2)
-        max_extent = max(max_x - min_x, max_y - min_y, max_z - min_z)
+        # Convert to NumPy arrays for fast batch operations
+        verts = np.array(raw_verts, dtype=np.float32)
+
+        # Calculate bounding box (vectorized)
+        min_coords = verts.min(axis=0)
+        max_coords = verts.max(axis=0)
+        mesh_center = (min_coords + max_coords) / 2
+        max_extent = (max_coords - min_coords).max()
 
         # Scale to fit within size
         scale = size / max_extent if max_extent > 0 else 1.0
 
-        # Precompute rotation (Y * X * Z order)
-        rx, ry, rz = math.radians(rotation[0]), math.radians(rotation[1]), math.radians(rotation[2])
-        cos_x, sin_x = math.cos(rx), math.sin(rx)
-        cos_y, sin_y = math.cos(ry), math.sin(ry)
-        cos_z, sin_z = math.cos(rz), math.sin(rz)
+        # Center and scale (vectorized)
+        verts = (verts - mesh_center) * scale
 
-        # Transform: center at origin, scale, rotate, move to target center
-        for x, y, z in raw_verts:
-            # Center and scale
-            vx = (x - mesh_center[0]) * scale
-            vy = (y - mesh_center[1]) * scale
-            vz = (z - mesh_center[2]) * scale
+        # Build rotation matrix (Y * X * Z order)
+        rx, ry, rz = np.radians(rotation)
+        cos_x, sin_x = np.cos(rx), np.sin(rx)
+        cos_y, sin_y = np.cos(ry), np.sin(ry)
+        cos_z, sin_z = np.cos(rz), np.sin(rz)
 
-            # Rotate Y
-            tmp_x = cos_y * vx + sin_y * vz
-            tmp_z = -sin_y * vx + cos_y * vz
-            vx, vz = tmp_x, tmp_z
+        # Rotation matrices
+        Ry = np.array([[cos_y, 0, sin_y], [0, 1, 0], [-sin_y, 0, cos_y]], dtype=np.float32)
+        Rx = np.array([[1, 0, 0], [0, cos_x, -sin_x], [0, sin_x, cos_x]], dtype=np.float32)
+        Rz = np.array([[cos_z, -sin_z, 0], [sin_z, cos_z, 0], [0, 0, 1]], dtype=np.float32)
+        R = Rz @ Rx @ Ry  # Combined rotation matrix
 
-            # Rotate X
-            tmp_y = cos_x * vy - sin_x * vz
-            tmp_z = sin_x * vy + cos_x * vz
-            vy, vz = tmp_y, tmp_z
+        # Apply rotation (vectorized matrix multiply) and translate
+        verts = (verts @ R.T + np.array(center, dtype=np.float32)).astype(np.float32)
 
-            # Rotate Z
-            tmp_x = cos_z * vx - sin_z * vy
-            tmp_y = sin_z * vx + cos_z * vy
-            vx, vy = tmp_x, tmp_y
+        # Convert faces to flat indices array
+        face_indices = (np.array(faces, dtype=np.int32).flatten() + start_vertex).astype(np.int32)
 
-            # Translate to center
-            vx += center[0]
-            vy += center[1]
-            vz += center[2]
+        # Batch copy using GPU kernels
+        _copy_vertices_batch(verts, start_vertex)
+        _copy_velocities_batch(np.array(velocity, dtype=np.float32), start_vertex, num_verts)
+        _copy_indices_batch(face_indices, data.num_triangles[None] * 3)
+        _copy_colors_batch(np.array(color, dtype=np.float32), start_vertex, num_verts)
 
-            data.vertices[data.num_vertices[None]] = (vx, vy, vz)
-            data.velocities[data.num_vertices[None]] = velocity
-            data.num_vertices[None] += 1
+        # Update counts
+        data.num_vertices[None] = start_vertex + num_verts
+        data.num_triangles[None] = data.num_triangles[None] + num_faces
 
-        for f in faces:
-            idx = data.num_triangles[None] * 3
-            data.indices[idx] = start_vertex + f[0]
-            data.indices[idx + 1] = start_vertex + f[1]
-            data.indices[idx + 2] = start_vertex + f[2]
-            data.num_triangles[None] += 1
-
-        # Set vertex colors
-        for i in range(start_vertex, data.num_vertices[None]):
-            data.vertex_colors[i] = color
-
-        self.object_starts.append((start_vertex, len(raw_verts)))
-        print(f"Loaded {filename}: {len(raw_verts)} vertices, {len(faces)} triangles")
+        self.object_starts.append((start_vertex, num_verts))
+        print(f"Loaded {filename}: {num_verts} vertices, {num_faces} triangles")
         return len(self.object_starts) - 1
 
     def clear(self):
@@ -470,7 +475,7 @@ def create_demo_scene():
 
     # Dragon inside the room
     scene.add_mesh_from_obj(
-        "./models/dragon_smallest.obj",
+        "./models/dragon_small.obj",
         center=(0, 2.5, 0),
         size=8.0,
         color=(0.8, 0.3, 0.3),
@@ -526,8 +531,8 @@ def main():
     mrays_smooth = 0.0
     ema_alpha = 0.1  # Smoothing factor (lower = smoother, higher = more responsive)
 
-    run_build_bvh()
     while window.running:
+        run_build_bvh()
         rays = render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytracing)
 
         now = time.perf_counter()

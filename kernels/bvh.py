@@ -1,6 +1,4 @@
 import taichi as ti
-import numpy as np
-from numba import njit
 import kernels.data as data
 
 @ti.func
@@ -269,36 +267,90 @@ def build_lbvh_hierarchy(n: ti.i32):
 
         j = i + l * d
 
-        # Find split with binary search
-        delta_node = delta(i, j, n)
-        s = 0
-        t = l // 2
-        while t >= 1:
-            if delta(i, i + (s + t) * d, n) > delta_node:
-                s += t
-            t //= 2
+        # Determine range bounds (first < last always)
+        first = ti.min(i, j)
+        last = ti.max(i, j)
 
-        split = i + s * d + ti.min(d, 0)
+        # Find split with binary search (matching CUDA reference)
+        # Compare with first_code, search from first toward last
+        delta_node = delta(first, last, n)
+        split = first
+        stride = last - first
+        while stride > 1:
+            stride = (stride + 1) // 2
+            middle = split + stride
+            if middle < last:
+                if delta(first, middle, n) > delta_node:
+                    split = middle
 
-        # Assign children
-        left_child = 0
-        right_child = 0
+        # Assign children (matching CUDA reference)
+        left_child = split
+        right_child = split + 1
 
-        # Left child
-        if ti.min(i, j) == split:
-            left_child = n - 1 + split  # Leaf
-        else:
-            left_child = split  # Internal
+        # If left subtree contains single primitive, it's a leaf
+        if first == split:
+            left_child = split + n - 1  # Leaf node index
 
-        # Right child
-        if ti.max(i, j) == split + 1:
-            right_child = n - 1 + split + 1  # Leaf
-        else:
-            right_child = split + 1  # Internal
+        # If right subtree contains single primitive, it's a leaf
+        if last == split + 1:
+            right_child = split + 1 + n - 1  # Leaf node index
 
         data.bvh_nodes[i].left_first = ti.cast(left_child, ti.u32)
         data.bvh_nodes[i].right_child = ti.cast(right_child, ti.u32)
         data.bvh_nodes[i].tri_count = 0
+
+        # Set parent indices for children (for bottom-up AABB propagation)
+        data.bvh_nodes[left_child].parent_idx = ti.cast(i, ti.u32)
+        data.bvh_nodes[right_child].parent_idx = ti.cast(i, ti.u32)
+
+    # Root has no parent (use max u32 = -1 in signed representation)
+    data.bvh_nodes[0].parent_idx = ti.u32(0xFFFFFFFF)
+
+
+@ti.kernel
+def clear_aabb_flags(n: ti.i32):
+    """Clear atomic flags before AABB propagation."""
+    for i in range(n - 1):
+        data.bvh_aabb_flags[i] = 0
+
+
+@ti.kernel
+def propagate_aabbs_atomic(n: ti.i32):
+    """Bottom-up AABB propagation using atomic flags.
+
+    Each leaf thread walks up the tree. At each parent node:
+    - First thread to arrive sets flag and exits (other child not ready)
+    - Second thread finds flag=1, computes AABB from both children, continues up
+    """
+    # Start from each leaf
+    for i in range(n):
+        leaf_idx = n - 1 + i
+        parent = data.bvh_nodes[leaf_idx].parent_idx
+
+        while parent != ti.u32(0xFFFFFFFF):
+            # Atomic compare-and-swap: if flag==0, set to 1 and return old value
+            parent_i32 = ti.cast(parent, ti.i32)
+            old = ti.atomic_or(data.bvh_aabb_flags[parent_i32], 1)
+
+            if old == 0:
+                # First thread to arrive - other child not ready yet
+                break
+
+            # Second thread - both children are ready, compute AABB
+            parent_i32 = ti.cast(parent, ti.i32)
+            left_idx = ti.cast(data.bvh_nodes[parent_i32].left_first, ti.i32)
+            right_idx = ti.cast(data.bvh_nodes[parent_i32].right_child, ti.i32)
+
+            left_min = data.bvh_nodes[left_idx].aabb_min
+            left_max = data.bvh_nodes[left_idx].aabb_max
+            right_min = data.bvh_nodes[right_idx].aabb_min
+            right_max = data.bvh_nodes[right_idx].aabb_max
+
+            data.bvh_nodes[parent_i32].aabb_min = ti.min(left_min, right_min)
+            data.bvh_nodes[parent_i32].aabb_max = ti.max(left_max, right_max)
+
+            # Move up to grandparent
+            parent = data.bvh_nodes[parent_i32].parent_idx
 
 
 @ti.kernel
@@ -321,53 +373,6 @@ def compute_leaf_aabbs(n: ti.i32):
         data.bvh_nodes[leaf_idx].aabb_max = aabb_max
 
 
-@ti.kernel
-def compute_internal_aabbs_level(level_start: ti.i32, level_end: ti.i32):
-    """Compute AABBs for internal nodes at one level (bottom-up)."""
-    for i in range(level_start, level_end):
-        left_idx = ti.cast(data.bvh_nodes[i].left_first, ti.i32)
-        right_idx = ti.cast(data.bvh_nodes[i].right_child, ti.i32)
-
-        left_min = data.bvh_nodes[left_idx].aabb_min
-        left_max = data.bvh_nodes[left_idx].aabb_max
-        right_min = data.bvh_nodes[right_idx].aabb_min
-        right_max = data.bvh_nodes[right_idx].aabb_max
-
-        data.bvh_nodes[i].aabb_min = ti.min(left_min, right_min)
-        data.bvh_nodes[i].aabb_max = ti.max(left_max, right_max)
-
-
-def debug_print_bvh(num_triangles: int):
-    """Print BVH tree structure for debugging."""
-    n = num_triangles
-    print(f"\n=== BVH Debug (n={n} triangles) ===")
-    print(f"Total nodes: {2*n-1} (internal: {n-1}, leaves: {n})")
-    print(f"Internal nodes: [0..{n-2}], Leaf nodes: [{n-1}..{2*n-2}]")
-
-    # Print first few internal nodes
-    print("\nInternal nodes:")
-    for i in range(min(n-1, 10)):
-        node = data.bvh_nodes[i]
-        print(f"  Node {i}: left={node.left_first}, right={node.right_child}, "
-              f"tri_count={node.tri_count}, aabb_min={node.aabb_min}, aabb_max={node.aabb_max}")
-
-    # Print first few leaf nodes
-    print("\nLeaf nodes:")
-    for i in range(min(n, 10)):
-        leaf_idx = n - 1 + i
-        node = data.bvh_nodes[leaf_idx]
-        prim_idx = data.bvh_prim_indices[int(node.left_first)]
-        print(f"  Leaf {leaf_idx}: left_first={node.left_first}, tri_count={node.tri_count}, "
-              f"prim_idx={prim_idx}, aabb_min={node.aabb_min}")
-
-    # Print sort indices
-    print("\nSort indices (first 10):")
-    for i in range(min(n, 10)):
-        print(f"  sort_indices[{i}] = {data.sort_indices[i]}")
-
-    print("=== End BVH Debug ===\n")
-
-
 def build_lbvh(num_triangles: int):
     """Build LBVH using Morton codes + radix sort + Karras construction.
 
@@ -379,49 +384,32 @@ def build_lbvh(num_triangles: int):
     if n == 0:
         return
 
-    print(f"Building LBVH for {n} triangles...")
-
     # 1. Compute centroids (parallel)
     bvh_init_centroids(n)
 
-    # 2. Compute scene bounds and Morton codes (parallel)
+    # 2. Compute scene bounds and Morton codes
     data.scene_aabb_min[None] = [1e30, 1e30, 1e30]
     data.scene_aabb_max[None] = [-1e30, -1e30, -1e30]
     compute_scene_bounds(n)
-    ti.sync()
+    ti.sync()  # Bounds must complete before morton codes
     compute_morton_codes(n)
-    ti.sync()
 
-    # 3. Radix sort Morton codes (parallel)
+    # 3. Radix sort Morton codes
     radix_sort_morton(n)
-    ti.sync()
 
     # 4. Build tree hierarchy (parallel - each internal node independent)
     build_lbvh_hierarchy(n)
-    ti.sync()
 
-    # 5. Compute leaf AABBs + copy prim indices (parallel)
+    # 5. Compute leaf AABBs + copy prim indices
     compute_leaf_aabbs(n)
-    ti.sync()
 
-    # 6. Compute internal AABBs bottom-up
-    # Simple approach: iterate from bottom level to root
-    # For a balanced tree, log2(n) levels
-    import math
-    num_levels = int(math.ceil(math.log2(n + 1))) + 1
-    for _ in range(num_levels):
-        compute_internal_aabbs_level(0, n - 1)
-        ti.sync()
+    # 6. Compute internal AABBs bottom-up using atomic propagation
+    clear_aabb_flags(n)
+    propagate_aabbs_atomic(n)
+    ti.sync()  # Final sync to ensure BVH is ready
 
     data.num_bvh_nodes[None] = 2 * n - 1
 
-    # Debug output
-    debug_print_bvh(n)
-
-
-# ============================================================================
-# Original BVH construction kernels
-# ============================================================================
 
 @ti.kernel
 def bvh_init_centroids(n: ti.i32):
@@ -433,156 +421,3 @@ def bvh_init_centroids(n: ti.i32):
         v2 = data.vertices[data.indices[idx + 2]]
         data.tri_centroids[i] = (v0 + v1 + v2) / 3.0
         data.bvh_prim_indices[i] = i
-
-@njit(cache=True)
-def _build_bvh_njit(n, centroids, vertices, indices,
-                    node_aabb_min, node_aabb_max, node_left_first, node_tri_count,
-                    prim_indices):
-    """Numba-compiled BVH build - 10-50x faster than pure Python"""
-    # Initialize root
-    node_left_first[0] = 0
-    node_tri_count[0] = n
-
-    # Stack for iterative build (pre-allocated)
-    stack_node = np.zeros(64, dtype=np.int32)
-    stack_first = np.zeros(64, dtype=np.int32)
-    stack_count = np.zeros(64, dtype=np.int32)
-    stack_ptr = 1
-    stack_node[0] = 0
-    stack_first[0] = 0
-    stack_count[0] = n
-    nodes_used = 1
-
-    while stack_ptr > 0:
-        stack_ptr -= 1
-        node_idx = stack_node[stack_ptr]
-        first = stack_first[stack_ptr]
-        count = stack_count[stack_ptr]
-
-        # Calculate bounds
-        aabb_min = np.array([1e30, 1e30, 1e30], dtype=np.float32)
-        aabb_max = np.array([-1e30, -1e30, -1e30], dtype=np.float32)
-        for i in range(first, first + count):
-            tri_idx = prim_indices[i]
-            idx = tri_idx * 3
-            for vi in range(3):
-                v_idx = indices[idx + vi]
-                for k in range(3):
-                    val = vertices[v_idx, k]
-                    if val < aabb_min[k]:
-                        aabb_min[k] = val
-                    if val > aabb_max[k]:
-                        aabb_max[k] = val
-
-        node_aabb_min[node_idx] = aabb_min
-        node_aabb_max[node_idx] = aabb_max
-
-        # Leaf if <= 10 triangles
-        if count <= 10:
-            node_left_first[node_idx] = first
-            node_tri_count[node_idx] = count
-            continue
-
-        # Find split axis (longest extent)
-        extent = aabb_max - aabb_min
-        axis = 0
-        if extent[1] > extent[0]:
-            axis = 1
-        if extent[2] > extent[axis]:
-            axis = 2
-        split_pos = aabb_min[axis] + extent[axis] * 0.5
-
-        # Partition
-        i = first
-        j = first + count - 1
-        while i <= j:
-            if centroids[prim_indices[i], axis] < split_pos:
-                i += 1
-            else:
-                tmp = prim_indices[i]
-                prim_indices[i] = prim_indices[j]
-                prim_indices[j] = tmp
-                j -= 1
-
-        left_count = i - first
-        if left_count == 0 or left_count == count:
-            # Degenerate - keep as leaf
-            node_left_first[node_idx] = first
-            node_tri_count[node_idx] = count
-            continue
-
-        # Create children
-        left_idx = nodes_used
-        right_idx = nodes_used + 1
-        nodes_used += 2
-
-        # Mark parent as interior
-        node_left_first[node_idx] = left_idx
-        node_tri_count[node_idx] = 0
-
-        # Push children to stack
-        stack_node[stack_ptr] = right_idx
-        stack_first[stack_ptr] = i
-        stack_count[stack_ptr] = count - left_count
-        stack_ptr += 1
-
-        stack_node[stack_ptr] = left_idx
-        stack_first[stack_ptr] = first
-        stack_count[stack_ptr] = left_count
-        stack_ptr += 1
-
-    return nodes_used
-
-
-def build_bvh(num_triangles: int, num_vertices: int):
-    """Build BVH acceleration structure using shared data fields.
-
-    Args:
-        num_triangles: Number of triangles in the scene
-        num_vertices: Number of vertices in the scene
-    """
-    n = num_triangles
-    if n == 0:
-        return
-
-    # GPU: compute centroids and init prim_indices
-    bvh_init_centroids(n)
-    ti.sync()  # Ensure GPU is done before CPU reads
-
-    # CPU: build tree (deterministic)
-    _build_bvh_cpu(n, num_vertices)
-
-
-def _build_bvh_cpu(n: int, num_vertices: int):
-    """Build BVH on CPU using Numba for speed"""
-    # Copy data to numpy
-    centroids = data.tri_centroids.to_numpy()[:n]
-    vertices = data.vertices.to_numpy()[:num_vertices]
-    indices = data.indices.to_numpy()[:n * 3]
-
-    # Allocate output arrays
-    max_nodes = n * 2
-    node_aabb_min = np.zeros((max_nodes, 3), dtype=np.float32)
-    node_aabb_max = np.zeros((max_nodes, 3), dtype=np.float32)
-    node_left_first = np.zeros(max_nodes, dtype=np.uint32)
-    node_tri_count = np.zeros(max_nodes, dtype=np.uint32)
-    prim_indices = np.arange(n, dtype=np.int32)
-
-    # Run njit-compiled build
-    nodes_used = _build_bvh_njit(
-        n, centroids, vertices, indices,
-        node_aabb_min, node_aabb_max, node_left_first, node_tri_count,
-        prim_indices
-    )
-
-    # Copy results back to Taichi fields
-    for i in range(nodes_used):
-        data.bvh_nodes[i].aabb_min = node_aabb_min[i].tolist()
-        data.bvh_nodes[i].aabb_max = node_aabb_max[i].tolist()
-        data.bvh_nodes[i].left_first = int(node_left_first[i])
-        data.bvh_nodes[i].tri_count = int(node_tri_count[i])
-
-    for i in range(n):
-        data.bvh_prim_indices[i] = int(prim_indices[i])
-
-    data.num_bvh_nodes[None] = nodes_used
