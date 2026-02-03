@@ -19,6 +19,9 @@ init_radix_sort()
 from kernels.bvh import build_lbvh
 from kernels.raytracing import run_raytrace
 from kernels.debug import run_debug_bvh
+from kernels.physics import (
+    compute_local_vertices, apply_gravity, integrate_bodies, update_render_vertices
+)
 
 # Constants from data module
 WIDTH, HEIGHT = data.WIDTH, data.HEIGHT
@@ -65,8 +68,67 @@ class Scene:
     def __init__(self):
         self.object_starts = []  # List of (start_vert, num_verts) tuples
 
+    def _create_rigid_body(self, center, mass, vert_start, vert_count):
+        """Create a rigid body and return its index."""
+        body_idx = data.num_bodies[None]
+
+        # Set body properties
+        data.bodies[body_idx].pos = center
+        data.bodies[body_idx].quat = (1.0, 0.0, 0.0, 0.0)  # Identity quaternion (w, x, y, z)
+        data.bodies[body_idx].vel = (0.0, 0.0, 0.0)
+        data.bodies[body_idx].omega = (0.0, 0.0, 0.0)
+        data.bodies[body_idx].mass = mass
+        data.bodies[body_idx].inv_mass = 1.0 / mass if mass > 0 else 0.0
+        # Simple uniform sphere inertia as default (will be overwritten for specific shapes)
+        data.bodies[body_idx].inertia = (1.0, 1.0, 1.0)
+        data.bodies[body_idx].inv_inertia = (1.0, 1.0, 1.0)
+        data.bodies[body_idx].vert_start = vert_start
+        data.bodies[body_idx].vert_count = vert_count
+
+        data.num_bodies[None] += 1
+        return body_idx
+
+    def _create_sphere_geom(self, body_idx, radius, local_pos=(0, 0, 0)):
+        """Create a sphere collision geometry for a body."""
+        geom_idx = data.num_geoms[None]
+
+        data.geoms[geom_idx].geom_type = data.GEOM_SPHERE
+        data.geoms[geom_idx].body_idx = body_idx
+        data.geoms[geom_idx].local_pos = local_pos
+        data.geoms[geom_idx].local_quat = (1.0, 0.0, 0.0, 0.0)
+        # SPHERE data: [radius, 0, 0, 0, 0, 0, 0]
+        data.geoms[geom_idx].data = (radius, 0, 0, 0, 0, 0, 0)
+        # World transform will be computed each physics step
+        data.geoms[geom_idx].world_pos = (0, 0, 0)
+        data.geoms[geom_idx].world_quat = (1, 0, 0, 0)
+        data.geoms[geom_idx].aabb_min = (0, 0, 0)
+        data.geoms[geom_idx].aabb_max = (0, 0, 0)
+
+        data.num_geoms[None] += 1
+        return geom_idx
+
+    def _create_box_geom(self, body_idx, half_extents, local_pos=(0, 0, 0)):
+        """Create a box collision geometry for a body."""
+        geom_idx = data.num_geoms[None]
+        hx, hy, hz = half_extents
+
+        data.geoms[geom_idx].geom_type = data.GEOM_BOX
+        data.geoms[geom_idx].body_idx = body_idx
+        data.geoms[geom_idx].local_pos = local_pos
+        data.geoms[geom_idx].local_quat = (1.0, 0.0, 0.0, 0.0)
+        # BOX data: [half_x, half_y, half_z, 0, 0, 0, 0]
+        data.geoms[geom_idx].data = (hx, hy, hz, 0, 0, 0, 0)
+        data.geoms[geom_idx].world_pos = (0, 0, 0)
+        data.geoms[geom_idx].world_quat = (1, 0, 0, 0)
+        data.geoms[geom_idx].aabb_min = (0, 0, 0)
+        data.geoms[geom_idx].aabb_max = (0, 0, 0)
+
+        data.num_geoms[None] += 1
+        return geom_idx
+
     @benchmark
-    def add_sphere(self, center, radius, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0), segments=16):
+    def add_sphere(self, center, radius, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0),
+                   segments=16, is_static=False):
         """Add a UV sphere as triangles"""
         cx, cy, cz = center
         start_vertex = data.num_vertices[None]
@@ -116,11 +178,24 @@ class Scene:
         for i in range(start_vertex, data.num_vertices[None]):
             data.vertex_colors[i] = color
 
-        self.object_starts.append((start_vertex, data.num_vertices[None] - start_vertex))
+        vert_count = data.num_vertices[None] - start_vertex
+        self.object_starts.append((start_vertex, vert_count))
+
+        # Create physics body and collision geom
+        mass = 0.0 if is_static else 1.0  # Default mass of 1.0 for dynamic objects
+        body_idx = self._create_rigid_body(center, mass, start_vertex, vert_count)
+        self._create_sphere_geom(body_idx, radius)
+
+        # Set proper sphere inertia: I = 2/5 * m * r^2
+        if mass > 0:
+            inertia = 0.4 * mass * radius * radius
+            data.bodies[body_idx].inertia = (inertia, inertia, inertia)
+            data.bodies[body_idx].inv_inertia = (1.0/inertia, 1.0/inertia, 1.0/inertia)
+
         return len(self.object_starts) - 1
 
     @benchmark
-    def add_box(self, center, size, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0)):
+    def add_box(self, center, size, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0), is_static=False):
         """Add a box as 12 triangles"""
         cx, cy, cz = center
         sx, sy, sz = size[0] / 2, size[1] / 2, size[2] / 2
@@ -162,7 +237,28 @@ class Scene:
         for i in range(start_vertex, data.num_vertices[None]):
             data.vertex_colors[i] = color
 
-        self.object_starts.append((start_vertex, data.num_vertices[None] - start_vertex))
+        vert_count = data.num_vertices[None] - start_vertex
+        self.object_starts.append((start_vertex, vert_count))
+
+        # Create physics body and collision geom
+        mass = 0.0 if is_static else 1.0
+        body_idx = self._create_rigid_body(center, mass, start_vertex, vert_count)
+        half_extents = (size[0] / 2, size[1] / 2, size[2] / 2)
+        self._create_box_geom(body_idx, half_extents)
+
+        # Set proper box inertia: I = 1/12 * m * (h^2 + d^2) for each axis
+        if mass > 0:
+            hx, hy, hz = half_extents
+            # Full dimensions
+            wx, wy, wz = 2*hx, 2*hy, 2*hz
+            ix = mass / 12.0 * (wy*wy + wz*wz)
+            iy = mass / 12.0 * (wx*wx + wz*wz)
+            iz = mass / 12.0 * (wx*wx + wy*wy)
+            data.bodies[body_idx].inertia = (ix, iy, iz)
+            data.bodies[body_idx].inv_inertia = (1.0/ix if ix > 0 else 0,
+                                                  1.0/iy if iy > 0 else 0,
+                                                  1.0/iz if iz > 0 else 0)
+
         return len(self.object_starts) - 1
 
     @benchmark
@@ -401,15 +497,14 @@ class Camera:
         )
 
 
-@ti.kernel
-def update_physics(dt: ti.f32):
-    for i in range(data.num_vertices[None]):
-        data.vertices[i] += data.velocities[i] * dt
-
 # Benchmarked wrappers for kernels (ti.sync() needed for accurate GPU timing)
 @benchmark
 def run_physics(dt):
-    update_physics(dt)
+    """Run one physics step: gravity -> integrate -> update render mesh."""
+    num_bodies = data.num_bodies[None]
+    apply_gravity(num_bodies, dt)
+    integrate_bodies(num_bodies, dt)
+    update_render_vertices(num_bodies)
     if is_enabled_benchmark():
         ti.sync()
 
@@ -429,57 +524,81 @@ def run_rasterize(ti_scene, ti_camera, canvas, cam):
     if is_enabled_benchmark():
         ti.sync()
 
+# def create_demo_scene():
+#     """Create demo scene - dragon inside a room"""
+#     room_size = 10
+#     wall_thickness = 0.5
+#     half = room_size / 2
+
+#     # Floor
+#     scene.add_box(
+#         center=(0, -wall_thickness / 2, 0),
+#         size=(room_size, wall_thickness, room_size),
+#         color=(0.4, 0.4, 0.4)
+#     )
+
+#     # Ceiling
+#     scene.add_box(
+#         center=(0, room_size - wall_thickness / 2, 0),
+#         size=(room_size, wall_thickness, room_size),
+#         color=(0.5, 0.5, 0.5)
+#     )
+
+#     # Back wall (far from camera)
+#     scene.add_box(
+#         center=(0, half, -half - wall_thickness / 2),
+#         size=(room_size, room_size, wall_thickness),
+#         color=(0.6, 0.6, 0.7)
+#     )
+
+#     # Left wall
+#     scene.add_box(
+#         center=(-half - wall_thickness / 2, half, 0),
+#         size=(wall_thickness, room_size, room_size),
+#         color=(0.7, 0.5, 0.5)
+#     )
+
+#     # Right wall
+#     scene.add_box(
+#         center=(half + wall_thickness / 2, half, 0),
+#         size=(wall_thickness, room_size, room_size),
+#         color=(0.5, 0.7, 0.5)
+#     )
+
+#     # Front wall is OPEN (no wall) so we can see inside
+
+#     # Dragon inside the room
+#     scene.add_mesh_from_obj(
+#         "./models/dragon_small.obj",
+#         center=(0, 2.5, 0),
+#         size=8.0,
+#         color=(0.8, 0.3, 0.3),
+#         rotation=(0, 180, 0)
+#     )
 
 def create_demo_scene():
-    """Create demo scene - dragon inside a room"""
-    room_size = 10
-    wall_thickness = 0.5
-    half = room_size / 2
-
-    # Floor
+    """Create demo scene - spheres dropping onto a ground plane"""
+    # Large ground plane (static)
     scene.add_box(
-        center=(0, -wall_thickness / 2, 0),
-        size=(room_size, wall_thickness, room_size),
-        color=(0.4, 0.4, 0.4)
+        center=(0, -0.25, 0),
+        size=(20, 0.5, 20),
+        color=(0.3, 0.3, 0.35),
+        is_static=True
     )
 
-    # Ceiling
+    # Spheres at various heights (dynamic, will drop with physics)
+    scene.add_sphere(center=(-2, 3, 0), radius=0.5, color=(0.9, 0.2, 0.2))   # Red
+    scene.add_sphere(center=(0, 5, 0), radius=0.7, color=(0.2, 0.9, 0.2))    # Green
+    scene.add_sphere(center=(2, 4, 1), radius=0.5, color=(0.2, 0.2, 0.9))    # Blue
+    scene.add_sphere(center=(-1, 6, -1), radius=0.6, color=(0.9, 0.9, 0.2))  # Yellow
+    scene.add_sphere(center=(1.5, 7, 0.5), radius=0.4, color=(0.9, 0.2, 0.9)) # Magenta
+    scene.add_sphere(center=(0, 8, 0), radius=0.8, color=(0.2, 0.9, 0.9))    # Cyan
+
+    # A box to show mixed shapes (dynamic)
     scene.add_box(
-        center=(0, room_size - wall_thickness / 2, 0),
-        size=(room_size, wall_thickness, room_size),
-        color=(0.5, 0.5, 0.5)
-    )
-
-    # Back wall (far from camera)
-    scene.add_box(
-        center=(0, half, -half - wall_thickness / 2),
-        size=(room_size, room_size, wall_thickness),
-        color=(0.6, 0.6, 0.7)
-    )
-
-    # Left wall
-    scene.add_box(
-        center=(-half - wall_thickness / 2, half, 0),
-        size=(wall_thickness, room_size, room_size),
-        color=(0.7, 0.5, 0.5)
-    )
-
-    # Right wall
-    scene.add_box(
-        center=(half + wall_thickness / 2, half, 0),
-        size=(wall_thickness, room_size, room_size),
-        color=(0.5, 0.7, 0.5)
-    )
-
-    # Front wall is OPEN (no wall) so we can see inside
-
-    # Dragon inside the room
-    scene.add_mesh_from_obj(
-        "./models/dragon_small.obj",
-        center=(0, 2.5, 0),
-        size=8.0,
-        color=(0.8, 0.3, 0.3),
-        rotation=(0, 180, 0)
+        center=(-3, 2, 2),
+        size=(1, 1, 1),
+        color=(0.8, 0.5, 0.2)
     )
 
 
@@ -517,7 +636,11 @@ def main():
 
     create_demo_scene()
 
+    # Compute local-space vertices for physics (once, before simulation)
+    compute_local_vertices(data.num_bodies[None])
+
     print(f"Scene: {data.num_vertices[None]} vertices, {data.num_triangles[None]} triangles")
+    print(f"Physics: {data.num_bodies[None]} bodies, {data.num_geoms[None]} geoms")
     print(f"Rendering: {'Ray Tracing' if use_raytracing else 'Rasterization'}")
 
     window = ti.ui.Window("Taichi Scene", (WIDTH, HEIGHT), vsync=False)

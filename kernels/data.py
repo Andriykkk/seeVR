@@ -17,6 +17,17 @@ MAX_VERTICES = 500000
 MAX_BVH_NODES = MAX_TRIANGLES * 2
 WIDTH, HEIGHT = 800, 600
 
+# Physics constants
+MAX_BODIES = 1000
+MAX_GEOMS = 2000  # Can have multiple geoms per body
+
+# Collision geometry types
+GEOM_SPHERE = 1
+GEOM_BOX = 2
+GEOM_CAPSULE = 3
+GEOM_CONVEX = 4
+GEOM_PLANE = 5
+
 # BVH Node structure
 # For internal nodes: left_first = left child, right_child = right child, tri_count = 0
 # For leaf nodes: left_first = first prim index, right_child unused, tri_count > 0
@@ -29,8 +40,44 @@ BVHNode = ti.types.struct(
     parent_idx=ti.u32,  # Parent node index (0xFFFFFFFF for root)
 )
 
+# Rigid Body structure (dynamic state, updated each frame)
+RigidBody = ti.types.struct(
+    pos=ti.types.vector(3, ti.f32),       # Center of mass position
+    quat=ti.types.vector(4, ti.f32),      # Orientation quaternion (w, x, y, z)
+    vel=ti.types.vector(3, ti.f32),       # Linear velocity
+    omega=ti.types.vector(3, ti.f32),     # Angular velocity
+    mass=ti.f32,                          # Mass (0 = static/infinite mass)
+    inv_mass=ti.f32,                      # 1/mass (0 for static)
+    inertia=ti.types.vector(3, ti.f32),   # Diagonal inertia tensor (local space)
+    inv_inertia=ti.types.vector(3, ti.f32), # 1/inertia
+    # Render mesh mapping
+    vert_start=ti.i32,                    # Start index in vertices array
+    vert_count=ti.i32,                    # Number of vertices for this body
+)
+
+# Collision Geometry structure (static info, set at load time)
+# Each geom belongs to a body and defines a collision shape
+CollisionGeom = ti.types.struct(
+    geom_type=ti.i32,                     # GEOM_SPHERE, GEOM_BOX, etc.
+    body_idx=ti.i32,                      # Which rigid body owns this geom
+    local_pos=ti.types.vector(3, ti.f32), # Offset from body center
+    local_quat=ti.types.vector(4, ti.f32), # Rotation relative to body
+    # Type-specific data (like Genesis vec7):
+    # SPHERE: [radius, 0, 0, 0, 0, 0, 0]
+    # BOX: [half_x, half_y, half_z, 0, 0, 0, 0]
+    # CAPSULE: [radius, half_length, 0, 0, 0, 0, 0]
+    # CONVEX: [vert_start, vert_end, face_start, face_end, 0, 0, 0]
+    data=ti.types.vector(7, ti.f32),
+    # Cached world-space transform (updated each frame)
+    world_pos=ti.types.vector(3, ti.f32),
+    world_quat=ti.types.vector(4, ti.f32),
+    aabb_min=ti.types.vector(3, ti.f32),
+    aabb_max=ti.types.vector(3, ti.f32),
+)
+
 # Global scene fields - initialized by init_scene()
 vertices = None
+original_vertices = None  # Local-space vertices for physics (relative to body center)
 indices = None
 vertex_colors = None
 num_vertices = None
@@ -54,18 +101,31 @@ sort_indices = None
 sort_indices_temp = None
 bvh_aabb_flags = None  # Atomic flags for AABB propagation
 
+# Physics fields
+bodies = None
+geoms = None
+num_bodies = None
+num_geoms = None
+gravity = None  # Gravity vector (adjustable)
+# Local vertices for collision geometry (convex hulls, stored in local space)
+collision_verts = None
+num_collision_verts = None
+
 
 def init_scene():
     """Initialize all Taichi fields. Call after ti.init()"""
-    global vertices, indices, vertex_colors, num_vertices, num_triangles
+    global vertices, original_vertices, indices, vertex_colors, num_vertices, num_triangles
     global velocities, pixels, bvh_nodes, bvh_prim_indices, tri_centroids
     global num_bvh_nodes, traverse_stack, bvh_build_stack
     global morton_codes, scene_aabb_min, scene_aabb_max
     global radix_histogram, radix_prefix_sum, morton_codes_temp
     global sort_indices, sort_indices_temp, bvh_aabb_flags
+    global bodies, geoms, num_bodies, num_geoms, gravity
+    global collision_verts, num_collision_verts
 
     # Geometry
     vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
+    original_vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)  # Local-space
     indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES * 3)
     vertex_colors = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
     num_vertices = ti.field(dtype=ti.i32, shape=())
@@ -96,6 +156,20 @@ def init_scene():
     # Atomic flags for AABB propagation (one per internal node)
     bvh_aabb_flags = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)
 
+    # Physics: Rigid bodies and collision geometry
+    bodies = RigidBody.field(shape=MAX_BODIES)
+    geoms = CollisionGeom.field(shape=MAX_GEOMS)
+    num_bodies = ti.field(dtype=ti.i32, shape=())
+    num_geoms = ti.field(dtype=ti.i32, shape=())
+    gravity = ti.Vector.field(3, dtype=ti.f32, shape=())  # Adjustable gravity
+    # Collision vertices for convex hulls (local space, never change)
+    collision_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
+    num_collision_verts = ti.field(dtype=ti.i32, shape=())
+
     # Initialize counts
     num_vertices[None] = 0
     num_triangles[None] = 0
+    num_bodies[None] = 0
+    num_geoms[None] = 0
+    num_collision_verts[None] = 0
+    gravity[None] = [0.0, -9.81, 0.0]  # Default Earth gravity
