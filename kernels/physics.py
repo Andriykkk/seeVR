@@ -663,20 +663,22 @@ def narrow_phase(num_pairs: ti.i32):
             has_contact, contact_point, normal, depth = collide_sphere_sphere(
                 pos_a, radius_a, pos_b, radius_b, body_a, body_b, geom_a_idx, geom_b_idx)
 
-        # Sphere-Box (ensure sphere is first)
+        # Sphere-Box: collide_sphere_box returns normal from box to sphere
+        # Convention: normal from body_a to body_b, so need to flip
         elif type_a == data.GEOM_SPHERE and type_b == data.GEOM_BOX:
             radius = data_a[0]
             half_b = ti.Vector([data_b[0], data_b[1], data_b[2]])
             has_contact, contact_point, normal, depth = collide_sphere_box(
                 pos_a, radius, pos_b, quat_b, half_b, body_a, body_b, geom_a_idx, geom_b_idx)
+            # Flip: collide returns box→sphere, we need sphere→box (A→B)
+            normal = -normal
 
         elif type_a == data.GEOM_BOX and type_b == data.GEOM_SPHERE:
             radius = data_b[0]
             half_a = ti.Vector([data_a[0], data_a[1], data_a[2]])
             has_contact, contact_point, normal, depth = collide_sphere_box(
                 pos_b, radius, pos_a, quat_a, half_a, body_b, body_a, geom_b_idx, geom_a_idx)
-            # Flip normal since we swapped order
-            normal = -normal
+            # No flip needed: collide returns box→sphere, which is A→B here
 
         # Box-Box
         elif type_a == data.GEOM_BOX and type_b == data.GEOM_BOX:
@@ -696,3 +698,156 @@ def narrow_phase(num_pairs: ti.i32):
                 data.contacts[slot].body_b = body_b
                 data.contacts[slot].geom_a = geom_a_idx
                 data.contacts[slot].geom_b = geom_b_idx
+
+
+# =============================================================================
+# Contact Solver (Step 6 from physics pipeline)
+# Sequential Impulse / Projected Gauss-Seidel solver
+# =============================================================================
+
+@ti.func
+def compute_world_inv_inertia(body_idx: ti.i32) -> ti.types.matrix(3, 3, ti.f32):
+    """Compute world-space inverse inertia tensor.
+
+    I_world^-1 = R * I_local^-1 * R^T
+    where R is the rotation matrix from body quaternion.
+
+    Since we store diagonal inertia, this simplifies to:
+    I_world^-1 = R * diag(inv_inertia) * R^T
+    """
+    inv_I = data.bodies[body_idx].inv_inertia
+    quat = data.bodies[body_idx].quat
+
+    # Get rotation matrix columns
+    r0 = quat_rotate(quat, ti.Vector([1.0, 0.0, 0.0]))
+    r1 = quat_rotate(quat, ti.Vector([0.0, 1.0, 0.0]))
+    r2 = quat_rotate(quat, ti.Vector([0.0, 0.0, 1.0]))
+
+    # I_world^-1 = R * diag(inv_I) * R^T
+    # = sum over i: inv_I[i] * outer(r_i, r_i)
+    result = ti.Matrix.zero(ti.f32, 3, 3)
+    for i in ti.static(range(3)):
+        for j in ti.static(range(3)):
+            result[i, j] = (inv_I[0] * r0[i] * r0[j] +
+                           inv_I[1] * r1[i] * r1[j] +
+                           inv_I[2] * r2[i] * r2[j])
+    return result
+
+
+@ti.func
+def apply_impulse_to_body(body_idx: ti.i32, impulse: ti.types.vector(3, ti.f32),
+                          r: ti.types.vector(3, ti.f32), inv_inertia_world: ti.types.matrix(3, 3, ti.f32)):
+    """Apply impulse to body at point offset r from center of mass.
+
+    Δv = impulse * inv_mass
+    Δω = I^-1 * (r × impulse)
+    """
+    inv_mass = data.bodies[body_idx].inv_mass
+    if inv_mass > 0:
+        data.bodies[body_idx].vel += impulse * inv_mass
+
+        # Angular impulse: torque = r × impulse
+        torque = r.cross(impulse)
+        # Δω = I^-1 * torque
+        delta_omega = inv_inertia_world @ torque
+        data.bodies[body_idx].omega += delta_omega
+
+
+@ti.kernel
+def solve_contacts(num_contacts: ti.i32, num_iterations: ti.i32):
+    """Solve contact constraints using Sequential Impulse method.
+
+    For each contact:
+    1. Compute relative velocity at contact point
+    2. Compute effective mass K
+    3. Compute impulse to resolve constraint
+    4. Clamp impulse (no pulling - contacts can only push)
+    5. Apply impulse to both bodies
+
+    Repeat for multiple iterations for convergence.
+
+    Parameters:
+        bias_factor: Baumgarte stabilization factor (0.1-0.3 typical)
+        slop: Allowed penetration before correction (0.01 typical)
+        restitution: Bounciness (0 = no bounce, 1 = perfect bounce)
+    """
+    # Solver parameters
+    bias_factor = 0.2  # Baumgarte stabilization
+    slop = 0.01  # Allowed penetration (meters)
+    restitution = 0.3  # Bounciness
+
+    for _ in range(num_iterations):
+        for c in range(num_contacts):
+            body_a = data.contacts[c].body_a
+            body_b = data.contacts[c].body_b
+            normal = data.contacts[c].normal
+            contact_point = data.contacts[c].point
+            depth = data.contacts[c].depth
+
+            # Get body states
+            pos_a = data.bodies[body_a].pos
+            pos_b = data.bodies[body_b].pos
+            vel_a = data.bodies[body_a].vel
+            vel_b = data.bodies[body_b].vel
+            omega_a = data.bodies[body_a].omega
+            omega_b = data.bodies[body_b].omega
+            inv_mass_a = data.bodies[body_a].inv_mass
+            inv_mass_b = data.bodies[body_b].inv_mass
+
+            # Vectors from body centers to contact point
+            r_a = contact_point - pos_a
+            r_b = contact_point - pos_b
+
+            # Compute world-space inverse inertia tensors
+            inv_I_a = compute_world_inv_inertia(body_a)
+            inv_I_b = compute_world_inv_inertia(body_b)
+
+            # Relative velocity at contact point
+            # v_rel = (v_b + omega_b × r_b) - (v_a + omega_a × r_a)
+            v_contact_a = vel_a + omega_a.cross(r_a)
+            v_contact_b = vel_b + omega_b.cross(r_b)
+            v_rel = v_contact_b - v_contact_a
+
+            # Normal component of relative velocity (positive = separating)
+            v_n = v_rel.dot(normal)
+
+            # Compute effective mass K along normal
+            # K = inv_mass_a + inv_mass_b + n · ((I_a^-1 * (r_a × n)) × r_a) + n · ((I_b^-1 * (r_b × n)) × r_b)
+            r_a_cross_n = r_a.cross(normal)
+            r_b_cross_n = r_b.cross(normal)
+
+            angular_a = (inv_I_a @ r_a_cross_n).cross(r_a)
+            angular_b = (inv_I_b @ r_b_cross_n).cross(r_b)
+
+            K = inv_mass_a + inv_mass_b + normal.dot(angular_a) + normal.dot(angular_b)
+
+            # Avoid division by zero for static-static (shouldn't happen, but be safe)
+            if K > 1e-8:
+                # Baumgarte bias: push apart if penetrating more than slop
+                bias = 0.0
+                penetration = depth - slop
+                if penetration > 0:
+                    bias = bias_factor * penetration
+
+                # Restitution bias (only if approaching)
+                if v_n < 0:
+                    bias += -restitution * v_n
+
+                # Compute impulse magnitude
+                # We want: v_n_new = 0 (or positive for bounce)
+                # impulse = -(v_n + bias) / K
+                impulse_magnitude = -(v_n + bias) / K
+
+                # Clamp: contacts can only push, not pull
+                # (In full solver, we'd accumulate and clamp accumulated impulse)
+                if impulse_magnitude < 0:
+                    impulse_magnitude = 0.0
+
+                # Apply impulse to both bodies
+                impulse = normal * impulse_magnitude
+
+                # Body A gets negative impulse (pushed away from contact)
+                apply_impulse_to_body(body_a, -impulse, r_a, inv_I_a)
+
+                # Body B gets positive impulse (pushed in normal direction)
+                apply_impulse_to_body(body_b, impulse, r_b, inv_I_b)

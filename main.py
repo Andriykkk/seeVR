@@ -22,7 +22,7 @@ from kernels.debug import run_debug_bvh
 from kernels.physics import (
     compute_local_vertices, apply_gravity, integrate_bodies,
     update_render_vertices, update_geom_transforms, broad_phase_n_squared,
-    narrow_phase
+    narrow_phase, solve_contacts
 )
 
 # Constants from data module
@@ -502,17 +502,14 @@ class Camera:
 # Benchmarked wrappers for kernels (ti.sync() needed for accurate GPU timing)
 @benchmark
 def run_physics(dt):
-    """Run one physics step: gravity -> integrate -> collision -> update render mesh."""
+    """Run one physics step following the pipeline from TODO.md."""
     num_bodies = data.num_bodies[None]
     num_geoms = data.num_geoms[None]
 
-    # Step 1: Apply gravity
+    # Step 1: Apply external forces (gravity)
     apply_gravity(num_bodies, dt)
 
-    # Step 2: Integrate positions/orientations
-    integrate_bodies(num_bodies, dt)
-
-    # Step 3: Update geom world transforms and AABBs
+    # Step 3: Update geom world transforms and AABBs (for collision detection)
     update_geom_transforms(num_geoms)
 
     # Step 4: Broad phase - find candidate collision pairs
@@ -525,7 +522,13 @@ def run_physics(dt):
     if num_pairs > 0:
         narrow_phase(num_pairs)
 
-    # TODO: Step 6: Newton solver - resolve contacts
+    # Step 6: Solve contacts - correct velocities to prevent penetration
+    num_contacts = data.num_contacts[None]
+    if num_contacts > 0:
+        solve_contacts(num_contacts, 10, dt)  # 10 iterations for convergence
+
+    # Step 7: Integrate positions/orientations (AFTER velocity correction)
+    integrate_bodies(num_bodies, dt)
 
     # Step 8: Update render mesh vertices
     update_render_vertices(num_bodies)
