@@ -436,40 +436,40 @@ def create_demo_scene():
     wall_thickness = 0.5
     half = room_size / 2
 
-    # # Floor
-    # scene.add_box(
-    #     center=(0, -wall_thickness / 2, 0),
-    #     size=(room_size, wall_thickness, room_size),
-    #     color=(0.4, 0.4, 0.4)
-    # )
+    # Floor
+    scene.add_box(
+        center=(0, -wall_thickness / 2, 0),
+        size=(room_size, wall_thickness, room_size),
+        color=(0.4, 0.4, 0.4)
+    )
 
-    # # Ceiling
-    # scene.add_box(
-    #     center=(0, room_size - wall_thickness / 2, 0),
-    #     size=(room_size, wall_thickness, room_size),
-    #     color=(0.5, 0.5, 0.5)
-    # )
+    # Ceiling
+    scene.add_box(
+        center=(0, room_size - wall_thickness / 2, 0),
+        size=(room_size, wall_thickness, room_size),
+        color=(0.5, 0.5, 0.5)
+    )
 
-    # # Back wall (far from camera)
-    # scene.add_box(
-    #     center=(0, half, -half - wall_thickness / 2),
-    #     size=(room_size, room_size, wall_thickness),
-    #     color=(0.6, 0.6, 0.7)
-    # )
+    # Back wall (far from camera)
+    scene.add_box(
+        center=(0, half, -half - wall_thickness / 2),
+        size=(room_size, room_size, wall_thickness),
+        color=(0.6, 0.6, 0.7)
+    )
 
-    # # Left wall
-    # scene.add_box(
-    #     center=(-half - wall_thickness / 2, half, 0),
-    #     size=(wall_thickness, room_size, room_size),
-    #     color=(0.7, 0.5, 0.5)
-    # )
+    # Left wall
+    scene.add_box(
+        center=(-half - wall_thickness / 2, half, 0),
+        size=(wall_thickness, room_size, room_size),
+        color=(0.7, 0.5, 0.5)
+    )
 
-    # # Right wall
-    # scene.add_box(
-    #     center=(half + wall_thickness / 2, half, 0),
-    #     size=(wall_thickness, room_size, room_size),
-    #     color=(0.5, 0.7, 0.5)
-    # )
+    # Right wall
+    scene.add_box(
+        center=(half + wall_thickness / 2, half, 0),
+        size=(wall_thickness, room_size, room_size),
+        color=(0.5, 0.7, 0.5)
+    )
 
     # Front wall is OPEN (no wall) so we can see inside
 
@@ -495,6 +495,7 @@ def render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytrac
             run_debug_bvh(camera)
             rays = WIDTH * HEIGHT
         else:
+            run_build_bvh()
             run_raytrace(camera, frame, settings)
             rays = WIDTH * HEIGHT * settings.samples_per_pixel * settings.max_bounces
         canvas.set_image(data.pixels)
@@ -532,7 +533,6 @@ def main():
     ema_alpha = 0.1  # Smoothing factor (lower = smoother, higher = more responsive)
 
     while window.running:
-        run_build_bvh()
         rays = render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytracing)
 
         now = time.perf_counter()
