@@ -20,6 +20,8 @@ WIDTH, HEIGHT = 800, 600
 # Physics constants
 MAX_BODIES = 1000
 MAX_GEOMS = 2000  # Can have multiple geoms per body
+MAX_COLLISION_PAIRS = 10000  # Maximum broad phase candidate pairs
+MAX_CONTACTS = 10000  # Maximum narrow phase contacts
 
 # Collision geometry types
 GEOM_SPHERE = 1
@@ -75,6 +77,17 @@ CollisionGeom = ti.types.struct(
     aabb_max=ti.types.vector(3, ti.f32),
 )
 
+# Contact structure (output of narrow phase)
+Contact = ti.types.struct(
+    point=ti.types.vector(3, ti.f32),     # Contact point in world space
+    normal=ti.types.vector(3, ti.f32),    # Contact normal (from body_a to body_b)
+    depth=ti.f32,                          # Penetration depth (positive = overlapping)
+    body_a=ti.i32,                         # First body index
+    body_b=ti.i32,                         # Second body index
+    geom_a=ti.i32,                         # First geom index
+    geom_b=ti.i32,                         # Second geom index
+)
+
 # Global scene fields - initialized by init_scene()
 vertices = None
 original_vertices = None  # Local-space vertices for physics (relative to body center)
@@ -110,6 +123,12 @@ gravity = None  # Gravity vector (adjustable)
 # Local vertices for collision geometry (convex hulls, stored in local space)
 collision_verts = None
 num_collision_verts = None
+# Broad phase collision pairs (candidate pairs whose AABBs overlap)
+collision_pairs = None  # [pair_idx, 0] = geom_a, [pair_idx, 1] = geom_b
+num_collision_pairs = None
+# Narrow phase contacts
+contacts = None
+num_contacts = None
 
 
 def init_scene():
@@ -122,6 +141,8 @@ def init_scene():
     global sort_indices, sort_indices_temp, bvh_aabb_flags
     global bodies, geoms, num_bodies, num_geoms, gravity
     global collision_verts, num_collision_verts
+    global collision_pairs, num_collision_pairs
+    global contacts, num_contacts
 
     # Geometry
     vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
@@ -166,10 +187,20 @@ def init_scene():
     collision_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
     num_collision_verts = ti.field(dtype=ti.i32, shape=())
 
+    # Broad phase collision pairs
+    collision_pairs = ti.Vector.field(2, dtype=ti.i32, shape=MAX_COLLISION_PAIRS)
+    num_collision_pairs = ti.field(dtype=ti.i32, shape=())
+
+    # Narrow phase contacts
+    contacts = Contact.field(shape=MAX_CONTACTS)
+    num_contacts = ti.field(dtype=ti.i32, shape=())
+
     # Initialize counts
     num_vertices[None] = 0
     num_triangles[None] = 0
     num_bodies[None] = 0
     num_geoms[None] = 0
     num_collision_verts[None] = 0
+    num_collision_pairs[None] = 0
+    num_contacts[None] = 0
     gravity[None] = [0.0, -9.81, 0.0]  # Default Earth gravity

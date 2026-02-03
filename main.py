@@ -20,7 +20,9 @@ from kernels.bvh import build_lbvh
 from kernels.raytracing import run_raytrace
 from kernels.debug import run_debug_bvh
 from kernels.physics import (
-    compute_local_vertices, apply_gravity, integrate_bodies, update_render_vertices
+    compute_local_vertices, apply_gravity, integrate_bodies,
+    update_render_vertices, update_geom_transforms, broad_phase_n_squared,
+    narrow_phase
 )
 
 # Constants from data module
@@ -500,11 +502,34 @@ class Camera:
 # Benchmarked wrappers for kernels (ti.sync() needed for accurate GPU timing)
 @benchmark
 def run_physics(dt):
-    """Run one physics step: gravity -> integrate -> update render mesh."""
+    """Run one physics step: gravity -> integrate -> collision -> update render mesh."""
     num_bodies = data.num_bodies[None]
+    num_geoms = data.num_geoms[None]
+
+    # Step 1: Apply gravity
     apply_gravity(num_bodies, dt)
+
+    # Step 2: Integrate positions/orientations
     integrate_bodies(num_bodies, dt)
+
+    # Step 3: Update geom world transforms and AABBs
+    update_geom_transforms(num_geoms)
+
+    # Step 4: Broad phase - find candidate collision pairs
+    data.num_collision_pairs[None] = 0  # Reset counter
+    broad_phase_n_squared(num_geoms)
+
+    # Step 5: Narrow phase - actual collision detection
+    data.num_contacts[None] = 0  # Reset contact counter
+    num_pairs = data.num_collision_pairs[None]
+    if num_pairs > 0:
+        narrow_phase(num_pairs)
+
+    # TODO: Step 6: Newton solver - resolve contacts
+
+    # Step 8: Update render mesh vertices
     update_render_vertices(num_bodies)
+
     if is_enabled_benchmark():
         ti.sync()
 

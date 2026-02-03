@@ -48,6 +48,18 @@ def quat_from_angular_velocity(omega: ti.types.vector(3, ti.f32), dt: ti.f32) ->
     return ti.Vector([1.0, half_angle[0], half_angle[1], half_angle[2]])
 
 
+@ti.func
+def quat_conjugate(q: ti.types.vector(4, ti.f32)) -> ti.types.vector(4, ti.f32):
+    """Return conjugate of quaternion (inverse for unit quaternions)."""
+    return ti.Vector([q[0], -q[1], -q[2], -q[3]])
+
+
+@ti.func
+def quat_rotate_inverse(q: ti.types.vector(4, ti.f32), v: ti.types.vector(3, ti.f32)) -> ti.types.vector(3, ti.f32):
+    """Rotate vector v by inverse of quaternion q (world to local)."""
+    return quat_rotate(quat_conjugate(q), v)
+
+
 # =============================================================================
 # Physics kernels
 # =============================================================================
@@ -119,3 +131,568 @@ def update_render_vertices(num_bodies: ti.i32):
         for v in range(start, start + count):
             local_pos = data.original_vertices[v]
             data.vertices[v] = body_pos + quat_rotate(body_quat, local_pos)
+
+
+# =============================================================================
+# Collision geometry transforms (Step 3 from physics pipeline)
+# =============================================================================
+
+@ti.func
+def compute_sphere_aabb(center: ti.types.vector(3, ti.f32), radius: ti.f32):
+    """Compute AABB for a sphere."""
+    r = ti.Vector([radius, radius, radius])
+    return center - r, center + r
+
+
+@ti.func
+def compute_box_aabb(center: ti.types.vector(3, ti.f32),
+                     quat: ti.types.vector(4, ti.f32),
+                     half_extents: ti.types.vector(3, ti.f32)):
+    """Compute AABB for an oriented box.
+
+    For each axis, project the rotated box extents.
+    """
+    # Get rotation matrix columns from quaternion
+    # These are the world-space directions of the box's local axes
+    ax = quat_rotate(quat, ti.Vector([1.0, 0.0, 0.0]))
+    ay = quat_rotate(quat, ti.Vector([0.0, 1.0, 0.0]))
+    az = quat_rotate(quat, ti.Vector([0.0, 0.0, 1.0]))
+
+    # For each world axis, compute the extent as sum of absolute projections
+    extent = ti.Vector([
+        ti.abs(ax[0]) * half_extents[0] + ti.abs(ay[0]) * half_extents[1] + ti.abs(az[0]) * half_extents[2],
+        ti.abs(ax[1]) * half_extents[0] + ti.abs(ay[1]) * half_extents[1] + ti.abs(az[1]) * half_extents[2],
+        ti.abs(ax[2]) * half_extents[0] + ti.abs(ay[2]) * half_extents[1] + ti.abs(az[2]) * half_extents[2],
+    ])
+
+    return center - extent, center + extent
+
+
+@ti.func
+def compute_capsule_aabb(center: ti.types.vector(3, ti.f32),
+                         quat: ti.types.vector(4, ti.f32),
+                         radius: ti.f32, half_length: ti.f32):
+    """Compute AABB for a capsule (oriented along local Y axis)."""
+    # Capsule axis in world space
+    axis = quat_rotate(quat, ti.Vector([0.0, half_length, 0.0]))
+
+    # AABB of the two sphere centers
+    p1 = center + axis
+    p2 = center - axis
+    aabb_min = ti.min(p1, p2)
+    aabb_max = ti.max(p1, p2)
+
+    # Expand by radius
+    r = ti.Vector([radius, radius, radius])
+    return aabb_min - r, aabb_max + r
+
+
+@ti.kernel
+def update_geom_transforms(num_geoms: ti.i32):
+    """Update world transforms and AABBs for all collision geometries.
+
+    For each geom:
+        world_pos = body.pos + rotate(body.quat, geom.local_pos)
+        world_quat = body.quat * geom.local_quat
+        aabb = compute based on geom type
+    """
+    for i in range(num_geoms):
+        body_idx = data.geoms[i].body_idx
+        body_pos = data.bodies[body_idx].pos
+        body_quat = data.bodies[body_idx].quat
+
+        # Compute world transform
+        local_pos = data.geoms[i].local_pos
+        local_quat = data.geoms[i].local_quat
+
+        world_pos = body_pos + quat_rotate(body_quat, local_pos)
+        world_quat = quat_mul(body_quat, local_quat)
+
+        data.geoms[i].world_pos = world_pos
+        data.geoms[i].world_quat = world_quat
+
+        # Compute AABB based on geom type
+        geom_type = data.geoms[i].geom_type
+        geom_data = data.geoms[i].data
+
+        aabb_min = ti.Vector([0.0, 0.0, 0.0])
+        aabb_max = ti.Vector([0.0, 0.0, 0.0])
+
+        if geom_type == data.GEOM_SPHERE:
+            radius = geom_data[0]
+            aabb_min, aabb_max = compute_sphere_aabb(world_pos, radius)
+
+        elif geom_type == data.GEOM_BOX:
+            half_extents = ti.Vector([geom_data[0], geom_data[1], geom_data[2]])
+            aabb_min, aabb_max = compute_box_aabb(world_pos, world_quat, half_extents)
+
+        elif geom_type == data.GEOM_CAPSULE:
+            radius = geom_data[0]
+            half_length = geom_data[1]
+            aabb_min, aabb_max = compute_capsule_aabb(world_pos, world_quat, radius, half_length)
+
+        elif geom_type == data.GEOM_PLANE:
+            # Infinite plane - use large AABB
+            aabb_min = ti.Vector([-1e6, -1e6, -1e6])
+            aabb_max = ti.Vector([1e6, 1e6, 1e6])
+
+        data.geoms[i].aabb_min = aabb_min
+        data.geoms[i].aabb_max = aabb_max
+
+
+# =============================================================================
+# Broad phase collision detection (Step 4 from physics pipeline)
+# =============================================================================
+
+@ti.func
+def aabb_overlap(min_a: ti.types.vector(3, ti.f32), max_a: ti.types.vector(3, ti.f32),
+                 min_b: ti.types.vector(3, ti.f32), max_b: ti.types.vector(3, ti.f32)) -> ti.i32:
+    """Check if two AABBs overlap. Returns 1 if overlap, 0 otherwise."""
+    # No overlap if separated along any axis
+    overlap = 1
+    if max_a[0] < min_b[0] or max_b[0] < min_a[0]:
+        overlap = 0
+    if max_a[1] < min_b[1] or max_b[1] < min_a[1]:
+        overlap = 0
+    if max_a[2] < min_b[2] or max_b[2] < min_a[2]:
+        overlap = 0
+    return overlap
+
+
+@ti.kernel
+def broad_phase_n_squared(num_geoms: ti.i32):
+    """Find all geom pairs with overlapping AABBs (N² algorithm).
+
+    For each pair (i, j) where i < j:
+        - Skip if same body (can't collide with yourself)
+        - Skip if both bodies are static (neither can move)
+        - Check AABB overlap
+        - If overlap, add to collision_pairs using atomic counter
+
+    Output: collision_pairs[0..num_collision_pairs] contains candidate pairs
+    """
+    # N² loop: each thread handles one geom, checks against all higher-indexed geoms
+    for i in range(num_geoms):
+        body_a = data.geoms[i].body_idx
+        inv_mass_a = data.bodies[body_a].inv_mass
+
+        for j in range(i + 1, num_geoms):
+            body_b = data.geoms[j].body_idx
+
+            # Skip self-collision (same body)
+            if body_a == body_b:
+                continue
+
+            # Skip static-static pairs (neither can move)
+            inv_mass_b = data.bodies[body_b].inv_mass
+            if inv_mass_a == 0.0 and inv_mass_b == 0.0:
+                continue
+
+            # Check AABB overlap
+            if aabb_overlap(data.geoms[i].aabb_min, data.geoms[i].aabb_max,
+                           data.geoms[j].aabb_min, data.geoms[j].aabb_max):
+                # Atomically get slot in collision_pairs array
+                slot = ti.atomic_add(data.num_collision_pairs[None], 1)
+                if slot < data.MAX_COLLISION_PAIRS:
+                    data.collision_pairs[slot] = ti.Vector([i, j])
+
+
+# =============================================================================
+# Narrow phase collision detection (Step 5 from physics pipeline)
+# =============================================================================
+
+@ti.func
+def collide_sphere_sphere(pos_a: ti.types.vector(3, ti.f32), radius_a: ti.f32,
+                          pos_b: ti.types.vector(3, ti.f32), radius_b: ti.f32,
+                          body_a: ti.i32, body_b: ti.i32,
+                          geom_a: ti.i32, geom_b: ti.i32):
+    """Sphere-sphere collision detection.
+
+    Returns: (has_contact, contact_point, normal, depth)
+    Normal points from A to B.
+    """
+    diff = pos_b - pos_a
+    dist_sq = diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2]
+    sum_radii = radius_a + radius_b
+
+    has_contact = 0
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    normal = ti.Vector([0.0, 1.0, 0.0])  # Default up
+    depth = 0.0
+
+    if dist_sq < sum_radii * sum_radii:
+        dist = ti.sqrt(dist_sq)
+        if dist > 1e-8:
+            normal = diff / dist
+        else:
+            normal = ti.Vector([0.0, 1.0, 0.0])
+
+        depth = sum_radii - dist
+        # Contact point on surface of A (or midpoint if overlapping)
+        contact_point = pos_a + normal * (radius_a - depth * 0.5)
+        has_contact = 1
+
+    return has_contact, contact_point, normal, depth
+
+
+@ti.func
+def collide_sphere_box(sphere_pos: ti.types.vector(3, ti.f32), sphere_radius: ti.f32,
+                       box_pos: ti.types.vector(3, ti.f32), box_quat: ti.types.vector(4, ti.f32),
+                       box_half: ti.types.vector(3, ti.f32),
+                       body_a: ti.i32, body_b: ti.i32,
+                       geom_a: ti.i32, geom_b: ti.i32):
+    """Sphere-box collision detection.
+
+    Returns: (has_contact, contact_point, normal, depth)
+    Normal points from box to sphere.
+    """
+    # Transform sphere center to box's local space
+    local_sphere = quat_rotate_inverse(box_quat, sphere_pos - box_pos)
+
+    # Find closest point on box to sphere (clamping to box bounds)
+    closest_local = ti.Vector([
+        ti.max(-box_half[0], ti.min(box_half[0], local_sphere[0])),
+        ti.max(-box_half[1], ti.min(box_half[1], local_sphere[1])),
+        ti.max(-box_half[2], ti.min(box_half[2], local_sphere[2]))
+    ])
+
+    # Distance from sphere center to closest point
+    diff = local_sphere - closest_local
+    dist_sq = diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2]
+
+    has_contact = 0
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    normal = ti.Vector([0.0, 1.0, 0.0])
+    depth = 0.0
+
+    if dist_sq < sphere_radius * sphere_radius:
+        has_contact = 1
+
+        # Check if sphere center is inside box
+        inside = (ti.abs(local_sphere[0]) <= box_half[0] and
+                  ti.abs(local_sphere[1]) <= box_half[1] and
+                  ti.abs(local_sphere[2]) <= box_half[2])
+
+        if inside:
+            # Sphere center inside box - find nearest face
+            # Distance to each face
+            dx_pos = box_half[0] - local_sphere[0]
+            dx_neg = box_half[0] + local_sphere[0]
+            dy_pos = box_half[1] - local_sphere[1]
+            dy_neg = box_half[1] + local_sphere[1]
+            dz_pos = box_half[2] - local_sphere[2]
+            dz_neg = box_half[2] + local_sphere[2]
+
+            min_dist = dx_pos
+            local_normal = ti.Vector([1.0, 0.0, 0.0])
+
+            if dx_neg < min_dist:
+                min_dist = dx_neg
+                local_normal = ti.Vector([-1.0, 0.0, 0.0])
+            if dy_pos < min_dist:
+                min_dist = dy_pos
+                local_normal = ti.Vector([0.0, 1.0, 0.0])
+            if dy_neg < min_dist:
+                min_dist = dy_neg
+                local_normal = ti.Vector([0.0, -1.0, 0.0])
+            if dz_pos < min_dist:
+                min_dist = dz_pos
+                local_normal = ti.Vector([0.0, 0.0, 1.0])
+            if dz_neg < min_dist:
+                min_dist = dz_neg
+                local_normal = ti.Vector([0.0, 0.0, -1.0])
+
+            depth = min_dist + sphere_radius
+            normal = quat_rotate(box_quat, local_normal)
+            contact_point = sphere_pos - normal * sphere_radius
+        else:
+            # Sphere center outside box
+            dist = ti.sqrt(dist_sq)
+            local_normal = diff / dist
+            depth = sphere_radius - dist
+            normal = quat_rotate(box_quat, local_normal)
+            contact_point = box_pos + quat_rotate(box_quat, closest_local)
+
+    return has_contact, contact_point, normal, depth
+
+
+@ti.func
+def test_sat_axis(axis: ti.types.vector(3, ti.f32), d: ti.types.vector(3, ti.f32),
+                  ra: ti.f32, rb: ti.f32,
+                  has_contact: ti.i32, min_overlap: ti.f32, best_axis: ti.types.vector(3, ti.f32)):
+    """Test one SAT axis and update collision state."""
+    dist = ti.abs(d.dot(axis))
+    overlap = ra + rb - dist
+
+    new_has_contact = has_contact
+    new_min_overlap = min_overlap
+    new_best_axis = best_axis
+
+    if overlap < 0:
+        new_has_contact = 0
+    elif overlap < min_overlap:
+        new_min_overlap = overlap
+        if d.dot(axis) < 0:
+            new_best_axis = -axis
+        else:
+            new_best_axis = axis
+
+    return new_has_contact, new_min_overlap, new_best_axis
+
+
+@ti.func
+def collide_box_box(pos_a: ti.types.vector(3, ti.f32), quat_a: ti.types.vector(4, ti.f32),
+                    half_a: ti.types.vector(3, ti.f32),
+                    pos_b: ti.types.vector(3, ti.f32), quat_b: ti.types.vector(4, ti.f32),
+                    half_b: ti.types.vector(3, ti.f32),
+                    body_a: ti.i32, body_b: ti.i32,
+                    geom_a: ti.i32, geom_b: ti.i32):
+    """Box-box collision using Separating Axis Theorem (SAT).
+
+    Tests 15 axes: 3 from box A, 3 from box B, 9 edge cross products.
+    Returns: (has_contact, contact_point, normal, depth)
+    Normal points from A to B.
+    """
+    # Get axes of both boxes as separate vectors (can't use vector of vectors in Taichi)
+    ax_a0 = quat_rotate(quat_a, ti.Vector([1.0, 0.0, 0.0]))
+    ax_a1 = quat_rotate(quat_a, ti.Vector([0.0, 1.0, 0.0]))
+    ax_a2 = quat_rotate(quat_a, ti.Vector([0.0, 0.0, 1.0]))
+
+    ax_b0 = quat_rotate(quat_b, ti.Vector([1.0, 0.0, 0.0]))
+    ax_b1 = quat_rotate(quat_b, ti.Vector([0.0, 1.0, 0.0]))
+    ax_b2 = quat_rotate(quat_b, ti.Vector([0.0, 0.0, 1.0]))
+
+    # Vector from A to B
+    d = pos_b - pos_a
+
+    has_contact = 1
+    min_overlap = 1e30
+    best_axis = ti.Vector([0.0, 1.0, 0.0])
+
+    # Test 3 face axes of box A
+    # Axis ax_a0
+    ra = half_a[0]
+    rb = (ti.abs(ax_a0.dot(ax_b0)) * half_b[0] +
+          ti.abs(ax_a0.dot(ax_b1)) * half_b[1] +
+          ti.abs(ax_a0.dot(ax_b2)) * half_b[2])
+    has_contact, min_overlap, best_axis = test_sat_axis(ax_a0, d, ra, rb, has_contact, min_overlap, best_axis)
+
+    # Axis ax_a1
+    ra = half_a[1]
+    rb = (ti.abs(ax_a1.dot(ax_b0)) * half_b[0] +
+          ti.abs(ax_a1.dot(ax_b1)) * half_b[1] +
+          ti.abs(ax_a1.dot(ax_b2)) * half_b[2])
+    has_contact, min_overlap, best_axis = test_sat_axis(ax_a1, d, ra, rb, has_contact, min_overlap, best_axis)
+
+    # Axis ax_a2
+    ra = half_a[2]
+    rb = (ti.abs(ax_a2.dot(ax_b0)) * half_b[0] +
+          ti.abs(ax_a2.dot(ax_b1)) * half_b[1] +
+          ti.abs(ax_a2.dot(ax_b2)) * half_b[2])
+    has_contact, min_overlap, best_axis = test_sat_axis(ax_a2, d, ra, rb, has_contact, min_overlap, best_axis)
+
+    # Test 3 face axes of box B
+    # Axis ax_b0
+    ra = (ti.abs(ax_b0.dot(ax_a0)) * half_a[0] +
+          ti.abs(ax_b0.dot(ax_a1)) * half_a[1] +
+          ti.abs(ax_b0.dot(ax_a2)) * half_a[2])
+    rb = half_b[0]
+    has_contact, min_overlap, best_axis = test_sat_axis(ax_b0, d, ra, rb, has_contact, min_overlap, best_axis)
+
+    # Axis ax_b1
+    ra = (ti.abs(ax_b1.dot(ax_a0)) * half_a[0] +
+          ti.abs(ax_b1.dot(ax_a1)) * half_a[1] +
+          ti.abs(ax_b1.dot(ax_a2)) * half_a[2])
+    rb = half_b[1]
+    has_contact, min_overlap, best_axis = test_sat_axis(ax_b1, d, ra, rb, has_contact, min_overlap, best_axis)
+
+    # Axis ax_b2
+    ra = (ti.abs(ax_b2.dot(ax_a0)) * half_a[0] +
+          ti.abs(ax_b2.dot(ax_a1)) * half_a[1] +
+          ti.abs(ax_b2.dot(ax_a2)) * half_a[2])
+    rb = half_b[2]
+    has_contact, min_overlap, best_axis = test_sat_axis(ax_b2, d, ra, rb, has_contact, min_overlap, best_axis)
+
+    # Test 9 edge cross products (only if still potentially colliding)
+    if has_contact == 1:
+        # ax_a0 x ax_b0
+        axis = ax_a0.cross(ax_b0)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a1)) * half_a[1] + ti.abs(axis.dot(ax_a2)) * half_a[2]
+            rb = ti.abs(axis.dot(ax_b1)) * half_b[1] + ti.abs(axis.dot(ax_b2)) * half_b[2]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+        # ax_a0 x ax_b1
+        axis = ax_a0.cross(ax_b1)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a1)) * half_a[1] + ti.abs(axis.dot(ax_a2)) * half_a[2]
+            rb = ti.abs(axis.dot(ax_b0)) * half_b[0] + ti.abs(axis.dot(ax_b2)) * half_b[2]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+        # ax_a0 x ax_b2
+        axis = ax_a0.cross(ax_b2)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a1)) * half_a[1] + ti.abs(axis.dot(ax_a2)) * half_a[2]
+            rb = ti.abs(axis.dot(ax_b0)) * half_b[0] + ti.abs(axis.dot(ax_b1)) * half_b[1]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+        # ax_a1 x ax_b0
+        axis = ax_a1.cross(ax_b0)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a0)) * half_a[0] + ti.abs(axis.dot(ax_a2)) * half_a[2]
+            rb = ti.abs(axis.dot(ax_b1)) * half_b[1] + ti.abs(axis.dot(ax_b2)) * half_b[2]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+        # ax_a1 x ax_b1
+        axis = ax_a1.cross(ax_b1)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a0)) * half_a[0] + ti.abs(axis.dot(ax_a2)) * half_a[2]
+            rb = ti.abs(axis.dot(ax_b0)) * half_b[0] + ti.abs(axis.dot(ax_b2)) * half_b[2]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+        # ax_a1 x ax_b2
+        axis = ax_a1.cross(ax_b2)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a0)) * half_a[0] + ti.abs(axis.dot(ax_a2)) * half_a[2]
+            rb = ti.abs(axis.dot(ax_b0)) * half_b[0] + ti.abs(axis.dot(ax_b1)) * half_b[1]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+        # ax_a2 x ax_b0
+        axis = ax_a2.cross(ax_b0)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a0)) * half_a[0] + ti.abs(axis.dot(ax_a1)) * half_a[1]
+            rb = ti.abs(axis.dot(ax_b1)) * half_b[1] + ti.abs(axis.dot(ax_b2)) * half_b[2]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+        # ax_a2 x ax_b1
+        axis = ax_a2.cross(ax_b1)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a0)) * half_a[0] + ti.abs(axis.dot(ax_a1)) * half_a[1]
+            rb = ti.abs(axis.dot(ax_b0)) * half_b[0] + ti.abs(axis.dot(ax_b2)) * half_b[2]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+        # ax_a2 x ax_b2
+        axis = ax_a2.cross(ax_b2)
+        axis_len = axis.norm()
+        if axis_len > 1e-6:
+            axis = axis / axis_len
+            ra = ti.abs(axis.dot(ax_a0)) * half_a[0] + ti.abs(axis.dot(ax_a1)) * half_a[1]
+            rb = ti.abs(axis.dot(ax_b0)) * half_b[0] + ti.abs(axis.dot(ax_b1)) * half_b[1]
+            has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
+
+    # Compute contact point (approximate: midpoint along collision axis)
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    depth = 0.0
+    normal = best_axis
+
+    if has_contact == 1:
+        depth = min_overlap
+        # Contact point: support point on A in direction of normal, offset by half depth
+        support_a = pos_a
+
+        sign0 = 1.0
+        if ax_a0.dot(normal) < 0:
+            sign0 = -1.0
+        support_a = support_a + ax_a0 * half_a[0] * sign0
+
+        sign1 = 1.0
+        if ax_a1.dot(normal) < 0:
+            sign1 = -1.0
+        support_a = support_a + ax_a1 * half_a[1] * sign1
+
+        sign2 = 1.0
+        if ax_a2.dot(normal) < 0:
+            sign2 = -1.0
+        support_a = support_a + ax_a2 * half_a[2] * sign2
+
+        contact_point = support_a + normal * (depth * 0.5)
+
+    return has_contact, contact_point, normal, depth
+
+
+@ti.kernel
+def narrow_phase(num_pairs: ti.i32):
+    """Process collision pairs and generate contacts.
+
+    For each candidate pair from broad phase:
+        - Dispatch to appropriate collision function based on geom types
+        - If contact found, add to contacts array
+    """
+    for p in range(num_pairs):
+        geom_a_idx = data.collision_pairs[p][0]
+        geom_b_idx = data.collision_pairs[p][1]
+
+        type_a = data.geoms[geom_a_idx].geom_type
+        type_b = data.geoms[geom_b_idx].geom_type
+
+        pos_a = data.geoms[geom_a_idx].world_pos
+        pos_b = data.geoms[geom_b_idx].world_pos
+        quat_a = data.geoms[geom_a_idx].world_quat
+        quat_b = data.geoms[geom_b_idx].world_quat
+        data_a = data.geoms[geom_a_idx].data
+        data_b = data.geoms[geom_b_idx].data
+
+        body_a = data.geoms[geom_a_idx].body_idx
+        body_b = data.geoms[geom_b_idx].body_idx
+
+        has_contact = 0
+        contact_point = ti.Vector([0.0, 0.0, 0.0])
+        normal = ti.Vector([0.0, 1.0, 0.0])
+        depth = 0.0
+
+        # Sphere-Sphere
+        if type_a == data.GEOM_SPHERE and type_b == data.GEOM_SPHERE:
+            radius_a = data_a[0]
+            radius_b = data_b[0]
+            has_contact, contact_point, normal, depth = collide_sphere_sphere(
+                pos_a, radius_a, pos_b, radius_b, body_a, body_b, geom_a_idx, geom_b_idx)
+
+        # Sphere-Box (ensure sphere is first)
+        elif type_a == data.GEOM_SPHERE and type_b == data.GEOM_BOX:
+            radius = data_a[0]
+            half_b = ti.Vector([data_b[0], data_b[1], data_b[2]])
+            has_contact, contact_point, normal, depth = collide_sphere_box(
+                pos_a, radius, pos_b, quat_b, half_b, body_a, body_b, geom_a_idx, geom_b_idx)
+
+        elif type_a == data.GEOM_BOX and type_b == data.GEOM_SPHERE:
+            radius = data_b[0]
+            half_a = ti.Vector([data_a[0], data_a[1], data_a[2]])
+            has_contact, contact_point, normal, depth = collide_sphere_box(
+                pos_b, radius, pos_a, quat_a, half_a, body_b, body_a, geom_b_idx, geom_a_idx)
+            # Flip normal since we swapped order
+            normal = -normal
+
+        # Box-Box
+        elif type_a == data.GEOM_BOX and type_b == data.GEOM_BOX:
+            half_a = ti.Vector([data_a[0], data_a[1], data_a[2]])
+            half_b = ti.Vector([data_b[0], data_b[1], data_b[2]])
+            has_contact, contact_point, normal, depth = collide_box_box(
+                pos_a, quat_a, half_a, pos_b, quat_b, half_b, body_a, body_b, geom_a_idx, geom_b_idx)
+
+        # Add contact if found
+        if has_contact == 1 and depth > 0:
+            slot = ti.atomic_add(data.num_contacts[None], 1)
+            if slot < data.MAX_CONTACTS:
+                data.contacts[slot].point = contact_point
+                data.contacts[slot].normal = normal
+                data.contacts[slot].depth = depth
+                data.contacts[slot].body_a = body_a
+                data.contacts[slot].body_b = body_b
+                data.contacts[slot].geom_a = geom_a_idx
+                data.contacts[slot].geom_b = geom_b_idx
