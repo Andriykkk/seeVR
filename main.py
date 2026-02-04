@@ -22,7 +22,7 @@ from kernels.debug import run_debug_bvh
 from kernels.physics import (
     compute_local_vertices, apply_gravity, integrate_bodies,
     update_render_vertices, update_geom_transforms, broad_phase_n_squared,
-    narrow_phase, solve_contacts
+    narrow_phase, highlight_contact_bodies, solve_contacts
 )
 
 # Constants from data module
@@ -35,6 +35,7 @@ class Settings:
         self.samples_per_pixel = 2
         self.sky_intensity = 1.0
         self.debug_bvh = False
+        self.target_fps = 2  # FPS limiter (0 = unlimited)
 
 settings = Settings()
 
@@ -131,60 +132,65 @@ class Scene:
     @benchmark
     def add_sphere(self, center, radius, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0),
                    segments=16, is_static=False):
-        """Add a UV sphere as triangles"""
+        """Add a UV sphere as triangles (batch CPU -> GPU transfer)"""
         cx, cy, cz = center
         start_vertex = data.num_vertices[None]
-        verts = []
 
-        # Generate vertices
-        for lat in range(segments + 1):
-            theta = lat * math.pi / segments
-            sin_theta = math.sin(theta)
-            cos_theta = math.cos(theta)
+        # Generate vertices using NumPy (vectorized on CPU)
+        lat_angles = np.linspace(0, np.pi, segments + 1)
+        lon_angles = np.linspace(0, 2 * np.pi, segments + 1)
 
-            for lon in range(segments + 1):
-                phi = lon * 2 * math.pi / segments
-                sin_phi = math.sin(phi)
-                cos_phi = math.cos(phi)
+        # Meshgrid for all lat/lon combinations
+        lat_grid, lon_grid = np.meshgrid(lat_angles, lon_angles, indexing='ij')
 
-                x = cx + radius * cos_phi * sin_theta
-                y = cy + radius * cos_theta
-                z = cz + radius * sin_phi * sin_theta
-                verts.append((x, y, z))
+        # Spherical to Cartesian (vectorized)
+        sin_lat = np.sin(lat_grid)
+        cos_lat = np.cos(lat_grid)
+        sin_lon = np.sin(lon_grid)
+        cos_lon = np.cos(lon_grid)
 
-        # Add vertices
-        for v in verts:
-            data.vertices[data.num_vertices[None]] = v
-            data.velocities[data.num_vertices[None]] = velocity
-            data.num_vertices[None] += 1
+        x = cx + radius * cos_lon * sin_lat
+        y = cy + radius * cos_lat
+        z = cz + radius * sin_lon * sin_lat
 
-        # Generate triangles
-        for lat in range(segments):
-            for lon in range(segments):
-                current = start_vertex + lat * (segments + 1) + lon
-                next_row = current + segments + 1
+        # Stack into (N, 3) array
+        verts = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1).astype(np.float32)
+        num_verts = verts.shape[0]
 
-                idx = data.num_triangles[None] * 3
-                data.indices[idx] = current
-                data.indices[idx + 1] = next_row
-                data.indices[idx + 2] = current + 1
-                data.num_triangles[None] += 1
+        # Generate triangle indices using NumPy (vectorized)
+        lat_idx = np.arange(segments)
+        lon_idx = np.arange(segments)
+        lat_grid_i, lon_grid_i = np.meshgrid(lat_idx, lon_idx, indexing='ij')
 
-                idx = data.num_triangles[None] * 3
-                data.indices[idx] = current + 1
-                data.indices[idx + 1] = next_row
-                data.indices[idx + 2] = next_row + 1
-                data.num_triangles[None] += 1
+        current = start_vertex + lat_grid_i * (segments + 1) + lon_grid_i
+        next_row = current + segments + 1
 
-        # Set vertex colors
-        for i in range(start_vertex, data.num_vertices[None]):
-            data.vertex_colors[i] = color
+        # Two triangles per quad
+        tri1 = np.stack([current, next_row, current + 1], axis=-1)
+        tri2 = np.stack([current + 1, next_row, next_row + 1], axis=-1)
 
-        vert_count = data.num_vertices[None] - start_vertex
+        # Interleave and flatten to get final indices
+        indices = np.empty((segments, segments, 2, 3), dtype=np.int32)
+        indices[:, :, 0, :] = tri1
+        indices[:, :, 1, :] = tri2
+        indices = indices.reshape(-1).astype(np.int32)
+        num_tris = len(indices) // 3
+
+        # Batch copy to GPU
+        _copy_vertices_batch(verts, start_vertex)
+        _copy_velocities_batch(np.array(velocity, dtype=np.float32), start_vertex, num_verts)
+        _copy_indices_batch(indices, data.num_triangles[None] * 3)
+        _copy_colors_batch(np.array(color, dtype=np.float32), start_vertex, num_verts)
+
+        # Update counts
+        data.num_vertices[None] = start_vertex + num_verts
+        data.num_triangles[None] = data.num_triangles[None] + num_tris
+
+        vert_count = num_verts
         self.object_starts.append((start_vertex, vert_count))
 
         # Create physics body and collision geom
-        mass = 0.0 if is_static else 1.0  # Default mass of 1.0 for dynamic objects
+        mass = 0.0 if is_static else 1.0
         body_idx = self._create_rigid_body(center, mass, start_vertex, vert_count)
         self._create_sphere_geom(body_idx, radius)
 
@@ -198,48 +204,48 @@ class Scene:
 
     @benchmark
     def add_box(self, center, size, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0), is_static=False):
-        """Add a box as 12 triangles"""
+        """Add a box as 12 triangles (batch CPU -> GPU transfer)"""
         cx, cy, cz = center
         sx, sy, sz = size[0] / 2, size[1] / 2, size[2] / 2
         start_vertex = data.num_vertices[None]
 
-        verts = [
-            (cx - sx, cy - sy, cz - sz),
-            (cx + sx, cy - sy, cz - sz),
-            (cx + sx, cy + sy, cz - sz),
-            (cx - sx, cy + sy, cz - sz),
-            (cx - sx, cy - sy, cz + sz),
-            (cx + sx, cy - sy, cz + sz),
-            (cx + sx, cy + sy, cz + sz),
-            (cx - sx, cy + sy, cz + sz),
-        ]
+        # Box vertices as NumPy array
+        verts = np.array([
+            [cx - sx, cy - sy, cz - sz],
+            [cx + sx, cy - sy, cz - sz],
+            [cx + sx, cy + sy, cz - sz],
+            [cx - sx, cy + sy, cz - sz],
+            [cx - sx, cy - sy, cz + sz],
+            [cx + sx, cy - sy, cz + sz],
+            [cx + sx, cy + sy, cz + sz],
+            [cx - sx, cy + sy, cz + sz],
+        ], dtype=np.float32)
 
-        faces = [
-            (0, 1, 2), (0, 2, 3),
-            (5, 4, 7), (5, 7, 6),
-            (4, 0, 3), (4, 3, 7),
-            (1, 5, 6), (1, 6, 2),
-            (3, 2, 6), (3, 6, 7),
-            (4, 5, 1), (4, 1, 0),
-        ]
+        # Box faces (12 triangles) as NumPy array
+        faces = np.array([
+            [0, 1, 2], [0, 2, 3],
+            [5, 4, 7], [5, 7, 6],
+            [4, 0, 3], [4, 3, 7],
+            [1, 5, 6], [1, 6, 2],
+            [3, 2, 6], [3, 6, 7],
+            [4, 5, 1], [4, 1, 0],
+        ], dtype=np.int32)
 
-        for v in verts:
-            data.vertices[data.num_vertices[None]] = v
-            data.velocities[data.num_vertices[None]] = velocity
-            data.num_vertices[None] += 1
+        num_verts = verts.shape[0]
+        num_tris = faces.shape[0]
+        indices = (faces.ravel() + start_vertex).astype(np.int32)
 
-        for f in faces:
-            idx = data.num_triangles[None] * 3
-            data.indices[idx] = start_vertex + f[0]
-            data.indices[idx + 1] = start_vertex + f[1]
-            data.indices[idx + 2] = start_vertex + f[2]
-            data.num_triangles[None] += 1
+        # Batch copy to GPU
+        _copy_vertices_batch(verts, start_vertex)
+        _copy_velocities_batch(np.array(velocity, dtype=np.float32), start_vertex, num_verts)
+        _copy_indices_batch(indices, data.num_triangles[None] * 3)
+        _copy_colors_batch(np.array(color, dtype=np.float32), start_vertex, num_verts)
 
-        # Set vertex colors
-        for i in range(start_vertex, data.num_vertices[None]):
-            data.vertex_colors[i] = color
+        # Update counts
+        data.num_vertices[None] = start_vertex + num_verts
+        data.num_triangles[None] = data.num_triangles[None] + num_tris
 
-        vert_count = data.num_vertices[None] - start_vertex
+        vert_count = num_verts
         self.object_starts.append((start_vertex, vert_count))
 
         # Create physics body and collision geom
@@ -251,7 +257,6 @@ class Scene:
         # Set proper box inertia: I = 1/12 * m * (h^2 + d^2) for each axis
         if mass > 0:
             hx, hy, hz = half_extents
-            # Full dimensions
             wx, wy, wz = 2*hx, 2*hy, 2*hz
             ix = mass / 12.0 * (wy*wy + wz*wz)
             iy = mass / 12.0 * (wx*wx + wz*wz)
@@ -509,7 +514,10 @@ def run_physics(dt):
     # Step 1: Apply external forces (gravity)
     apply_gravity(num_bodies, dt)
 
-    # Step 3: Update geom world transforms and AABBs (for collision detection)
+    # Step 2: Integrate positions/orientations
+    integrate_bodies(num_bodies, dt)
+
+    # Step 3: Update geom world transforms and AABBs (AFTER integration)
     update_geom_transforms(num_geoms)
 
     # Step 4: Broad phase - find candidate collision pairs
@@ -527,11 +535,12 @@ def run_physics(dt):
     if num_contacts > 0:
         solve_contacts(num_contacts, 10, dt)  # 10 iterations for convergence
 
-    # Step 7: Integrate positions/orientations (AFTER velocity correction)
-    integrate_bodies(num_bodies, dt)
-
-    # Step 8: Update render mesh vertices
+    # Step 7: Update render mesh vertices
     update_render_vertices(num_bodies)
+
+    # Optional: highlight bodies in contact
+    if num_contacts > 0:
+        highlight_contact_bodies(num_contacts, num_bodies)
 
     if is_enabled_benchmark():
         ti.sync()
@@ -684,6 +693,8 @@ def main():
     ema_alpha = 0.1  # Smoothing factor (lower = smoother, higher = more responsive)
 
     while window.running:
+        frame_start = time.perf_counter()
+
         rays = render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytracing)
 
         now = time.perf_counter()
@@ -698,8 +709,10 @@ def main():
 
         # GUI panel
         gui = window.get_gui()
-        gui.begin("Settings", 0.02, 0.02, 0.3, 0.3)
+        gui.begin("Settings", 0.02, 0.02, 0.3, 0.35)
         gui.text(f"FPS: {fps_smooth:.1f}  Mrays/s: {mrays_smooth:.1f}")
+        gui.text(f"Contacts: {data.num_contacts[None]}")
+        settings.target_fps = gui.slider_int("Target FPS", settings.target_fps, 0, 120)
         settings.max_bounces = gui.slider_int("Bounces", settings.max_bounces, 1, 16)
         settings.samples_per_pixel = gui.slider_int("Samples", settings.samples_per_pixel, 1, 64)
         settings.sky_intensity = gui.slider_float("Sky", settings.sky_intensity, 0.0, 3.0)
@@ -708,6 +721,13 @@ def main():
 
         frame += 1
         window.show()
+
+        # FPS limiter
+        if settings.target_fps > 0:
+            target_frame_time = 1.0 / settings.target_fps
+            elapsed = time.perf_counter() - frame_start
+            if elapsed < target_frame_time:
+                time.sleep(target_frame_time - elapsed)
 
 
 if __name__ == '__main__':

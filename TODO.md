@@ -216,3 +216,4 @@ How it looks (render mesh, updated from physics transforms)
 
 
 [ ] remove object_starts for rastering, there already objects
+[ ] understand how solve contacts kernel work

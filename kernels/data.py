@@ -86,6 +86,10 @@ Contact = ti.types.struct(
     body_b=ti.i32,                         # Second body index
     geom_a=ti.i32,                         # First geom index
     geom_b=ti.i32,                         # Second geom index
+    # Solver state (set in PreStep, used during iterations)
+    Pn=ti.f32,                             # Accumulated normal impulse
+    bias=ti.f32,                           # Target relative velocity (computed once per frame)
+    mass_normal=ti.f32,                    # Effective mass along normal (1/K)
 )
 
 # Global scene fields - initialized by init_scene()
