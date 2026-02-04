@@ -903,7 +903,7 @@ def compute_world_inv_inertia(body_idx: ti.i32) -> ti.types.matrix(3, 3, ti.f32)
 @ti.kernel
 def solve_contacts_prestep(num_contacts: ti.i32, dt: ti.f32):
     beta = 0.2      # Baumgarte factor: how aggressively to fix penetration (0.1-0.3)
-    slop = 0.005    # Allow 5mm penetration before correction (prevents jitter)
+    slop = 0.001    # Allow 5mm penetration before correction (prevents jitter)
     restitution = 0.3  # Bounciness (0 = clay, 1 = superball)
 
     for c in range(num_contacts):

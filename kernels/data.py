@@ -28,7 +28,12 @@ GEOM_SPHERE = 1
 GEOM_BOX = 2
 GEOM_PLANE = 3
 GEOM_CAPSULE = 4
-GEOM_CONVEX = 5
+GEOM_MESH = 5    # Triangle mesh (can be single hull, decomposed, or exact)
+GEOM_SDF = 6     # Signed Distance Field
+
+# GEOM_MESH sub-types (stored in data[6])
+MESH_SINGLE_HULL = 0       # Single convex hull
+MESH_DECOMPOSED = 1        # Multiple convex hulls (CoACD)
 
 # BVH Node structure
 # For internal nodes: left_first = left child, right_child = right child, tri_count = 0
@@ -68,7 +73,10 @@ CollisionGeom = ti.types.struct(
     # SPHERE: [radius, 0, 0, 0, 0, 0, 0]
     # BOX: [half_x, half_y, half_z, 0, 0, 0, 0]
     # CAPSULE: [radius, half_length, 0, 0, 0, 0, 0]
-    # CONVEX: [vert_start, vert_end, face_start, face_end, 0, 0, 0]
+    # PLANE: [normal_x, normal_y, normal_z, 0, 0, 0, 0]
+    # MESH: [data_start, data_count, hull_count, volume, error, 0, mesh_subtype]
+    #   - mesh_subtype: MESH_SINGLE_HULL, MESH_DECOMPOSED
+    # SDF: [grid_start, resolution_x, resolution_y, resolution_z, voxel_size, 0, 0]
     data=ti.types.vector(7, ti.f32),
     # Cached world-space transform (updated each frame)
     world_pos=ti.types.vector(3, ti.f32),
