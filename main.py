@@ -35,7 +35,7 @@ class Settings:
         self.samples_per_pixel = 2
         self.sky_intensity = 1.0
         self.debug_bvh = False
-        self.target_fps = 2  # FPS limiter (0 = unlimited)
+        self.target_fps = 60  # FPS limiter (0 = unlimited)
 
 settings = Settings()
 
@@ -82,9 +82,14 @@ class Scene:
         data.bodies[body_idx].omega = (0.0, 0.0, 0.0)
         data.bodies[body_idx].mass = mass
         data.bodies[body_idx].inv_mass = 1.0 / mass if mass > 0 else 0.0
-        # Simple uniform sphere inertia as default (will be overwritten for specific shapes)
-        data.bodies[body_idx].inertia = (1.0, 1.0, 1.0)
-        data.bodies[body_idx].inv_inertia = (1.0, 1.0, 1.0)
+        # For static bodies (mass=0), inv_inertia must be 0 so they don't rotate
+        # For dynamic bodies, this default will be overwritten with proper inertia
+        if mass > 0:
+            data.bodies[body_idx].inertia = (1.0, 1.0, 1.0)
+            data.bodies[body_idx].inv_inertia = (1.0, 1.0, 1.0)
+        else:
+            data.bodies[body_idx].inertia = (0.0, 0.0, 0.0)
+            data.bodies[body_idx].inv_inertia = (0.0, 0.0, 0.0)
         data.bodies[body_idx].vert_start = vert_start
         data.bodies[body_idx].vert_count = vert_count
 

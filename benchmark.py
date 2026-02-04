@@ -64,6 +64,8 @@ def print_benchmark_stats():
     print("-" * 100)
 
     for name, stats in sorted(_stats.items(), key=lambda x: -x[1]["total_time"]):
+        if stats["calls"] == 0:
+            continue
         calls = stats["calls"]
         total = stats["total_time"]
         times = sorted(stats["times"])

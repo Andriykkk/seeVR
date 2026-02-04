@@ -631,32 +631,29 @@ def collide_box_box(pos_a: ti.types.vector(3, ti.f32), quat_a: ti.types.vector(4
             rb = ti.abs(axis.dot(ax_b0)) * half_b[0] + ti.abs(axis.dot(ax_b1)) * half_b[1]
             has_contact, min_overlap, best_axis = test_sat_axis(axis, d, ra, rb, has_contact, min_overlap, best_axis)
 
-    # Compute contact point (approximate: midpoint along collision axis)
+    # Compute contact point
     contact_point = ti.Vector([0.0, 0.0, 0.0])
     depth = 0.0
     normal = best_axis
 
     if has_contact == 1:
         depth = min_overlap
-        # Contact point: support point on A in direction of normal, offset by half depth
-        support_a = pos_a
+        # Contact point: project box B's center onto the contact surface of box A.
+        #
+        # For face-face contact (box sitting on ground), this gives a point
+        # directly under box B on the surface of box A - the actual contact region.
+        #
+        # The contact surface of A in the normal direction is at:
+        #   pos_a + normal * (extent of A along normal)
+        extent_a_along_normal = (ti.abs(ax_a0.dot(normal)) * half_a[0] +
+                                  ti.abs(ax_a1.dot(normal)) * half_a[1] +
+                                  ti.abs(ax_a2.dot(normal)) * half_a[2])
+        surface_height_a = pos_a.dot(normal) + extent_a_along_normal
 
-        sign0 = 1.0
-        if ax_a0.dot(normal) < 0:
-            sign0 = -1.0
-        support_a = support_a + ax_a0 * half_a[0] * sign0
-
-        sign1 = 1.0
-        if ax_a1.dot(normal) < 0:
-            sign1 = -1.0
-        support_a = support_a + ax_a1 * half_a[1] * sign1
-
-        sign2 = 1.0
-        if ax_a2.dot(normal) < 0:
-            sign2 = -1.0
-        support_a = support_a + ax_a2 * half_a[2] * sign2
-
-        contact_point = support_a + normal * (depth * 0.5)
+        # Project pos_b onto the contact plane (keep x,z of B, set height to surface)
+        # contact_point = pos_b projected onto plane with normal at surface_height_a
+        pos_b_along_normal = pos_b.dot(normal)
+        contact_point = pos_b + normal * (surface_height_a - pos_b_along_normal + depth * 0.5)
 
     return has_contact, contact_point, normal, depth
 
@@ -715,14 +712,65 @@ def narrow_phase(num_pairs: ti.i32):
                 pos_b, radius, pos_a, quat_a, half_a, body_b, body_a, geom_b_idx, geom_a_idx)
             # No flip needed: collide returns box→sphere, which is A→B here
 
-        # Box-Box
+        # Box-Box: Generate 4 corner contacts to prevent rotation
         elif type_a == data.GEOM_BOX and type_b == data.GEOM_BOX:
             half_a = ti.Vector([data_a[0], data_a[1], data_a[2]])
             half_b = ti.Vector([data_b[0], data_b[1], data_b[2]])
             has_contact, contact_point, normal, depth = collide_box_box(
                 pos_a, quat_a, half_a, pos_b, quat_b, half_b, body_a, body_b, geom_a_idx, geom_b_idx)
 
-        # Add contact if found
+            if has_contact == 1 and depth > 0:
+                # Generate 4 contact points at corners of box B's contact face
+                # Find the two axes of box B perpendicular to the contact normal
+                ax_b0 = quat_rotate(quat_b, ti.Vector([1.0, 0.0, 0.0]))
+                ax_b1 = quat_rotate(quat_b, ti.Vector([0.0, 1.0, 0.0]))
+                ax_b2 = quat_rotate(quat_b, ti.Vector([0.0, 0.0, 1.0]))
+
+                # Find which face of B is closest to facing -normal (the contact face)
+                dot0 = ti.abs(ax_b0.dot(normal))
+                dot1 = ti.abs(ax_b1.dot(normal))
+                dot2 = ti.abs(ax_b2.dot(normal))
+
+                # Initialize tangent vectors (will be set based on contact face)
+                tangent1 = ti.Vector([0.0, 0.0, 0.0])
+                tangent2 = ti.Vector([0.0, 0.0, 0.0])
+
+                # The face normal is the axis most aligned with collision normal
+                # The other two axes span the contact face
+                if dot0 >= dot1 and dot0 >= dot2:
+                    # X-face: span by Y and Z
+                    tangent1 = ax_b1 * half_b[1]
+                    tangent2 = ax_b2 * half_b[2]
+                elif dot1 >= dot0 and dot1 >= dot2:
+                    # Y-face: span by X and Z
+                    tangent1 = ax_b0 * half_b[0]
+                    tangent2 = ax_b2 * half_b[2]
+                else:
+                    # Z-face: span by X and Y
+                    tangent1 = ax_b0 * half_b[0]
+                    tangent2 = ax_b1 * half_b[1]
+
+                # 4 corners of box B's contact face (relative to center contact point)
+                # Use the center contact_point as base and offset to corners
+                for i in ti.static(range(4)):
+                    sign1 = 1.0 if (i & 1) == 0 else -1.0
+                    sign2 = 1.0 if (i & 2) == 0 else -1.0
+                    corner_offset = tangent1 * sign1 + tangent2 * sign2
+                    corner_point = contact_point + corner_offset
+
+                    slot = ti.atomic_add(data.num_contacts[None], 1)
+                    if slot < data.MAX_CONTACTS:
+                        data.contacts[slot].point = corner_point
+                        data.contacts[slot].normal = normal
+                        data.contacts[slot].depth = depth
+                        data.contacts[slot].body_a = body_a
+                        data.contacts[slot].body_b = body_b
+                        data.contacts[slot].geom_a = geom_a_idx
+                        data.contacts[slot].geom_b = geom_b_idx
+
+            has_contact = 0  # Already handled, skip generic add below
+
+        # Add contact if found (for non-box-box collisions)
         if has_contact == 1 and depth > 0:
             slot = ti.atomic_add(data.num_contacts[None], 1)
             if slot < data.MAX_CONTACTS:
@@ -877,12 +925,12 @@ def solve_contacts_prestep(num_contacts: ti.i32, dt: ti.f32):
 
 
 @ti.kernel
-def solve_contacts_iterate(num_contacts: ti.i32, num_iterations: ti.i32):
+def solve_contacts_iterate_once(num_contacts: ti.i32):
     """
-    ITERATION: Apply impulses to satisfy constraints.
+    Single iteration of the constraint solver.
 
-    This is the core Newton step, repeated num_iterations times.
-    Each iteration goes through ALL contacts sequentially (Gauss-Seidel).
+    Goes through ALL contacts sequentially (Gauss-Seidel).
+    Called multiple times from Python to complete the solve.
 
     The Jacobian J maps body velocities to constraint velocity:
         v_n = J · V
@@ -901,11 +949,10 @@ def solve_contacts_iterate(num_contacts: ti.i32, num_iterations: ti.i32):
         body_a: vel -= λ·n/m,  ω -= I⁻¹·(r_a × λ·n)
         body_b: vel += λ·n/m,  ω += I⁻¹·(r_b × λ·n)
     """
-    for _ in range(num_iterations):
-        # CRITICAL: Sequential iteration (Gauss-Seidel)
-        # Each contact sees updated velocities from previous contacts
-        ti.loop_config(serialize=True)
-        for c in range(num_contacts):
+    # CRITICAL: Sequential iteration (Gauss-Seidel)
+    # Each contact sees updated velocities from previous contacts
+    ti.loop_config(serialize=True)
+    for c in range(num_contacts):
             # Skip if no effective mass (static-static collision)
             mass_normal = data.contacts[c].mass_normal
             if mass_normal < 1e-8:
@@ -1022,6 +1069,7 @@ def solve_contacts(num_contacts: int, num_iterations: int, dt: float):
     # Phase 1: Compute constants (mass_normal, bias)
     solve_contacts_prestep(num_contacts, dt)
 
-    # Phase 2: Iteratively apply impulses
-    solve_contacts_iterate(num_contacts, num_iterations)
+    # Phase 2: Iteratively apply impulses (Python loop ensures sequential iterations)
+    for _ in range(num_iterations):
+        solve_contacts_iterate_once(num_contacts)
 
