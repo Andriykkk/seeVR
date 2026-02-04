@@ -65,74 +65,170 @@ def _copy_colors_batch(color: ti.types.ndarray(dtype=ti.f32, ndim=1), offset: ti
         data.vertex_colors[offset + i] = ti.Vector([color[0], color[1], color[2]])
 
 
+@ti.data_oriented
 class Scene:
-    """Interface for adding objects to the scene. Uses kernels/data.py for storage."""
+    """GPU-first scene builder. All geometry generation happens on GPU."""
 
     def __init__(self):
-        self.object_starts = []  # List of (start_vert, num_verts) tuples
+        pass
 
-    def _create_rigid_body(self, center, mass, vert_start, vert_count):
+    @ti.kernel
+    def _create_rigid_body(self, center: ti.types.vector(3, ti.f32), mass: ti.f32,
+                          vert_start: ti.i32, vert_count: ti.i32) -> ti.i32:
         """Create a rigid body and return its index."""
-        body_idx = data.num_bodies[None]
+        body_idx = ti.atomic_add(data.num_bodies[None], 1)
 
-        # Set body properties
         data.bodies[body_idx].pos = center
-        data.bodies[body_idx].quat = (1.0, 0.0, 0.0, 0.0)  # Identity quaternion (w, x, y, z)
-        data.bodies[body_idx].vel = (0.0, 0.0, 0.0)
-        data.bodies[body_idx].omega = (0.0, 0.0, 0.0)
+        data.bodies[body_idx].quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.bodies[body_idx].vel = ti.Vector([0.0, 0.0, 0.0])
+        data.bodies[body_idx].omega = ti.Vector([0.0, 0.0, 0.0])
         data.bodies[body_idx].mass = mass
-        data.bodies[body_idx].inv_mass = 1.0 / mass if mass > 0 else 0.0
-        # For static bodies (mass=0), inv_inertia must be 0 so they don't rotate
-        # For dynamic bodies, this default will be overwritten with proper inertia
-        if mass > 0:
-            data.bodies[body_idx].inertia = (1.0, 1.0, 1.0)
-            data.bodies[body_idx].inv_inertia = (1.0, 1.0, 1.0)
-        else:
-            data.bodies[body_idx].inertia = (0.0, 0.0, 0.0)
-            data.bodies[body_idx].inv_inertia = (0.0, 0.0, 0.0)
+        data.bodies[body_idx].inv_mass = 1.0 / mass if mass > 0.0 else 0.0
         data.bodies[body_idx].vert_start = vert_start
         data.bodies[body_idx].vert_count = vert_count
 
-        data.num_bodies[None] += 1
+        if mass > 0.0:
+            data.bodies[body_idx].inertia = ti.Vector([1.0, 1.0, 1.0])
+            data.bodies[body_idx].inv_inertia = ti.Vector([1.0, 1.0, 1.0])
+        else:
+            data.bodies[body_idx].inertia = ti.Vector([0.0, 0.0, 0.0])
+            data.bodies[body_idx].inv_inertia = ti.Vector([0.0, 0.0, 0.0])
+
         return body_idx
 
-    def _create_sphere_geom(self, body_idx, radius, local_pos=(0, 0, 0)):
-        """Create a sphere collision geometry for a body."""
-        geom_idx = data.num_geoms[None]
+    @ti.kernel
+    def _create_sphere_geom(self, body_idx: ti.i32, radius: ti.f32) -> ti.i32:
+        """Create a sphere collision geometry."""
+        geom_idx = ti.atomic_add(data.num_geoms[None], 1)
 
         data.geoms[geom_idx].geom_type = data.GEOM_SPHERE
         data.geoms[geom_idx].body_idx = body_idx
-        data.geoms[geom_idx].local_pos = local_pos
-        data.geoms[geom_idx].local_quat = (1.0, 0.0, 0.0, 0.0)
-        # SPHERE data: [radius, 0, 0, 0, 0, 0, 0]
-        data.geoms[geom_idx].data = (radius, 0, 0, 0, 0, 0, 0)
-        # World transform will be computed each physics step
-        data.geoms[geom_idx].world_pos = (0, 0, 0)
-        data.geoms[geom_idx].world_quat = (1, 0, 0, 0)
-        data.geoms[geom_idx].aabb_min = (0, 0, 0)
-        data.geoms[geom_idx].aabb_max = (0, 0, 0)
+        data.geoms[geom_idx].local_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].data = ti.Vector([radius, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].world_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].world_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].aabb_min = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].aabb_max = ti.Vector([0.0, 0.0, 0.0])
 
-        data.num_geoms[None] += 1
         return geom_idx
 
-    def _create_box_geom(self, body_idx, half_extents, local_pos=(0, 0, 0)):
-        """Create a box collision geometry for a body."""
-        geom_idx = data.num_geoms[None]
-        hx, hy, hz = half_extents
+    @ti.kernel
+    def _create_box_geom(self, body_idx: ti.i32, half_extents: ti.types.vector(3, ti.f32)) -> ti.i32:
+        """Create a box collision geometry."""
+        geom_idx = ti.atomic_add(data.num_geoms[None], 1)
 
         data.geoms[geom_idx].geom_type = data.GEOM_BOX
         data.geoms[geom_idx].body_idx = body_idx
-        data.geoms[geom_idx].local_pos = local_pos
-        data.geoms[geom_idx].local_quat = (1.0, 0.0, 0.0, 0.0)
-        # BOX data: [half_x, half_y, half_z, 0, 0, 0, 0]
-        data.geoms[geom_idx].data = (hx, hy, hz, 0, 0, 0, 0)
-        data.geoms[geom_idx].world_pos = (0, 0, 0)
-        data.geoms[geom_idx].world_quat = (1, 0, 0, 0)
-        data.geoms[geom_idx].aabb_min = (0, 0, 0)
-        data.geoms[geom_idx].aabb_max = (0, 0, 0)
+        data.geoms[geom_idx].local_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].data = ti.Vector([half_extents[0], half_extents[1], half_extents[2], 0.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].world_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].world_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].aabb_min = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].aabb_max = ti.Vector([0.0, 0.0, 0.0])
 
-        data.num_geoms[None] += 1
         return geom_idx
+
+    @ti.kernel
+    def _set_box_inertia(self, body_idx: ti.i32, half_extents: ti.types.vector(3, ti.f32)):
+        """Set proper box inertia tensor."""
+        mass = data.bodies[body_idx].mass
+        if mass > 0.0:
+            wx, wy, wz = half_extents[0] * 2.0, half_extents[1] * 2.0, half_extents[2] * 2.0
+            ix = mass / 12.0 * (wy*wy + wz*wz)
+            iy = mass / 12.0 * (wx*wx + wz*wz)
+            iz = mass / 12.0 * (wx*wx + wy*wy)
+            data.bodies[body_idx].inertia = ti.Vector([ix, iy, iz])
+            data.bodies[body_idx].inv_inertia = ti.Vector([
+                1.0/ix if ix > 0.0 else 0.0,
+                1.0/iy if iy > 0.0 else 0.0,
+                1.0/iz if iz > 0.0 else 0.0
+            ])
+
+    @ti.kernel
+    def _set_sphere_inertia(self, body_idx: ti.i32, radius: ti.f32):
+        """Set proper sphere inertia tensor."""
+        mass = data.bodies[body_idx].mass
+        if mass > 0.0:
+            inertia = 0.4 * mass * radius * radius
+            data.bodies[body_idx].inertia = ti.Vector([inertia, inertia, inertia])
+            data.bodies[body_idx].inv_inertia = ti.Vector([1.0/inertia, 1.0/inertia, 1.0/inertia])
+
+    @ti.kernel
+    def _add_box_gpu(self, center: ti.types.vector(3, ti.f32),
+                     half_size: ti.types.vector(3, ti.f32),
+                     color: ti.types.vector(3, ti.f32),
+                     mass: ti.f32) -> ti.i32:
+        """Add a box - everything on GPU, returns body index."""
+        # Atomically allocate slots on GPU
+        vert_start = ti.atomic_add(data.num_vertices[None], 8)
+        tri_start = ti.atomic_add(data.num_triangles[None], 12)
+        body_idx = ti.atomic_add(data.num_bodies[None], 1)
+        geom_idx = ti.atomic_add(data.num_geoms[None], 1)
+
+        # Box topology
+        box_verts = ti.static([
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]
+        ])
+        box_faces = ti.static([
+            [0, 1, 2], [0, 2, 3],  # Front
+            [5, 4, 7], [5, 7, 6],  # Back
+            [4, 0, 3], [4, 3, 7],  # Left
+            [1, 5, 6], [1, 6, 2],  # Right
+            [3, 2, 6], [3, 6, 7],  # Top
+            [4, 5, 1], [4, 1, 0],  # Bottom
+        ])
+
+        # Generate vertices and indices
+        for i in ti.static(range(8)):
+            data.vertices[vert_start + i] = center + half_size * ti.Vector(box_verts[i])
+            data.vertex_colors[vert_start + i] = color
+            data.velocities[vert_start + i] = ti.Vector([0.0, 0.0, 0.0])
+
+        for i in ti.static(range(12)):
+            for j in ti.static(range(3)):
+                data.indices[tri_start * 3 + i * 3 + j] = vert_start + box_faces[i][j]
+
+        # Create rigid body
+        data.bodies[body_idx].pos = center
+        data.bodies[body_idx].quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.bodies[body_idx].vel = ti.Vector([0.0, 0.0, 0.0])
+        data.bodies[body_idx].omega = ti.Vector([0.0, 0.0, 0.0])
+        data.bodies[body_idx].mass = mass
+        data.bodies[body_idx].inv_mass = 1.0 / mass if mass > 0.0 else 0.0
+        data.bodies[body_idx].vert_start = vert_start
+        data.bodies[body_idx].vert_count = 8
+
+        # Set inertia
+        if mass > 0.0:
+            wx, wy, wz = half_size[0] * 2.0, half_size[1] * 2.0, half_size[2] * 2.0
+            ix = mass / 12.0 * (wy*wy + wz*wz)
+            iy = mass / 12.0 * (wx*wx + wz*wz)
+            iz = mass / 12.0 * (wx*wx + wy*wy)
+            data.bodies[body_idx].inertia = ti.Vector([ix, iy, iz])
+            data.bodies[body_idx].inv_inertia = ti.Vector([
+                1.0/ix if ix > 0.0 else 0.0,
+                1.0/iy if iy > 0.0 else 0.0,
+                1.0/iz if iz > 0.0 else 0.0
+            ])
+        else:
+            data.bodies[body_idx].inertia = ti.Vector([0.0, 0.0, 0.0])
+            data.bodies[body_idx].inv_inertia = ti.Vector([0.0, 0.0, 0.0])
+
+        # Create collision geom
+        data.geoms[geom_idx].geom_type = data.GEOM_BOX
+        data.geoms[geom_idx].body_idx = body_idx
+        data.geoms[geom_idx].local_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].data = ti.Vector([half_size[0], half_size[1], half_size[2], 0.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].world_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].world_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].aabb_min = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].aabb_max = ti.Vector([0.0, 0.0, 0.0])
+
+        return body_idx
 
     @benchmark
     def add_sphere(self, center, radius, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0),
@@ -191,87 +287,20 @@ class Scene:
         data.num_vertices[None] = start_vertex + num_verts
         data.num_triangles[None] = data.num_triangles[None] + num_tris
 
-        vert_count = num_verts
-        self.object_starts.append((start_vertex, vert_count))
-
         # Create physics body and collision geom
         mass = 0.0 if is_static else 1.0
-        body_idx = self._create_rigid_body(center, mass, start_vertex, vert_count)
+        body_idx = self._create_rigid_body(ti.Vector(center), mass, start_vertex, num_verts)
         self._create_sphere_geom(body_idx, radius)
+        self._set_sphere_inertia(body_idx, radius)
 
-        # Set proper sphere inertia: I = 2/5 * m * r^2
-        if mass > 0:
-            inertia = 0.4 * mass * radius * radius
-            data.bodies[body_idx].inertia = (inertia, inertia, inertia)
-            data.bodies[body_idx].inv_inertia = (1.0/inertia, 1.0/inertia, 1.0/inertia)
-
-        return len(self.object_starts) - 1
+        return body_idx
 
     @benchmark
     def add_box(self, center, size, color=(1.0, 1.0, 1.0), velocity=(0, 0, 0), is_static=False):
-        """Add a box as 12 triangles (batch CPU -> GPU transfer)"""
-        cx, cy, cz = center
-        sx, sy, sz = size[0] / 2, size[1] / 2, size[2] / 2
-        start_vertex = data.num_vertices[None]
-
-        # Box vertices as NumPy array
-        verts = np.array([
-            [cx - sx, cy - sy, cz - sz],
-            [cx + sx, cy - sy, cz - sz],
-            [cx + sx, cy + sy, cz - sz],
-            [cx - sx, cy + sy, cz - sz],
-            [cx - sx, cy - sy, cz + sz],
-            [cx + sx, cy - sy, cz + sz],
-            [cx + sx, cy + sy, cz + sz],
-            [cx - sx, cy + sy, cz + sz],
-        ], dtype=np.float32)
-
-        # Box faces (12 triangles) as NumPy array
-        faces = np.array([
-            [0, 1, 2], [0, 2, 3],
-            [5, 4, 7], [5, 7, 6],
-            [4, 0, 3], [4, 3, 7],
-            [1, 5, 6], [1, 6, 2],
-            [3, 2, 6], [3, 6, 7],
-            [4, 5, 1], [4, 1, 0],
-        ], dtype=np.int32)
-
-        num_verts = verts.shape[0]
-        num_tris = faces.shape[0]
-        indices = (faces.ravel() + start_vertex).astype(np.int32)
-
-        # Batch copy to GPU
-        _copy_vertices_batch(verts, start_vertex)
-        _copy_velocities_batch(np.array(velocity, dtype=np.float32), start_vertex, num_verts)
-        _copy_indices_batch(indices, data.num_triangles[None] * 3)
-        _copy_colors_batch(np.array(color, dtype=np.float32), start_vertex, num_verts)
-
-        # Update counts
-        data.num_vertices[None] = start_vertex + num_verts
-        data.num_triangles[None] = data.num_triangles[None] + num_tris
-
-        vert_count = num_verts
-        self.object_starts.append((start_vertex, vert_count))
-
-        # Create physics body and collision geom
+        """Add a box - everything happens on GPU in one kernel call."""
         mass = 0.0 if is_static else 1.0
-        body_idx = self._create_rigid_body(center, mass, start_vertex, vert_count)
-        half_extents = (size[0] / 2, size[1] / 2, size[2] / 2)
-        self._create_box_geom(body_idx, half_extents)
-
-        # Set proper box inertia: I = 1/12 * m * (h^2 + d^2) for each axis
-        if mass > 0:
-            hx, hy, hz = half_extents
-            wx, wy, wz = 2*hx, 2*hy, 2*hz
-            ix = mass / 12.0 * (wy*wy + wz*wz)
-            iy = mass / 12.0 * (wx*wx + wz*wz)
-            iz = mass / 12.0 * (wx*wx + wy*wy)
-            data.bodies[body_idx].inertia = (ix, iy, iz)
-            data.bodies[body_idx].inv_inertia = (1.0/ix if ix > 0 else 0,
-                                                  1.0/iy if iy > 0 else 0,
-                                                  1.0/iz if iz > 0 else 0)
-
-        return len(self.object_starts) - 1
+        half_size = ti.Vector([size[0] / 2, size[1] / 2, size[2] / 2])
+        return self._add_box_gpu(ti.Vector(center), half_size, ti.Vector(color), mass)
 
     @benchmark
     def add_plane(self, center, normal, size, color=(0.5, 0.5, 0.5)):
@@ -324,6 +353,25 @@ class Scene:
         # Set vertex colors
         for i in range(start_vertex, data.num_vertices[None]):
             data.vertex_colors[i] = color
+
+        # Create physics body and plane geom (static infinite plane)
+        vert_count = 4
+        body_idx = self._create_rigid_body(ti.Vector(center), 0.0, start_vertex, vert_count)  # mass=0 (static)
+
+        # Create plane geom - store normal in data field
+        geom_idx = ti.atomic_add(data.num_geoms[None], 1)
+        data.geoms[geom_idx].geom_type = data.GEOM_PLANE
+        data.geoms[geom_idx].body_idx = body_idx
+        data.geoms[geom_idx].local_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        # Store plane normal in data field
+        data.geoms[geom_idx].data = ti.Vector([normal[0], normal[1], normal[2], 0.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].world_pos = ti.Vector(center)
+        data.geoms[geom_idx].world_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].aabb_min = ti.Vector([-1e6, -1e6, -1e6])
+        data.geoms[geom_idx].aabb_max = ti.Vector([1e6, 1e6, 1e6])
+
+        return body_idx
 
     @benchmark
     def add_mesh_from_obj(self, filename, center=(0, 0, 0), size=1.0, rotation=(0, 0, 0), color=(1.0, 1.0, 1.0), velocity=(0, 0, 0)):

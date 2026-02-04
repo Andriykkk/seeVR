@@ -1,4 +1,4 @@
-[ ] physics
+[x] physics
 Component	What Genesis Uses	Realism
 Shape representation	Convex + SDF	⭐⭐⭐ Exact (no approximation)
 Collision detection	GJK + EPA	⭐⭐⭐ Mathematically exact

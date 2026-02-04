@@ -26,9 +26,9 @@ MAX_CONTACTS = 10000  # Maximum narrow phase contacts
 # Collision geometry types
 GEOM_SPHERE = 1
 GEOM_BOX = 2
-GEOM_CAPSULE = 3
-GEOM_CONVEX = 4
-GEOM_PLANE = 5
+GEOM_PLANE = 3
+GEOM_CAPSULE = 4
+GEOM_CONVEX = 5
 
 # BVH Node structure
 # For internal nodes: left_first = left child, right_child = right child, tri_count = 0

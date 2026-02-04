@@ -476,6 +476,78 @@ def test_sat_axis(axis: ti.types.vector(3, ti.f32), d: ti.types.vector(3, ti.f32
 
 
 @ti.func
+def collide_sphere_plane(sphere_pos: ti.types.vector(3, ti.f32), sphere_radius: ti.f32,
+                         plane_pos: ti.types.vector(3, ti.f32), plane_normal: ti.types.vector(3, ti.f32),
+                         body_a: ti.i32, body_b: ti.i32,
+                         geom_a: ti.i32, geom_b: ti.i32):
+    """Sphere-plane collision detection.
+
+    Returns: (has_contact, contact_point, normal, depth)
+    Normal points from plane to sphere (A to B).
+    """
+    # Distance from sphere center to plane (signed)
+    dist = (sphere_pos - plane_pos).dot(plane_normal)
+
+    has_contact = 0
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    normal = plane_normal
+    depth = 0.0
+
+    # Check if sphere penetrates plane
+    if dist < sphere_radius:
+        has_contact = 1
+        depth = sphere_radius - dist
+        contact_point = sphere_pos - plane_normal * dist
+        # Normal points from plane (A) to sphere (B)
+        normal = plane_normal
+
+    return has_contact, contact_point, normal, depth
+
+
+@ti.func
+def collide_box_plane(box_pos: ti.types.vector(3, ti.f32), box_quat: ti.types.vector(4, ti.f32),
+                      box_half: ti.types.vector(3, ti.f32),
+                      plane_pos: ti.types.vector(3, ti.f32), plane_normal: ti.types.vector(3, ti.f32),
+                      body_a: ti.i32, body_b: ti.i32,
+                      geom_a: ti.i32, geom_b: ti.i32):
+    """Box-plane collision detection.
+
+    Returns: (has_contact, contact_point, normal, depth)
+    Normal points from plane to box (A to B).
+    """
+    # Get box axes
+    ax0 = quat_rotate(box_quat, ti.Vector([1.0, 0.0, 0.0]))
+    ax1 = quat_rotate(box_quat, ti.Vector([0.0, 1.0, 0.0]))
+    ax2 = quat_rotate(box_quat, ti.Vector([0.0, 0.0, 1.0]))
+
+    # Find the box corner furthest in the -normal direction (most penetrating)
+    # This is the support point in the -normal direction
+    sign0 = -1.0 if ax0.dot(plane_normal) > 0.0 else 1.0
+    sign1 = -1.0 if ax1.dot(plane_normal) > 0.0 else 1.0
+    sign2 = -1.0 if ax2.dot(plane_normal) > 0.0 else 1.0
+
+    # Most penetrating corner
+    corner = box_pos + ax0 * box_half[0] * sign0 + ax1 * box_half[1] * sign1 + ax2 * box_half[2] * sign2
+
+    # Distance from corner to plane
+    dist = (corner - plane_pos).dot(plane_normal)
+
+    has_contact = 0
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    normal = plane_normal
+    depth = 0.0
+
+    # If corner is below plane, we have contact
+    if dist < 0.0:
+        has_contact = 1
+        depth = -dist
+        contact_point = corner - plane_normal * dist
+        normal = plane_normal
+
+    return has_contact, contact_point, normal, depth
+
+
+@ti.func
 def collide_box_box(pos_a: ti.types.vector(3, ti.f32), quat_a: ti.types.vector(4, ti.f32),
                     half_a: ti.types.vector(3, ti.f32),
                     pos_b: ti.types.vector(3, ti.f32), quat_b: ti.types.vector(4, ti.f32),
@@ -673,6 +745,12 @@ def narrow_phase(num_pairs: ti.i32):
         type_a = data.geoms[geom_a_idx].geom_type
         type_b = data.geoms[geom_b_idx].geom_type
 
+        # Canonicalize: ensure type_a <= type_b to avoid duplicate collision cases
+        # Swap if type_a > type_b
+        if type_a > type_b:
+            geom_a_idx, geom_b_idx = geom_b_idx, geom_a_idx
+            type_a, type_b = type_b, type_a
+
         pos_a = data.geoms[geom_a_idx].world_pos
         pos_b = data.geoms[geom_b_idx].world_pos
         quat_a = data.geoms[geom_a_idx].world_quat
@@ -704,13 +782,6 @@ def narrow_phase(num_pairs: ti.i32):
                 pos_a, radius, pos_b, quat_b, half_b, body_a, body_b, geom_a_idx, geom_b_idx)
             # Flip: collide returns box→sphere, we need sphere→box (A→B)
             normal = -normal
-
-        elif type_a == data.GEOM_BOX and type_b == data.GEOM_SPHERE:
-            radius = data_b[0]
-            half_a = ti.Vector([data_a[0], data_a[1], data_a[2]])
-            has_contact, contact_point, normal, depth = collide_sphere_box(
-                pos_b, radius, pos_a, quat_a, half_a, body_b, body_a, geom_b_idx, geom_a_idx)
-            # No flip needed: collide returns box→sphere, which is A→B here
 
         # Box-Box: Generate 4 corner contacts to prevent rotation
         elif type_a == data.GEOM_BOX and type_b == data.GEOM_BOX:
@@ -769,6 +840,20 @@ def narrow_phase(num_pairs: ti.i32):
                         data.contacts[slot].geom_b = geom_b_idx
 
             has_contact = 0  # Already handled, skip generic add below
+
+        # Sphere-Plane
+        elif type_a == data.GEOM_SPHERE and type_b == data.GEOM_PLANE:
+            radius = data_a[0]
+            plane_normal = ti.Vector([data_b[0], data_b[1], data_b[2]])
+            has_contact, contact_point, normal, depth = collide_sphere_plane(
+                pos_a, radius, pos_b, plane_normal, body_a, body_b, geom_a_idx, geom_b_idx)
+
+        # Box-Plane
+        elif type_a == data.GEOM_BOX and type_b == data.GEOM_PLANE:
+            half_a = ti.Vector([data_a[0], data_a[1], data_a[2]])
+            plane_normal = ti.Vector([data_b[0], data_b[1], data_b[2]])
+            has_contact, contact_point, normal, depth = collide_box_plane(
+                pos_a, quat_a, half_a, pos_b, plane_normal, body_a, body_b, geom_a_idx, geom_b_idx)
 
         # Add contact if found (for non-box-box collisions)
         if has_contact == 1 and depth > 0:
