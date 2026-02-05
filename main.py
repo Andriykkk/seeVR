@@ -22,7 +22,7 @@ from kernels.debug import run_debug_bvh
 from kernels.physics import (
     compute_local_vertices, apply_gravity, integrate_bodies,
     update_render_vertices, update_geom_transforms, broad_phase_n_squared,
-    narrow_phase, highlight_contact_bodies, solve_contacts
+    narrow_phase, highlight_contact_bodies, solve_contacts, build_debug_geom_verts
 )
 from kernels.mesh_processor import load_collision_mesh
 
@@ -36,7 +36,9 @@ class Settings:
         self.samples_per_pixel = 2
         self.sky_intensity = 1.0
         self.debug_bvh = False
-        self.target_fps = 60  # FPS limiter (0 = unlimited)
+        self.highlight_contacts = False
+        self.target_fps = 3  # FPS limiter (0 = unlimited)
+        self.render_geoms = False  # Visual debug: render collision geom wireframes
 
 settings = Settings()
 
@@ -132,6 +134,64 @@ class Scene:
         return geom_idx
 
     @ti.kernel
+    def _create_hull_geom(self, body_idx: ti.i32,
+                          hull_verts: ti.types.ndarray(dtype=ti.f32, ndim=2),
+                          hull_faces: ti.types.ndarray(dtype=ti.i32, ndim=2),
+                          mesh_subtype: ti.i32) -> ti.i32:
+        """Create a mesh collision geometry from convex hull vertices and faces.
+
+        Hull vertices should already be in local space (centered, scaled, rotated).
+        """
+        geom_idx = ti.atomic_add(data.num_geoms[None], 1)
+        num_verts = hull_verts.shape[0]
+        num_faces = hull_faces.shape[0]
+
+        # Allocate space in collision_verts and copy hull vertices (already in local space)
+        vert_start = ti.atomic_add(data.num_collision_verts[None], num_verts)
+        for i in range(num_verts):
+            data.collision_verts[vert_start + i] = ti.Vector([
+                hull_verts[i, 0], hull_verts[i, 1], hull_verts[i, 2]
+            ])
+
+        # Allocate space in collision_faces and copy (offset indices by vert_start)
+        face_start = ti.atomic_add(data.num_collision_faces[None], num_faces)
+        for i in range(num_faces):
+            data.collision_faces[face_start + i] = ti.Vector([
+                hull_faces[i, 0] + vert_start,
+                hull_faces[i, 1] + vert_start,
+                hull_faces[i, 2] + vert_start
+            ])
+
+        # Compute bounding box of hull vertices
+        min_coord = ti.Vector([1e10, 1e10, 1e10])
+        max_coord = ti.Vector([-1e10, -1e10, -1e10])
+        for i in range(num_verts):
+            v = ti.Vector([hull_verts[i, 0], hull_verts[i, 1], hull_verts[i, 2]])
+            min_coord = ti.min(min_coord, v)
+            max_coord = ti.max(max_coord, v)
+
+        # Create GEOM_MESH with hull data
+        # MESH data: [vert_start, vert_count, face_start, face_count, 0, 0, mesh_subtype]
+        data.geoms[geom_idx].geom_type = data.GEOM_MESH
+        data.geoms[geom_idx].body_idx = body_idx
+        data.geoms[geom_idx].local_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].data = ti.Vector([
+            ti.cast(vert_start, ti.f32),
+            ti.cast(num_verts, ti.f32),
+            ti.cast(face_start, ti.f32),
+            ti.cast(num_faces, ti.f32),
+            0.0, 0.0,
+            ti.cast(mesh_subtype, ti.f32)
+        ])
+        data.geoms[geom_idx].world_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[geom_idx].world_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[geom_idx].aabb_min = min_coord
+        data.geoms[geom_idx].aabb_max = max_coord
+
+        return geom_idx
+
+    @ti.kernel
     def _set_box_inertia(self, body_idx: ti.i32, half_extents: ti.types.vector(3, ti.f32)):
         """Set proper box inertia tensor."""
         mass = data.bodies[body_idx].mass
@@ -155,6 +215,46 @@ class Scene:
             inertia = 0.4 * mass * radius * radius
             data.bodies[body_idx].inertia = ti.Vector([inertia, inertia, inertia])
             data.bodies[body_idx].inv_inertia = ti.Vector([1.0/inertia, 1.0/inertia, 1.0/inertia])
+
+    @ti.kernel
+    def _set_mesh_inertia(self, body_idx: ti.i32, hull_verts: ti.types.ndarray(dtype=ti.f32, ndim=2),
+                          mesh_volume: ti.f32):
+        """Set inertia tensor based on original mesh volume and bounding box."""
+        mass = data.bodies[body_idx].mass
+        if mass > 0.0:
+            # Compute bounding box dimensions
+            min_coord = ti.Vector([1e10, 1e10, 1e10])
+            max_coord = ti.Vector([-1e10, -1e10, -1e10])
+
+            for i in range(hull_verts.shape[0]):
+                v = ti.Vector([hull_verts[i, 0], hull_verts[i, 1], hull_verts[i, 2]])
+                min_coord = ti.min(min_coord, v)
+                max_coord = ti.max(max_coord, v)
+
+            # Box dimensions (width, height, depth)
+            dims = max_coord - min_coord
+
+            # Calculate bounding box volume
+            bbox_volume = dims[0] * dims[1] * dims[2]
+
+            # Volume ratio: how much of the bounding box is filled by the original mesh
+            # This represents the actual mass distribution (not the hull)
+            volume_ratio = mesh_volume / bbox_volume if bbox_volume > 1e-8 else 1.0
+            volume_ratio = ti.max(volume_ratio, 0.1)  # Clamp to avoid too small values
+
+            # Box inertia tensor scaled by volume ratio
+            # For a solid box: I = (mass/12) * (height^2 + depth^2), etc.
+            # Scaled by volume_ratio since mass is distributed in mesh_volume, not bbox_volume
+            ix = (mass * volume_ratio) / 12.0 * (dims[1]*dims[1] + dims[2]*dims[2])
+            iy = (mass * volume_ratio) / 12.0 * (dims[0]*dims[0] + dims[2]*dims[2])
+            iz = (mass * volume_ratio) / 12.0 * (dims[0]*dims[0] + dims[1]*dims[1])
+
+            data.bodies[body_idx].inertia = ti.Vector([ix, iy, iz])
+            data.bodies[body_idx].inv_inertia = ti.Vector([
+                1.0/ix if ix > 0.0 else 0.0,
+                1.0/iy if iy > 0.0 else 0.0,
+                1.0/iz if iz > 0.0 else 0.0
+            ])
 
     @ti.kernel
     def _add_box_gpu(self, center: ti.types.vector(3, ti.f32),
@@ -525,19 +625,40 @@ class Scene:
             mass
         )
 
-        # CPU analyzes mesh and decides collision strategy
-        collision_data = load_collision_mesh(verts_np, faces_np, convexify, collision_threshold)
+        # Read GPU-transformed vertices directly (they are exact)
+        # GPU stores: (raw - mesh_center) * scale rotated + center
+        vert_start = data.bodies[body_idx].vert_start
+        vert_count = data.bodies[body_idx].vert_count
+        center_np = np.array(center, dtype=np.float32)
+
+        # Read vertices from GPU and subtract center to get local space
+        gpu_verts = np.zeros((vert_count, 3), dtype=np.float32)
+        for i in range(vert_count):
+            v = data.vertices[vert_start + i]
+            gpu_verts[i] = [v[0] - center_np[0], v[1] - center_np[1], v[2] - center_np[2]]
+
+        # Compute hull from GPU local-space vertices (exact match with visual mesh)
+        collision_data = load_collision_mesh(gpu_verts, faces_np, convexify, collision_threshold)
 
         # Create collision geoms based on strategy
         if collision_data['geom_type'] == data.GEOM_MESH:
             mesh_subtype = collision_data['mesh_subtype']
             hulls = collision_data['hulls']
+            mesh_volume = collision_data['mesh_volume']
 
             print(f"  Collision: {len(hulls)} convex hull(s), error={collision_data['stats']['volume_error']:.4f}")
 
-            # TODO: Create actual hull geoms on GPU
-            # For now, just print warning
-            print(f"  WARNING: Convex hull collision not yet implemented - no collision geoms created")
+            # Create hull geoms - hull vertices are in local space (same as original_vertices)
+            for i, hull in enumerate(hulls):
+                hv = hull['vertices']  # already in local space from transformed_verts
+                print(f"    Hull {i}: {len(hv)} verts, {len(hull['faces'])} faces")
+                self._create_hull_geom(body_idx, hv, hull['faces'], mesh_subtype)
+
+            # Set inertia based on original mesh volume (not hull volume)
+            if mass > 0.0:
+                self._set_mesh_inertia(body_idx, hulls[0]['vertices'], mesh_volume)
+
+            print(f"  Created {len(hulls)} hull collision geom(s)")
 
         elif collision_data['geom_type'] == data.GEOM_SDF:
             sdf = collision_data['sdf']
@@ -690,8 +811,15 @@ def run_physics(dt):
     update_render_vertices(num_bodies)
 
     # Optional: highlight bodies in contact
-    if num_contacts > 0:
+    if settings.highlight_contacts and num_contacts > 0:
         highlight_contact_bodies(num_contacts, num_bodies)
+
+    # Optional: build debug geom vertices for rendering
+    if settings.render_geoms:
+        num_coll_verts = data.num_collision_verts[None]
+        num_coll_faces = data.num_collision_faces[None]
+        if num_coll_faces > 0:
+            build_debug_geom_verts(num_geoms, num_coll_verts, num_coll_faces)
 
     if is_enabled_benchmark():
         ti.sync()
@@ -708,6 +836,14 @@ def run_rasterize(ti_scene, ti_camera, canvas, cam):
         per_vertex_color=data.vertex_colors,
         two_sided=True
     )
+    # Render collision geom hulls as wireframe mesh
+    if settings.render_geoms and data.num_collision_faces[None] > 0:
+        ti_scene.mesh(
+            data.debug_geom_verts,
+            indices=data.debug_geom_indices,
+            per_vertex_color=data.debug_geom_colors,
+            two_sided=True
+        )
     canvas.scene(ti_scene)
     if is_enabled_benchmark():
         ti.sync()
@@ -780,7 +916,15 @@ def create_demo_scene():
     scene.add_sphere(center=(2, 4, 1), radius=0.5, color=(0.2, 0.2, 0.9))    # Blue
     scene.add_sphere(center=(-1, 6, -1), radius=0.6, color=(0.9, 0.9, 0.2))  # Yellow
     scene.add_sphere(center=(1.5, 7, 0.5), radius=0.4, color=(0.9, 0.2, 0.9)) # Magenta
-    scene.add_sphere(center=(0, 8, 0), radius=0.8, color=(0.2, 0.9, 0.9))    # Cyan
+    scene.add_sphere(center=(0, 8, 0), radius=0.8, color=(0.2, 0.9, 0.9)) 
+    
+    scene.add_mesh_from_obj(
+    "./models/cylinder.obj",
+    center=(-1, 2.5, 0),
+    size=1.0,
+    color=(0.8, 0.3, 0.3),
+    rotation=(0, 180, 0)
+    )
 
     # A box to show mixed shapes (dynamic)
     scene.add_box(
@@ -868,6 +1012,8 @@ def main():
         settings.samples_per_pixel = gui.slider_int("Samples", settings.samples_per_pixel, 1, 64)
         settings.sky_intensity = gui.slider_float("Sky", settings.sky_intensity, 0.0, 3.0)
         settings.debug_bvh = gui.checkbox("Debug BVH", settings.debug_bvh)
+        settings.highlight_contacts = gui.checkbox("Highlight Contacts", settings.highlight_contacts)
+        settings.render_geoms = gui.checkbox("Render Geoms", settings.render_geoms)
         gui.end()
 
         frame += 1

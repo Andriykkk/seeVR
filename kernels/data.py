@@ -135,12 +135,19 @@ gravity = None  # Gravity vector (adjustable)
 # Local vertices for collision geometry (convex hulls, stored in local space)
 collision_verts = None
 num_collision_verts = None
+# Collision faces (triangle indices into collision_verts)
+collision_faces = None
+num_collision_faces = None
 # Broad phase collision pairs (candidate pairs whose AABBs overlap)
 collision_pairs = None  # [pair_idx, 0] = geom_a, [pair_idx, 1] = geom_b
 num_collision_pairs = None
 # Narrow phase contacts
 contacts = None
 num_contacts = None
+# Debug rendering
+debug_geom_verts = None
+debug_geom_colors = None
+debug_geom_indices = None
 
 
 def init_scene():
@@ -153,8 +160,10 @@ def init_scene():
     global sort_indices, sort_indices_temp, bvh_aabb_flags
     global bodies, geoms, num_bodies, num_geoms, gravity
     global collision_verts, num_collision_verts
+    global collision_faces, num_collision_faces
     global collision_pairs, num_collision_pairs
     global contacts, num_contacts
+    global debug_geom_verts, debug_geom_colors, debug_geom_indices
 
     # Geometry
     vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
@@ -198,6 +207,9 @@ def init_scene():
     # Collision vertices for convex hulls (local space, never change)
     collision_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
     num_collision_verts = ti.field(dtype=ti.i32, shape=())
+    # Collision faces (triangle indices into collision_verts)
+    collision_faces = ti.Vector.field(3, dtype=ti.i32, shape=MAX_TRIANGLES)
+    num_collision_faces = ti.field(dtype=ti.i32, shape=())
 
     # Broad phase collision pairs
     collision_pairs = ti.Vector.field(2, dtype=ti.i32, shape=MAX_COLLISION_PAIRS)
@@ -207,12 +219,18 @@ def init_scene():
     contacts = Contact.field(shape=MAX_CONTACTS)
     num_contacts = ti.field(dtype=ti.i32, shape=())
 
+    # Debug rendering: world-space collision geometry
+    debug_geom_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
+    debug_geom_colors = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
+    debug_geom_indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES * 3)
+
     # Initialize counts
     num_vertices[None] = 0
     num_triangles[None] = 0
     num_bodies[None] = 0
     num_geoms[None] = 0
     num_collision_verts[None] = 0
+    num_collision_faces[None] = 0
     num_collision_pairs[None] = 0
     num_contacts[None] = 0
     gravity[None] = [0.0, -9.81, 0.0]  # Default Earth gravity

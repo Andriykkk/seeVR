@@ -1158,3 +1158,42 @@ def solve_contacts(num_contacts: int, num_iterations: int, dt: float):
     for _ in range(num_iterations):
         solve_contacts_iterate_once(num_contacts)
 
+
+# =============================================================================
+# Debug rendering for collision geoms
+# =============================================================================
+
+@ti.kernel
+def build_debug_geom_verts(num_geoms: ti.i32, num_collision_verts: ti.i32, num_collision_faces: ti.i32):
+    """Transform collision vertices to world space and copy face indices for debug rendering."""
+    # Transform all collision vertices to world space
+    for gi in range(num_geoms):
+        geom = data.geoms[gi]
+        if geom.geom_type == data.GEOM_MESH:
+            vert_start = ti.cast(geom.data[0], ti.i32)
+            vert_count = ti.cast(geom.data[1], ti.i32)
+
+            body_idx = geom.body_idx
+            body_pos = data.bodies[body_idx].pos
+            body_quat = data.bodies[body_idx].quat
+
+            # Random color per geom
+            r = ti.cast((gi * 123) % 255, ti.f32) / 255.0
+            g = ti.cast((gi * 456 + 100) % 255, ti.f32) / 255.0
+            b = ti.cast((gi * 789 + 50) % 255, ti.f32) / 255.0
+            color = ti.Vector([r, g, b])
+
+            for vi in range(vert_count):
+                idx = vert_start + vi
+                local_v = data.collision_verts[idx]
+                world_v = quat_rotate(body_quat, local_v) + body_pos
+                data.debug_geom_verts[idx] = world_v
+                data.debug_geom_colors[idx] = color
+
+    # Copy all collision face indices to debug indices (flattened)
+    for fi in range(num_collision_faces):
+        src_face = data.collision_faces[fi]
+        data.debug_geom_indices[fi * 3 + 0] = src_face[0]
+        data.debug_geom_indices[fi * 3 + 1] = src_face[1]
+        data.debug_geom_indices[fi * 3 + 2] = src_face[2]
+
