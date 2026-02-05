@@ -921,7 +921,7 @@ def create_demo_scene():
     scene.add_mesh_from_obj(
     "./models/cylinder.obj",
     center=(-1, 2.5, 0),
-    size=1.0,
+    size=2.0,
     color=(0.8, 0.3, 0.3),
     rotation=(0, 180, 0)
     )

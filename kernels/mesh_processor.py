@@ -1,7 +1,6 @@
 """Mesh collision processor - determines collision strategy based on complexity (GPU)."""
 import taichi as ti
 import numpy as np
-from numba import njit
 import kernels.data as data
 
 
@@ -19,247 +18,98 @@ def compute_mesh_volume_gpu(vertices: ti.types.ndarray(dtype=ti.f32, ndim=2),
 
 
 # =============================================================================
-# Quickhull Algorithm (Pure Python/NumPy - no Numba for simplicity)
+# Quickhull Algorithm
 # =============================================================================
 
-def quickhull_3d(input_vertices):
-    """
-    Compute 3D convex hull using Quickhull algorithm.
+def _face_normal(points, f):
+    """Get outward normal of face."""
+    n = np.cross(points[f[1]] - points[f[0]], points[f[2]] - points[f[0]])
+    ln = np.linalg.norm(n)
+    return n / ln if ln > 1e-10 else n
 
-    Args:
-        input_vertices: Nx3 numpy array of 3D points
+def _point_dist(points, pi, f):
+    """Signed distance from point to face plane."""
+    return np.dot(points[pi] - points[f[0]], _face_normal(points, f))
 
-    Returns:
-        hull_vertices: Mx3 array of hull vertex coordinates (direct copy from input)
-        hull_faces: Kx3 array of triangle face indices (into hull_vertices)
-    """
-    # Keep reference to original for final output
-    original_verts = np.asarray(input_vertices)
-    # Work with float64 for precision in calculations
-    points = original_verts.astype(np.float64)
-    n = len(points)
+def _orient_face(points, f, centroid):
+    """Orient face outward (away from centroid)."""
+    fc = (points[f[0]] + points[f[1]] + points[f[2]]) / 3.0
+    if np.dot(_face_normal(points, f), fc - centroid) < 0:
+        return [f[0], f[2], f[1]]
+    return f
 
+def quickhull_3d(verts):
+    """Compute 3D convex hull. Returns (hull_verts, hull_faces)."""
+    pts = np.asarray(verts, dtype=np.float64)
+    n = len(pts)
     if n < 4:
-        return points.astype(np.float32), np.array([[0, 1, 2]], dtype=np.int32)
+        return pts.astype(np.float32), np.array([[0,1,2]], dtype=np.int32)
 
-    # Step 1: Find extreme points to build initial tetrahedron
-    # Find min/max along each axis
-    min_x, max_x = np.argmin(points[:, 0]), np.argmax(points[:, 0])
-    min_y, max_y = np.argmin(points[:, 1]), np.argmax(points[:, 1])
-    min_z, max_z = np.argmin(points[:, 2]), np.argmax(points[:, 2])
+    # Find initial tetrahedron from extreme points
+    ext = [np.argmin(pts[:,i//2]) if i%2==0 else np.argmax(pts[:,i//2]) for i in range(6)]
+    p0, p1 = max(((ext[i], ext[j]) for i in range(6) for j in range(i+1,6)),
+                  key=lambda p: np.linalg.norm(pts[p[0]] - pts[p[1]]))
 
-    extreme = [min_x, max_x, min_y, max_y, min_z, max_z]
+    line = pts[p1] - pts[p0]
+    line /= np.linalg.norm(line)
+    p2 = max((i for i in range(n) if i not in (p0,p1)),
+             key=lambda i: np.linalg.norm(pts[i] - pts[p0] - np.dot(pts[i]-pts[p0], line)*line))
 
-    # Find two most distant extreme points
-    max_dist = -1
-    p0, p1 = 0, 1
-    for i in range(len(extreme)):
-        for j in range(i + 1, len(extreme)):
-            d = np.linalg.norm(points[extreme[i]] - points[extreme[j]])
-            if d > max_dist:
-                max_dist = d
-                p0, p1 = extreme[i], extreme[j]
+    norm = np.cross(pts[p1]-pts[p0], pts[p2]-pts[p0])
+    norm /= np.linalg.norm(norm)
+    p3 = max((i for i in range(n) if i not in (p0,p1,p2)),
+             key=lambda i: abs(np.dot(pts[i]-pts[p0], norm)))
 
-    # Find point furthest from line p0-p1
-    line_dir = points[p1] - points[p0]
-    line_len = np.linalg.norm(line_dir)
-    if line_len < 1e-10:
-        return points[:1].astype(np.float32), np.array([[0, 0, 0]], dtype=np.int32)
-    line_dir /= line_len
+    centroid = (pts[p0] + pts[p1] + pts[p2] + pts[p3]) / 4.0
+    on_hull = {p0, p1, p2, p3}
 
-    max_dist = -1
-    p2 = 0
-    for i in range(n):
-        if i == p0 or i == p1:
-            continue
-        v = points[i] - points[p0]
-        proj = np.dot(v, line_dir) * line_dir
-        dist = np.linalg.norm(v - proj)
-        if dist > max_dist:
-            max_dist = dist
-            p2 = i
+    # Initial faces with outside sets
+    faces = [_orient_face(pts, f, centroid) for f in [[p0,p1,p2], [p0,p2,p3], [p0,p3,p1], [p1,p3,p2]]]
+    outside = [[i for i in range(n) if i not in on_hull and _point_dist(pts, i, f) > 1e-10] for f in faces]
 
-    # Find point furthest from plane (p0, p1, p2)
-    v1 = points[p1] - points[p0]
-    v2 = points[p2] - points[p0]
-    normal = np.cross(v1, v2)
-    normal_len = np.linalg.norm(normal)
-    if normal_len < 1e-10:
-        return points[[p0, p1, p2]].astype(np.float32), np.array([[0, 1, 2]], dtype=np.int32)
-    normal /= normal_len
-
-    max_dist = -1
-    p3 = 0
-    for i in range(n):
-        if i in [p0, p1, p2]:
-            continue
-        dist = abs(np.dot(points[i] - points[p0], normal))
-        if dist > max_dist:
-            max_dist = dist
-            p3 = i
-
-    # Step 2: Build initial tetrahedron with 4 faces
-    # Each face stores: [v0, v1, v2] indices into points array
-    # Faces are oriented with normals pointing outward
-
-    centroid = (points[p0] + points[p1] + points[p2] + points[p3]) / 4.0
-
-    # Initial faces (will be reoriented to point outward)
-    initial_faces = [
-        [p0, p1, p2],
-        [p0, p2, p3],
-        [p0, p3, p1],
-        [p1, p3, p2]
-    ]
-
-    faces = []
-    for face in initial_faces:
-        v0, v1, v2 = points[face[0]], points[face[1]], points[face[2]]
-        normal = np.cross(v1 - v0, v2 - v0)
-        normal_len = np.linalg.norm(normal)
-        if normal_len > 1e-10:
-            normal /= normal_len
-        # Check if normal points outward (away from centroid)
-        face_center = (v0 + v1 + v2) / 3.0
-        if np.dot(normal, face_center - centroid) < 0:
-            # Flip winding
-            face = [face[0], face[2], face[1]]
-        faces.append(face)
-
-    # Track which points are on the hull
-    on_hull = set([p0, p1, p2, p3])
-
-    # Step 3: Assign outside points to faces
-    def get_face_normal(face):
-        v0, v1, v2 = points[face[0]], points[face[1]], points[face[2]]
-        normal = np.cross(v1 - v0, v2 - v0)
-        norm_len = np.linalg.norm(normal)
-        if norm_len > 1e-10:
-            normal /= norm_len
-        return normal, v0
-
-    def point_above_face(pt_idx, face):
-        normal, v0 = get_face_normal(face)
-        return np.dot(points[pt_idx] - v0, normal) > 1e-10
-
-    # Build outside sets for each face
-    outside_sets = []
-    for face in faces:
-        outside = []
-        for i in range(n):
-            if i not in on_hull and point_above_face(i, face):
-                outside.append(i)
-        outside_sets.append(outside)
-
-    # Step 4: Main loop - process faces with outside points
-    max_iterations = n * 3
-    iteration = 0
-
-    while iteration < max_iterations:
-        iteration += 1
-
-        # Find face with furthest outside point
-        best_face_idx = -1
-        best_point_idx = -1
-        best_dist = 1e-10
-
-        for fi, face in enumerate(faces):
-            if not outside_sets[fi]:
-                continue
-            normal, v0 = get_face_normal(face)
-            for pi in outside_sets[fi]:
-                dist = np.dot(points[pi] - v0, normal)
-                if dist > best_dist:
-                    best_dist = dist
-                    best_face_idx = fi
-                    best_point_idx = pi
-
-        if best_face_idx == -1:
-            # No more outside points - done!
+    # Main loop
+    while True:
+        # Find furthest outside point
+        best = (-1, -1, 0)
+        for fi, f in enumerate(faces):
+            for pi in outside[fi]:
+                d = _point_dist(pts, pi, f)
+                if d > best[2]:
+                    best = (fi, pi, d)
+        if best[0] < 0:
             break
 
-        new_point = best_point_idx
-        on_hull.add(new_point)
+        new_pt = best[1]
+        on_hull.add(new_pt)
 
-        # Find all faces visible from new point
-        visible = []
-        for fi, face in enumerate(faces):
-            if point_above_face(new_point, face):
-                visible.append(fi)
-
-        if not visible:
-            continue
-
-        # Collect all outside points from visible faces
-        all_outside = set()
+        # Find visible faces and horizon edges
+        visible = [fi for fi, f in enumerate(faces) if _point_dist(pts, new_pt, f) > 1e-10]
+        edges = {}
         for fi in visible:
-            all_outside.update(outside_sets[fi])
-        all_outside.discard(new_point)
-
-        # Find horizon edges (edges between visible and non-visible faces)
-        edge_count = {}
-        for fi in visible:
-            face = faces[fi]
             for i in range(3):
-                e = (face[i], face[(i + 1) % 3])
-                # Store edge with canonical ordering for counting
-                e_key = (min(e), max(e))
-                e_directed = e  # Keep original direction
-                if e_key not in edge_count:
-                    edge_count[e_key] = []
-                edge_count[e_key].append(e_directed)
+                e = (faces[fi][i], faces[fi][(i+1)%3])
+                k = (min(e), max(e))
+                edges[k] = edges.get(k, []) + [e]
+        horizon = [es[0] for es in edges.values() if len(es) == 1]
 
-        # Horizon edges appear only once (not shared between visible faces)
-        horizon = []
-        for e_key, edges in edge_count.items():
-            if len(edges) == 1:
-                # This edge is on the horizon - keep original winding
-                horizon.append(edges[0])
+        # Collect outside points from visible faces
+        all_out = {pi for fi in visible for pi in outside[fi]} - {new_pt}
 
-        # Remove visible faces (in reverse order to preserve indices)
+        # Remove visible, add new faces
         for fi in sorted(visible, reverse=True):
             faces.pop(fi)
-            outside_sets.pop(fi)
+            outside.pop(fi)
 
-        # Create new faces from new point to horizon edges
-        new_faces = []
-        new_outside_sets = []
         for e0, e1 in horizon:
-            # Create face with correct winding (e1, e0, new_point to match horizon edge direction)
-            new_face = [e1, e0, new_point]
+            nf = _orient_face(pts, [e1, e0, new_pt], centroid)
+            faces.append(nf)
+            outside.append([pi for pi in all_out if pi not in on_hull and _point_dist(pts, pi, nf) > 1e-10])
 
-            # Verify orientation
-            v0, v1, v2 = points[new_face[0]], points[new_face[1]], points[new_face[2]]
-            normal = np.cross(v1 - v0, v2 - v0)
-            normal_len = np.linalg.norm(normal)
-            if normal_len > 1e-10:
-                normal /= normal_len
-            face_center = (v0 + v1 + v2) / 3.0
-            if np.dot(normal, face_center - centroid) < 0:
-                new_face = [new_face[0], new_face[2], new_face[1]]
-
-            # Assign outside points to new face
-            new_outside = []
-            for pi in all_outside:
-                if pi not in on_hull and point_above_face(pi, new_face):
-                    new_outside.append(pi)
-
-            new_faces.append(new_face)
-            new_outside_sets.append(new_outside)
-
-        faces.extend(new_faces)
-        outside_sets.extend(new_outside_sets)
-
-    # Step 5: Convert to output format
-    # Map original point indices to hull vertex indices
-    hull_point_indices = sorted(on_hull)
-    index_map = {old: new for new, old in enumerate(hull_point_indices)}
-
-    # Copy ORIGINAL vertices directly (no conversion, exact same values)
-    hull_vertices = original_verts[hull_point_indices].astype(np.float32)
-    hull_faces = np.array([[index_map[f[0]], index_map[f[1]], index_map[f[2]]] for f in faces], dtype=np.int32)
-
-    return hull_vertices, hull_faces
+    # Output
+    hull_idx = sorted(on_hull)
+    idx_map = {old: new for new, old in enumerate(hull_idx)}
+    return (np.asarray(verts)[hull_idx].astype(np.float32),
+            np.array([[idx_map[f[0]], idx_map[f[1]], idx_map[f[2]]] for f in faces], dtype=np.int32))
 
 
 def convex_hull(vertices):

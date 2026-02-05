@@ -271,6 +271,18 @@ def update_geom_transforms(num_geoms: ti.i32):
             aabb_min = ti.Vector([-1e6, -1e6, -1e6])
             aabb_max = ti.Vector([1e6, 1e6, 1e6])
 
+        elif geom_type == data.GEOM_MESH:
+            # Compute AABB from hull vertices transformed to world space
+            vert_start = ti.cast(geom_data[0], ti.i32)
+            vert_count = ti.cast(geom_data[1], ti.i32)
+            aabb_min = ti.Vector([1e10, 1e10, 1e10])
+            aabb_max = ti.Vector([-1e10, -1e10, -1e10])
+            for vi in range(vert_count):
+                local_v = data.collision_verts[vert_start + vi]
+                world_v = world_pos + quat_rotate(world_quat, local_v)
+                aabb_min = ti.min(aabb_min, world_v)
+                aabb_max = ti.max(aabb_max, world_v)
+
         data.geoms[i].aabb_min = aabb_min
         data.geoms[i].aabb_max = aabb_max
 
@@ -545,6 +557,32 @@ def collide_box_plane(box_pos: ti.types.vector(3, ti.f32), box_quat: ti.types.ve
         normal = plane_normal
 
     return has_contact, contact_point, normal, depth
+
+
+@ti.func
+def collide_mesh_plane(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.types.vector(4, ti.f32),
+                       vert_start: ti.i32, vert_count: ti.i32,
+                       plane_pos: ti.types.vector(3, ti.f32), plane_normal: ti.types.vector(3, ti.f32),
+                       body_a: ti.i32, body_b: ti.i32, geom_a: ti.i32, geom_b: ti.i32):
+    """Mesh-plane collision - find deepest vertex below plane."""
+    has_contact = 0
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    normal = plane_normal
+    max_depth = 0.0
+
+    for vi in range(vert_count):
+        local_v = data.collision_verts[vert_start + vi]
+        world_v = mesh_pos + quat_rotate(mesh_quat, local_v)
+        dist = (world_v - plane_pos).dot(plane_normal)
+
+        if dist < 0.0:
+            depth = -dist
+            if depth > max_depth:
+                max_depth = depth
+                contact_point = world_v - plane_normal * dist
+                has_contact = 1
+
+    return has_contact, contact_point, normal, max_depth
 
 
 @ti.func
@@ -854,6 +892,15 @@ def narrow_phase(num_pairs: ti.i32):
             plane_normal = ti.Vector([data_b[0], data_b[1], data_b[2]])
             has_contact, contact_point, normal, depth = collide_box_plane(
                 pos_a, quat_a, half_a, pos_b, plane_normal, body_a, body_b, geom_a_idx, geom_b_idx)
+
+        # Mesh-Plane
+        elif type_a == data.GEOM_MESH and type_b == data.GEOM_PLANE:
+            vert_start = ti.cast(data_a[0], ti.i32)
+            vert_count = ti.cast(data_a[1], ti.i32)
+            plane_normal = ti.Vector([data_b[0], data_b[1], data_b[2]])
+            has_contact, contact_point, normal, depth = collide_mesh_plane(
+                pos_a, quat_a, vert_start, vert_count, pos_b, plane_normal,
+                body_a, body_b, geom_a_idx, geom_b_idx)
 
         # Add contact if found (for non-box-box collisions)
         if has_contact == 1 and depth > 0:
