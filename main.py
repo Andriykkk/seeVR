@@ -22,7 +22,8 @@ from kernels.debug import run_debug_bvh
 from kernels.physics import (
     compute_local_vertices, apply_gravity, integrate_bodies,
     update_render_vertices, update_geom_transforms, broad_phase_n_squared,
-    narrow_phase, highlight_contact_bodies, solve_contacts, build_debug_geom_verts
+    narrow_phase, highlight_contact_bodies, solve_contacts, build_debug_geom_verts,
+    build_debug_contacts
 )
 from kernels.mesh_processor import load_collision_mesh
 
@@ -39,6 +40,7 @@ class Settings:
         self.highlight_contacts = False
         self.target_fps = 30  # FPS limiter (0 = unlimited)
         self.render_geoms = False  # Visual debug: render collision geom wireframes
+        self.debug_contacts = False  # Print contact info after narrow phase
 
 settings = Settings()
 
@@ -821,6 +823,10 @@ def run_physics(dt):
         if num_coll_faces > 0:
             build_debug_geom_verts(num_geoms, num_coll_verts, num_coll_faces)
 
+    # Build debug contact visualization
+    if settings.debug_contacts and num_contacts > 0:
+        build_debug_contacts(num_contacts)
+
     if is_enabled_benchmark():
         ti.sync()
 
@@ -843,6 +849,31 @@ def run_rasterize(ti_scene, ti_camera, canvas, cam):
             indices=data.debug_geom_indices,
             per_vertex_color=data.debug_geom_colors,
             two_sided=True
+        )
+        # Render normal arrows as lines
+        num_faces = data.num_collision_faces[None]
+        ti_scene.lines(
+            data.debug_normal_verts,
+            per_vertex_color=data.debug_normal_colors,
+            width=3.0,
+            vertex_count=num_faces * 2
+        )
+    # Render contact points and normals
+    num_contacts = data.num_contacts[None]
+    if settings.debug_contacts and num_contacts > 0:
+        # Contact points as particles (yellow)
+        ti_scene.particles(
+            data.debug_contact_points,
+            radius=0.02,
+            color=(1.0, 1.0, 0.0),
+            index_count=num_contacts
+        )
+        # Contact normals as lines (cyan)
+        ti_scene.lines(
+            data.debug_contact_normals,
+            width=4.0,
+            color=(0.0, 1.0, 1.0),
+            vertex_count=num_contacts * 2
         )
     canvas.scene(ti_scene)
     if is_enabled_benchmark():
@@ -1014,6 +1045,7 @@ def main():
         settings.debug_bvh = gui.checkbox("Debug BVH", settings.debug_bvh)
         settings.highlight_contacts = gui.checkbox("Highlight Contacts", settings.highlight_contacts)
         settings.render_geoms = gui.checkbox("Render Geoms", settings.render_geoms)
+        settings.debug_contacts = gui.checkbox("Debug Contacts", settings.debug_contacts)
         gui.end()
 
         frame += 1

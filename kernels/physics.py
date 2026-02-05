@@ -590,15 +590,15 @@ def collide_mesh_sphere(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.type
                         face_start: ti.i32, face_count: ti.i32,
                         sphere_pos: ti.types.vector(3, ti.f32), sphere_radius: ti.f32,
                         body_a: ti.i32, body_b: ti.i32, geom_a: ti.i32, geom_b: ti.i32):
-    """Mesh-sphere collision - check sphere against hull faces."""
+    """Mesh-sphere collision - check sphere against hull faces. A=sphere, B=mesh."""
     has_contact = 0
     contact_point = ti.Vector([0.0, 0.0, 0.0])
     normal = ti.Vector([0.0, 1.0, 0.0])
     depth = 0.0
 
     # For convex hull: find closest face to sphere center
-    # Signed distance: positive = outside, negative = inside
-    max_dist = -1e10  # Most positive (closest to surface from inside)
+    # Signed distance: positive = outside hull, negative = inside hull
+    max_dist = -1e10
     best_normal = ti.Vector([0.0, 1.0, 0.0])
     best_point = ti.Vector([0.0, 0.0, 0.0])
 
@@ -608,24 +608,23 @@ def collide_mesh_sphere(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.type
         v1 = mesh_pos + quat_rotate(mesh_quat, data.collision_verts[face[1]])
         v2 = mesh_pos + quat_rotate(mesh_quat, data.collision_verts[face[2]])
 
-        # Face normal (outward)
+        # Face normal (outward from hull)
         fn = (v1 - v0).cross(v2 - v0)
         fn_len = fn.norm()
         if fn_len > 1e-10:
             fn = fn / fn_len
-
-            # Signed distance from sphere center to face plane
             dist = (sphere_pos - v0).dot(fn)
 
             if dist > max_dist:
                 max_dist = dist
                 best_normal = fn
-                best_point = sphere_pos - fn * dist  # Project onto plane
+                best_point = sphere_pos - fn * dist
 
     # Contact if sphere penetrates: max_dist < sphere_radius
     if max_dist < sphere_radius:
         depth = sphere_radius - max_dist
-        normal = best_normal  # Points outward from hull
+        # Normal points from A (sphere) to B (mesh) = -outward
+        normal = -best_normal
         contact_point = best_point
         has_contact = 1
 
@@ -638,13 +637,12 @@ def collide_mesh_box(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.types.v
                      box_pos: ti.types.vector(3, ti.f32), box_quat: ti.types.vector(4, ti.f32),
                      box_half: ti.types.vector(3, ti.f32),
                      body_a: ti.i32, body_b: ti.i32, geom_a: ti.i32, geom_b: ti.i32):
-    """Mesh-box collision - check hull vertices against box."""
+    """Mesh-box collision. A=box, B=mesh. Normal points from A to B."""
     has_contact = 0
     contact_point = ti.Vector([0.0, 0.0, 0.0])
     normal = ti.Vector([0.0, 1.0, 0.0])
     max_depth = 0.0
 
-    # Box axes
     ax0 = quat_rotate(box_quat, ti.Vector([1.0, 0.0, 0.0]))
     ax1 = quat_rotate(box_quat, ti.Vector([0.0, 1.0, 0.0]))
     ax2 = quat_rotate(box_quat, ti.Vector([0.0, 0.0, 1.0]))
@@ -653,26 +651,22 @@ def collide_mesh_box(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.types.v
         local_v = data.collision_verts[vert_start + vi]
         world_v = mesh_pos + quat_rotate(mesh_quat, local_v)
 
-        # Transform vertex to box local space
         rel = world_v - box_pos
         local_x = rel.dot(ax0)
         local_y = rel.dot(ax1)
         local_z = rel.dot(ax2)
 
-        # Check if inside box (with penetration)
         dx = ti.abs(local_x) - box_half[0]
         dy = ti.abs(local_y) - box_half[1]
         dz = ti.abs(local_z) - box_half[2]
 
         if dx < 0 and dy < 0 and dz < 0:
-            # Inside box - find shallowest penetration axis
             depth = -ti.max(dx, ti.max(dy, dz))
             if depth > max_depth:
                 max_depth = depth
                 has_contact = 1
                 contact_point = world_v
-
-                # Normal is along axis of shallowest penetration
+                # Normal points from box (A) toward mesh vertex (B)
                 if dx > dy and dx > dz:
                     normal = ax0 if local_x > 0 else -ax0
                 elif dy > dz:
@@ -1458,9 +1452,37 @@ def build_debug_geom_verts(num_geoms: ti.i32, num_collision_verts: ti.i32, num_c
                 data.debug_geom_colors[idx] = color
 
     # Copy all collision face indices to debug indices (flattened)
+    # Also compute normal arrows for each face
     for fi in range(num_collision_faces):
         src_face = data.collision_faces[fi]
         data.debug_geom_indices[fi * 3 + 0] = src_face[0]
         data.debug_geom_indices[fi * 3 + 1] = src_face[1]
         data.debug_geom_indices[fi * 3 + 2] = src_face[2]
+
+        # Compute face center and normal for debug arrow
+        v0 = data.debug_geom_verts[src_face[0]]
+        v1 = data.debug_geom_verts[src_face[1]]
+        v2 = data.debug_geom_verts[src_face[2]]
+        center = (v0 + v1 + v2) / 3.0
+        fn = (v1 - v0).cross(v2 - v0)
+        fn_len = fn.norm()
+        if fn_len > 1e-10:
+            fn = fn / fn_len
+        # Arrow from center to center + normal * 0.1
+        data.debug_normal_verts[fi * 2 + 0] = center
+        data.debug_normal_verts[fi * 2 + 1] = center + fn * 0.1
+        data.debug_normal_colors[fi * 2 + 0] = ti.Vector([0.0, 1.0, 0.0])
+        data.debug_normal_colors[fi * 2 + 1] = ti.Vector([1.0, 0.0, 0.0])
+
+
+@ti.kernel
+def build_debug_contacts(num_contacts: ti.i32):
+    """Build debug visualization for contact points and normals."""
+    for i in range(num_contacts):
+        pt = data.contacts[i].point
+        n = data.contacts[i].normal
+        data.debug_contact_points[i] = pt
+        # Normal arrow from contact point
+        data.debug_contact_normals[i * 2 + 0] = pt
+        data.debug_contact_normals[i * 2 + 1] = pt + n * 0.2  # 0.2 length arrow
 

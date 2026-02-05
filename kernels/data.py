@@ -148,6 +148,12 @@ num_contacts = None
 debug_geom_verts = None
 debug_geom_colors = None
 debug_geom_indices = None
+# Debug normal arrows (2 verts per face: center and center+normal)
+debug_normal_verts = None
+debug_normal_colors = None
+# Debug contact points (point + normal arrow)
+debug_contact_points = None
+debug_contact_normals = None  # 2 verts per contact for normal line
 
 
 def init_scene():
@@ -164,6 +170,8 @@ def init_scene():
     global collision_pairs, num_collision_pairs
     global contacts, num_contacts
     global debug_geom_verts, debug_geom_colors, debug_geom_indices
+    global debug_normal_verts, debug_normal_colors
+    global debug_contact_points, debug_contact_normals
 
     # Geometry
     vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
@@ -223,6 +231,12 @@ def init_scene():
     debug_geom_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
     debug_geom_colors = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
     debug_geom_indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES * 3)
+    # Debug normal arrows (2 verts per face for lines)
+    debug_normal_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIANGLES * 2)
+    debug_normal_colors = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIANGLES * 2)
+    # Debug contact points and normals
+    debug_contact_points = ti.Vector.field(3, dtype=ti.f32, shape=MAX_CONTACTS)
+    debug_contact_normals = ti.Vector.field(3, dtype=ti.f32, shape=MAX_CONTACTS * 2)  # 2 verts per line
 
     # Initialize counts
     num_vertices[None] = 0
@@ -233,4 +247,5 @@ def init_scene():
     num_collision_faces[None] = 0
     num_collision_pairs[None] = 0
     num_contacts[None] = 0
-    gravity[None] = [0.0, -9.81, 0.0]  # Default Earth gravity
+    # gravity[None] = [0.0, -9.81, 0.0]  # Default Earth gravity
+    gravity[None] = [0.0, -2.0, 0.0]  # Default Earth gravity

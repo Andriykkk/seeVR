@@ -105,11 +105,12 @@ def quickhull_3d(verts):
             faces.append(nf)
             outside.append([pi for pi in all_out if pi not in on_hull and _point_dist(pts, pi, nf) > 1e-10])
 
-    # Output - flip winding for collision convention (inward normals)
+    # Output (faces already oriented outward by _orient_face during construction)
     hull_idx = sorted(on_hull)
     idx_map = {old: new for new, old in enumerate(hull_idx)}
-    return (np.asarray(verts)[hull_idx].astype(np.float32),
-            np.array([[idx_map[f[0]], idx_map[f[2]], idx_map[f[1]]] for f in faces], dtype=np.int32))
+    hull_pts = np.asarray(verts)[hull_idx]
+    out_faces = np.array([[idx_map[f[0]], idx_map[f[1]], idx_map[f[2]]] for f in faces], dtype=np.int32)
+    return (hull_pts.astype(np.float32), out_faces)
 
 
 def convex_hull(vertices):
