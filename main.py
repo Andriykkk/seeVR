@@ -23,7 +23,7 @@ from kernels.physics import (
     compute_local_vertices, apply_gravity, integrate_bodies,
     update_render_vertices, update_geom_transforms, broad_phase_n_squared,
     narrow_phase, highlight_contact_bodies, solve_contacts, build_debug_geom_verts,
-    build_debug_contacts
+    build_debug_contacts, build_debug_forces
 )
 from kernels.mesh_processor import load_collision_mesh
 
@@ -40,7 +40,8 @@ class Settings:
         self.highlight_contacts = False
         self.target_fps = 30  # FPS limiter (0 = unlimited)
         self.render_geoms = False  # Visual debug: render collision geom wireframes
-        self.debug_contacts = False  # Print contact info after narrow phase
+        self.debug_contacts = False  # Visual debug: render contact points and normals
+        self.debug_forces = False  # Visual debug: render solver impulse arrows
 
 settings = Settings()
 
@@ -827,6 +828,10 @@ def run_physics(dt):
     if settings.debug_contacts and num_contacts > 0:
         build_debug_contacts(num_contacts)
 
+    # Build debug force visualization (after solver has computed impulses)
+    if settings.debug_forces and num_contacts > 0:
+        build_debug_forces(num_contacts)
+
     if is_enabled_benchmark():
         ti.sync()
 
@@ -873,6 +878,14 @@ def run_rasterize(ti_scene, ti_camera, canvas, cam):
             data.debug_contact_normals,
             width=4.0,
             color=(0.0, 1.0, 1.0),
+            vertex_count=num_contacts * 2
+        )
+    # Render solver force/impulse arrows (green->yellow->red based on strength)
+    if settings.debug_forces and num_contacts > 0:
+        ti_scene.lines(
+            data.debug_force_verts,
+            per_vertex_color=data.debug_force_colors,
+            width=5.0,
             vertex_count=num_contacts * 2
         )
     canvas.scene(ti_scene)
@@ -950,11 +963,11 @@ def create_demo_scene():
     scene.add_sphere(center=(0, 8, 0), radius=0.8, color=(0.2, 0.9, 0.9)) 
     
     scene.add_mesh_from_obj(
-    "./models/cylinder.obj",
-    center=(-5, 2.5, 0),
+    "./models/dragon_smallest.obj",
+    center=(0, 2.5, -5),
     size=2.0,
     color=(0.8, 0.3, 0.3),
-    rotation=(45, 180, 45)
+    rotation=(0, 180, 0)
     )
 
     # A box to show mixed shapes (dynamic)
@@ -1046,6 +1059,7 @@ def main():
         settings.highlight_contacts = gui.checkbox("Highlight Contacts", settings.highlight_contacts)
         settings.render_geoms = gui.checkbox("Render Geoms", settings.render_geoms)
         settings.debug_contacts = gui.checkbox("Debug Contacts", settings.debug_contacts)
+        settings.debug_forces = gui.checkbox("Debug Forces", settings.debug_forces)
         gui.end()
 
         frame += 1

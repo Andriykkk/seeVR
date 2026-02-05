@@ -634,47 +634,107 @@ def collide_mesh_sphere(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.type
 @ti.func
 def collide_mesh_box(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.types.vector(4, ti.f32),
                      vert_start: ti.i32, vert_count: ti.i32,
+                     face_start: ti.i32, face_count: ti.i32,
                      box_pos: ti.types.vector(3, ti.f32), box_quat: ti.types.vector(4, ti.f32),
                      box_half: ti.types.vector(3, ti.f32),
                      body_a: ti.i32, body_b: ti.i32, geom_a: ti.i32, geom_b: ti.i32):
-    """Mesh-box collision. A=box, B=mesh. Normal points from A to B."""
+    """Mesh-box collision using two-way vertex tests. A=box, B=mesh.
+
+    Part 1: Check mesh vertices inside box
+    Part 2: Check box corners inside mesh hull
+    Returns deepest contact found.
+    """
     has_contact = 0
-    contact_point = ti.Vector([0.0, 0.0, 0.0])
-    normal = ti.Vector([0.0, 1.0, 0.0])
+    best_point = ti.Vector([0.0, 0.0, 0.0])
+    best_normal = ti.Vector([0.0, 1.0, 0.0])
     max_depth = 0.0
 
+    # Box axes in world space
     ax0 = quat_rotate(box_quat, ti.Vector([1.0, 0.0, 0.0]))
     ax1 = quat_rotate(box_quat, ti.Vector([0.0, 1.0, 0.0]))
     ax2 = quat_rotate(box_quat, ti.Vector([0.0, 0.0, 1.0]))
 
+    # =========================================================================
+    # Part 1: Check each mesh vertex inside box
+    # =========================================================================
     for vi in range(vert_count):
         local_v = data.collision_verts[vert_start + vi]
         world_v = mesh_pos + quat_rotate(mesh_quat, local_v)
 
+        # Transform to box local space
         rel = world_v - box_pos
         local_x = rel.dot(ax0)
         local_y = rel.dot(ax1)
         local_z = rel.dot(ax2)
 
+        # Distance to each box face (negative = inside)
         dx = ti.abs(local_x) - box_half[0]
         dy = ti.abs(local_y) - box_half[1]
         dz = ti.abs(local_z) - box_half[2]
 
+        # If all negative, vertex is inside box
         if dx < 0 and dy < 0 and dz < 0:
+            # Depth = distance to nearest face
             depth = -ti.max(dx, ti.max(dy, dz))
             if depth > max_depth:
                 max_depth = depth
                 has_contact = 1
-                contact_point = world_v
-                # Normal points from box (A) toward mesh vertex (B)
+                best_point = world_v
+                # Normal = box face normal pointing toward mesh vertex (A→B)
                 if dx > dy and dx > dz:
-                    normal = ax0 if local_x > 0 else -ax0
+                    best_normal = ax0 if local_x > 0 else -ax0
                 elif dy > dz:
-                    normal = ax1 if local_y > 0 else -ax1
+                    best_normal = ax1 if local_y > 0 else -ax1
                 else:
-                    normal = ax2 if local_z > 0 else -ax2
+                    best_normal = ax2 if local_z > 0 else -ax2
 
-    return has_contact, contact_point, normal, max_depth
+    # =========================================================================
+    # Part 2: Check each box corner inside mesh hull
+    # =========================================================================
+    for corner_idx in range(8):
+        # Generate corner: each bit of corner_idx selects +/- for each axis
+        sx = 1.0 if (corner_idx & 1) == 0 else -1.0
+        sy = 1.0 if (corner_idx & 2) == 0 else -1.0
+        sz = 1.0 if (corner_idx & 4) == 0 else -1.0
+        corner = box_pos + ax0 * box_half[0] * sx + ax1 * box_half[1] * sy + ax2 * box_half[2] * sz
+
+        # Check if corner is inside mesh hull (behind all faces)
+        inside = 1
+        min_pen = 1e10  # minimum penetration (smallest |distance|)
+        closest_normal = ti.Vector([0.0, 1.0, 0.0])
+
+        for fi in range(face_count):
+            face = data.collision_faces[face_start + fi]
+            v0 = mesh_pos + quat_rotate(mesh_quat, data.collision_verts[face[0]])
+            v1 = mesh_pos + quat_rotate(mesh_quat, data.collision_verts[face[1]])
+            v2 = mesh_pos + quat_rotate(mesh_quat, data.collision_verts[face[2]])
+
+            # Face normal (outward from hull)
+            fn = (v1 - v0).cross(v2 - v0)
+            fn_len = fn.norm()
+            if fn_len > 1e-10:
+                fn = fn / fn_len
+
+                # Signed distance: positive = outside, negative = inside
+                dist = (corner - v0).dot(fn)
+
+                if dist > 0:
+                    inside = 0  # Corner is outside this face = outside hull
+                elif -dist < min_pen:
+                    min_pen = -dist
+                    closest_normal = fn  # Outward from mesh
+
+        # If inside hull, this is a contact
+        if inside == 1 and min_pen < 1e10:
+            depth = min_pen
+            if depth > max_depth:
+                max_depth = depth
+                has_contact = 1
+                best_point = corner
+                # Normal points from box (A) to mesh (B) = -outward = push box out
+                best_normal = -closest_normal
+
+    return has_contact, best_point, best_normal, max_depth
 
 
 @ti.func
@@ -1091,14 +1151,95 @@ def narrow_phase(num_pairs: ti.i32):
                 pos_b, quat_b, face_start, face_count, pos_a, radius,
                 body_a, body_b, geom_a_idx, geom_b_idx)
 
-        # Box-Mesh (BOX=2 < MESH=5)
+        # Box-Mesh (BOX=2 < MESH=5) - Generate multiple contacts directly
         elif type_a == data.GEOM_BOX and type_b == data.GEOM_MESH:
             half_a = ti.Vector([data_a[0], data_a[1], data_a[2]])
             vert_start = ti.cast(data_b[0], ti.i32)
             vert_count = ti.cast(data_b[1], ti.i32)
-            has_contact, contact_point, normal, depth = collide_mesh_box(
-                pos_b, quat_b, vert_start, vert_count, pos_a, quat_a, half_a,
-                body_a, body_b, geom_a_idx, geom_b_idx)
+            face_start = ti.cast(data_b[2], ti.i32)
+            face_count = ti.cast(data_b[3], ti.i32)
+
+            # Box axes
+            ax0 = quat_rotate(quat_a, ti.Vector([1.0, 0.0, 0.0]))
+            ax1 = quat_rotate(quat_a, ti.Vector([0.0, 1.0, 0.0]))
+            ax2 = quat_rotate(quat_a, ti.Vector([0.0, 0.0, 1.0]))
+
+            # Part 1: Check each mesh vertex inside box
+            for vi in range(vert_count):
+                local_v = data.collision_verts[vert_start + vi]
+                world_v = pos_b + quat_rotate(quat_b, local_v)
+
+                rel = world_v - pos_a
+                local_x = rel.dot(ax0)
+                local_y = rel.dot(ax1)
+                local_z = rel.dot(ax2)
+
+                dx = ti.abs(local_x) - half_a[0]
+                dy = ti.abs(local_y) - half_a[1]
+                dz = ti.abs(local_z) - half_a[2]
+
+                if dx < 0 and dy < 0 and dz < 0:
+                    depth = -ti.max(dx, ti.max(dy, dz))
+                    # Normal = box face normal (A→B)
+                    normal = ti.Vector([0.0, 1.0, 0.0])
+                    if dx > dy and dx > dz:
+                        normal = ax0 if local_x > 0 else -ax0
+                    elif dy > dz:
+                        normal = ax1 if local_y > 0 else -ax1
+                    else:
+                        normal = ax2 if local_z > 0 else -ax2
+
+                    slot = ti.atomic_add(data.num_contacts[None], 1)
+                    if slot < data.MAX_CONTACTS:
+                        data.contacts[slot].point = world_v
+                        data.contacts[slot].normal = normal
+                        data.contacts[slot].depth = depth
+                        data.contacts[slot].body_a = body_a
+                        data.contacts[slot].body_b = body_b
+                        data.contacts[slot].geom_a = geom_a_idx
+                        data.contacts[slot].geom_b = geom_b_idx
+
+            # Part 2: Check each box corner inside mesh hull
+            for corner_idx in range(8):
+                sx = 1.0 if (corner_idx & 1) == 0 else -1.0
+                sy = 1.0 if (corner_idx & 2) == 0 else -1.0
+                sz = 1.0 if (corner_idx & 4) == 0 else -1.0
+                corner = pos_a + ax0 * half_a[0] * sx + ax1 * half_a[1] * sy + ax2 * half_a[2] * sz
+
+                inside = 1
+                min_pen = 1e10
+                closest_normal = ti.Vector([0.0, 1.0, 0.0])
+
+                for fi in range(face_count):
+                    face = data.collision_faces[face_start + fi]
+                    v0 = pos_b + quat_rotate(quat_b, data.collision_verts[face[0]])
+                    v1 = pos_b + quat_rotate(quat_b, data.collision_verts[face[1]])
+                    v2 = pos_b + quat_rotate(quat_b, data.collision_verts[face[2]])
+
+                    fn = (v1 - v0).cross(v2 - v0)
+                    fn_len = fn.norm()
+                    if fn_len > 1e-10:
+                        fn = fn / fn_len
+                        dist = (corner - v0).dot(fn)
+
+                        if dist > 0:
+                            inside = 0
+                        elif -dist < min_pen:
+                            min_pen = -dist
+                            closest_normal = fn
+
+                if inside == 1 and min_pen < 1e10:
+                    slot = ti.atomic_add(data.num_contacts[None], 1)
+                    if slot < data.MAX_CONTACTS:
+                        data.contacts[slot].point = corner
+                        data.contacts[slot].normal = closest_normal  # Outward from mesh = separation direction
+                        data.contacts[slot].depth = min_pen
+                        data.contacts[slot].body_a = body_a
+                        data.contacts[slot].body_b = body_b
+                        data.contacts[slot].geom_a = geom_a_idx
+                        data.contacts[slot].geom_b = geom_b_idx
+
+            has_contact = 0  # Already handled, skip generic add below
 
         # Mesh-Mesh (MESH=5, MESH=5) - skip if same body
         elif type_a == data.GEOM_MESH and type_b == data.GEOM_MESH:
@@ -1481,8 +1622,58 @@ def build_debug_contacts(num_contacts: ti.i32):
     for i in range(num_contacts):
         pt = data.contacts[i].point
         n = data.contacts[i].normal
-        data.debug_contact_points[i] = pt
+        # Offset slightly along normal so it renders on top of surfaces
+        offset = n * 0.01
+        pt_vis = pt + offset
+        data.debug_contact_points[i] = pt_vis
         # Normal arrow from contact point
-        data.debug_contact_normals[i * 2 + 0] = pt
-        data.debug_contact_normals[i * 2 + 1] = pt + n * 0.2  # 0.2 length arrow
+        data.debug_contact_normals[i * 2 + 0] = pt_vis
+        data.debug_contact_normals[i * 2 + 1] = pt_vis + n * 0.2  # 0.2 length arrow
+
+
+@ti.kernel
+def build_debug_forces(num_contacts: ti.i32):
+    """Build debug visualization for solver impulses.
+
+    Shows the accumulated impulse (Pn) applied at each contact point.
+    Arrow length is proportional to impulse magnitude, scaled for visibility.
+    Color indicates impulse strength: green (weak) -> yellow -> red (strong).
+    """
+    # Find max impulse for normalization
+    max_impulse = 0.0
+    for i in range(num_contacts):
+        Pn = data.contacts[i].Pn
+        if Pn > max_impulse:
+            max_impulse = Pn
+
+    # Build arrows
+    for i in range(num_contacts):
+        pt = data.contacts[i].point
+        n = data.contacts[i].normal
+        Pn = data.contacts[i].Pn
+
+        # Offset slightly along normal so it renders on top of surfaces
+        offset = n * 0.015
+        pt_vis = pt + offset
+
+        # Scale factor: make impulses visible (0.5 units per unit impulse)
+        scale = 0.5
+        arrow_vec = n * Pn * scale
+
+        data.debug_force_verts[i * 2 + 0] = pt_vis
+        data.debug_force_verts[i * 2 + 1] = pt_vis + arrow_vec
+
+        # Color based on relative impulse strength (green -> yellow -> red)
+        ratio = 0.0
+        if max_impulse > 1e-6:
+            ratio = Pn / max_impulse
+
+        # Gradient: green (0) -> yellow (0.5) -> red (1)
+        r = ti.min(1.0, ratio * 2.0)
+        g = ti.min(1.0, 2.0 - ratio * 2.0)
+        b = 0.0
+        color = ti.Vector([r, g, b])
+
+        data.debug_force_colors[i * 2 + 0] = color
+        data.debug_force_colors[i * 2 + 1] = color
 
