@@ -1,6 +1,5 @@
 """Mesh collision processor - determines collision strategy based on complexity."""
 import numpy as np
-from scipy.spatial import ConvexHull
 import kernels.data as data
 
 
@@ -59,12 +58,13 @@ def load_collision_mesh(vertices, faces, convexify=True, threshold=0.05):
 
 def convex_hull(vertices):
     """Build single convex hull from vertices."""
-    hull = ConvexHull(vertices)
-    return {
-        'vertices': vertices[hull.vertices],
-        'faces': hull.simplices,
-        'volume': hull.volume,
-    }
+    pass
+    # hull = ConvexHull(vertices)
+    # return {
+    #     'vertices': vertices[hull.vertices],
+    #     'faces': hull.simplices,
+    #     'volume': hull.volume,
+    # }
 
 
 def volume_error(hull, original_verts, original_faces):

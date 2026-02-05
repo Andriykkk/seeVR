@@ -24,6 +24,7 @@ from kernels.physics import (
     update_render_vertices, update_geom_transforms, broad_phase_n_squared,
     narrow_phase, highlight_contact_bodies, solve_contacts
 )
+from kernels.mesh_processor import load_collision_mesh
 
 # Constants from data module
 WIDTH, HEIGHT = data.WIDTH, data.HEIGHT
@@ -300,7 +301,12 @@ class Scene:
         """Add a box - everything happens on GPU in one kernel call."""
         mass = 0.0 if is_static else 1.0
         half_size = ti.Vector([size[0] / 2, size[1] / 2, size[2] / 2])
-        return self._add_box_gpu(ti.Vector(center), half_size, ti.Vector(color), mass)
+        box = self._add_box_gpu(ti.Vector(center), half_size, ti.Vector(color), mass)
+
+        if is_enabled_benchmark():
+            ti.sync()
+
+        return box
 
     @benchmark
     def add_plane(self, center, normal, size, color=(0.5, 0.5, 0.5)):
@@ -373,88 +379,180 @@ class Scene:
 
         return body_idx
 
+    @ti.kernel
+    def _process_mesh_gpu(self, raw_verts: ti.types.ndarray(dtype=ti.f32, ndim=2),
+                          faces: ti.types.ndarray(dtype=ti.i32, ndim=2),
+                          center: ti.types.vector(3, ti.f32),
+                          target_size: ti.f32,
+                          rotation: ti.types.vector(3, ti.f32),  # rx, ry, rz in radians
+                          color: ti.types.vector(3, ti.f32),
+                          velocity: ti.types.vector(3, ti.f32),
+                          mass: ti.f32) -> ti.i32:
+        """Process mesh entirely on GPU: transform, create body, store geometry.
+
+        Returns body_idx.
+        """
+        num_verts = raw_verts.shape[0]
+        num_faces = faces.shape[0]
+
+        # Atomically allocate slots
+        vert_start = ti.atomic_add(data.num_vertices[None], num_verts)
+        tri_start = ti.atomic_add(data.num_triangles[None], num_faces)
+        body_idx = ti.atomic_add(data.num_bodies[None], 1)
+
+        # Step 1: Calculate bounding box on GPU
+        min_coord = ti.Vector([1e10, 1e10, 1e10])
+        max_coord = ti.Vector([-1e10, -1e10, -1e10])
+
+        for i in range(num_verts):
+            v = ti.Vector([raw_verts[i, 0], raw_verts[i, 1], raw_verts[i, 2]])
+            min_coord = ti.min(min_coord, v)
+            max_coord = ti.max(max_coord, v)
+
+        mesh_center = (min_coord + max_coord) * 0.5
+        extent = max_coord - min_coord
+        max_extent = ti.max(ti.max(extent[0], extent[1]), extent[2])
+        scale = target_size / max_extent if max_extent > 1e-8 else 1.0
+
+        # Step 2: Build rotation matrix (Y * X * Z order)
+        rx, ry, rz = rotation[0], rotation[1], rotation[2]
+        cos_x, sin_x = ti.cos(rx), ti.sin(rx)
+        cos_y, sin_y = ti.cos(ry), ti.sin(ry)
+        cos_z, sin_z = ti.cos(rz), ti.sin(rz)
+
+        # Rotation matrices (row-major)
+        Ry = ti.Matrix([
+            [cos_y, 0.0, sin_y],
+            [0.0, 1.0, 0.0],
+            [-sin_y, 0.0, cos_y]
+        ])
+        Rx = ti.Matrix([
+            [1.0, 0.0, 0.0],
+            [0.0, cos_x, -sin_x],
+            [0.0, sin_x, cos_x]
+        ])
+        Rz = ti.Matrix([
+            [cos_z, -sin_z, 0.0],
+            [sin_z, cos_z, 0.0],
+            [0.0, 0.0, 1.0]
+        ])
+        R = Rz @ Rx @ Ry
+
+        # Step 3: Transform vertices and store
+        for i in range(num_verts):
+            v = ti.Vector([raw_verts[i, 0], raw_verts[i, 1], raw_verts[i, 2]])
+            # Center, scale, rotate, translate
+            v = (v - mesh_center) * scale
+            v = R @ v
+            v = v + center
+
+            data.vertices[vert_start + i] = v
+            data.vertex_colors[vert_start + i] = color
+            data.velocities[vert_start + i] = velocity
+
+        # Step 4: Store face indices
+        for i in range(num_faces):
+            for j in ti.static(range(3)):
+                data.indices[tri_start * 3 + i * 3 + j] = vert_start + faces[i, j]
+
+        # Step 5: Create rigid body
+        data.bodies[body_idx].pos = center
+        data.bodies[body_idx].quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.bodies[body_idx].vel = ti.Vector([0.0, 0.0, 0.0])
+        data.bodies[body_idx].omega = ti.Vector([0.0, 0.0, 0.0])
+        data.bodies[body_idx].mass = mass
+        data.bodies[body_idx].inv_mass = 1.0 / mass if mass > 0.0 else 0.0
+        data.bodies[body_idx].vert_start = vert_start
+        data.bodies[body_idx].vert_count = num_verts
+
+        # Default inertia (will be updated by collision geom creation)
+        if mass > 0.0:
+            data.bodies[body_idx].inertia = ti.Vector([1.0, 1.0, 1.0])
+            data.bodies[body_idx].inv_inertia = ti.Vector([1.0, 1.0, 1.0])
+        else:
+            data.bodies[body_idx].inertia = ti.Vector([0.0, 0.0, 0.0])
+            data.bodies[body_idx].inv_inertia = ti.Vector([0.0, 0.0, 0.0])
+
+        return body_idx
+
     @benchmark
-    def add_mesh_from_obj(self, filename, center=(0, 0, 0), size=1.0, rotation=(0, 0, 0), color=(1.0, 1.0, 1.0), velocity=(0, 0, 0)):
-        """Load mesh from OBJ file, scaled to fit within given size
+    def add_mesh_from_obj(self, filename, center=(0, 0, 0), size=1.0, rotation=(0, 0, 0),
+                          color=(1.0, 1.0, 1.0), velocity=(0, 0, 0), is_static=False,
+                          convexify=True, collision_threshold=0.05):
+        """Load mesh from OBJ file - CPU reads file, GPU processes everything else.
 
         Args:
             rotation: (rx, ry, rz) in degrees - applied in Y, X, Z order
+            is_static: If True, mass = 0 (immovable)
+            convexify: If True, use convex hulls. If False, use SDF.
+            collision_threshold: Max volume error for single hull
         """
+        # CPU only reads file and extracts raw data
         raw_verts = []
         faces = []
-        start_vertex = data.num_vertices[None]
 
-        # Read raw vertices and faces
         with open(filename, 'r') as f:
             for line in f:
                 parts = line.strip().split()
                 if not parts:
                     continue
                 if parts[0] == 'v':
-                    raw_verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                    raw_verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
                 elif parts[0] == 'f':
                     indices = [int(p.split('/')[0]) - 1 for p in parts[1:]]
+                    # Triangulate polygon faces
                     for i in range(1, len(indices) - 1):
-                        faces.append((indices[0], indices[i], indices[i + 1]))
+                        faces.append([indices[0], indices[i], indices[i + 1]])
 
         if not raw_verts:
             return -1
 
-        num_verts = len(raw_verts)
-        num_faces = len(faces)
+        # Convert to numpy arrays
+        verts_np = np.array(raw_verts, dtype=np.float32)
+        faces_np = np.array(faces, dtype=np.int32)
 
-        # Convert to NumPy arrays for fast batch operations
-        verts = np.array(raw_verts, dtype=np.float32)
+        # Convert rotation to radians
+        rotation_rad = np.radians(rotation).astype(np.float32)
 
-        # Calculate bounding box (vectorized)
-        min_coords = verts.min(axis=0)
-        max_coords = verts.max(axis=0)
-        mesh_center = (min_coords + max_coords) / 2
-        max_extent = (max_coords - min_coords).max()
+        # GPU does all processing: transform, create body, store geometry
+        mass = 0.0 if is_static else 1.0
+        body_idx = self._process_mesh_gpu(
+            verts_np, faces_np,
+            ti.Vector(center), size,
+            ti.Vector(rotation_rad),
+            ti.Vector(color),
+            ti.Vector(velocity),
+            mass
+        )
 
-        # Scale to fit within size
-        scale = size / max_extent if max_extent > 0 else 1.0
+        # CPU analyzes mesh and decides collision strategy
+        collision_data = load_collision_mesh(verts_np, faces_np, convexify, collision_threshold)
 
-        # Center and scale (vectorized)
-        verts = (verts - mesh_center) * scale
+        # Create collision geoms based on strategy
+        if collision_data['geom_type'] == data.GEOM_MESH:
+            mesh_subtype = collision_data['mesh_subtype']
+            hulls = collision_data['hulls']
 
-        # Build rotation matrix (Y * X * Z order)
-        rx, ry, rz = np.radians(rotation)
-        cos_x, sin_x = np.cos(rx), np.sin(rx)
-        cos_y, sin_y = np.cos(ry), np.sin(ry)
-        cos_z, sin_z = np.cos(rz), np.sin(rz)
+            print(f"  Collision: {len(hulls)} convex hull(s), error={collision_data['stats']['volume_error']:.4f}")
 
-        # Rotation matrices
-        Ry = np.array([[cos_y, 0, sin_y], [0, 1, 0], [-sin_y, 0, cos_y]], dtype=np.float32)
-        Rx = np.array([[1, 0, 0], [0, cos_x, -sin_x], [0, sin_x, cos_x]], dtype=np.float32)
-        Rz = np.array([[cos_z, -sin_z, 0], [sin_z, cos_z, 0], [0, 0, 1]], dtype=np.float32)
-        R = Rz @ Rx @ Ry  # Combined rotation matrix
+            # TODO: Create actual hull geoms on GPU
+            # For now, just print warning
+            print(f"  WARNING: Convex hull collision not yet implemented - no collision geoms created")
 
-        # Apply rotation (vectorized matrix multiply) and translate
-        verts = (verts @ R.T + np.array(center, dtype=np.float32)).astype(np.float32)
+        elif collision_data['geom_type'] == data.GEOM_SDF:
+            sdf = collision_data['sdf']
+            print(f"  Collision: SDF grid resolution={sdf['resolution']}")
+            print(f"  WARNING: SDF collision not yet implemented - no collision geoms created")
 
-        # Convert faces to flat indices array
-        face_indices = (np.array(faces, dtype=np.int32).flatten() + start_vertex).astype(np.int32)
-
-        # Batch copy using GPU kernels
-        _copy_vertices_batch(verts, start_vertex)
-        _copy_velocities_batch(np.array(velocity, dtype=np.float32), start_vertex, num_verts)
-        _copy_indices_batch(face_indices, data.num_triangles[None] * 3)
-        _copy_colors_batch(np.array(color, dtype=np.float32), start_vertex, num_verts)
-
-        # Update counts
-        data.num_vertices[None] = start_vertex + num_verts
-        data.num_triangles[None] = data.num_triangles[None] + num_faces
-
-        self.object_starts.append((start_vertex, num_verts))
-        print(f"Loaded {filename}: {num_verts} vertices, {num_faces} triangles")
-        return len(self.object_starts) - 1
+        print(f"Loaded {filename}: {len(raw_verts)} vertices, {len(faces)} triangles (body {body_idx})")
+        return body_idx
 
     def clear(self):
         """Clear all objects"""
         data.num_vertices[None] = 0
         data.num_triangles[None] = 0
-        self.object_starts.clear()
+        data.num_bodies[None] = 0
+        data.num_geoms[None] = 0
 
 scene = Scene()
 
