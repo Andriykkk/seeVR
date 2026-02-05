@@ -586,6 +586,192 @@ def collide_mesh_plane(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.types
 
 
 @ti.func
+def collide_mesh_sphere(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.types.vector(4, ti.f32),
+                        face_start: ti.i32, face_count: ti.i32,
+                        sphere_pos: ti.types.vector(3, ti.f32), sphere_radius: ti.f32,
+                        body_a: ti.i32, body_b: ti.i32, geom_a: ti.i32, geom_b: ti.i32):
+    """Mesh-sphere collision - check sphere against hull faces."""
+    has_contact = 0
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    normal = ti.Vector([0.0, 1.0, 0.0])
+    depth = 0.0
+
+    # For convex hull: find closest face to sphere center
+    # Signed distance: positive = outside, negative = inside
+    max_dist = -1e10  # Most positive (closest to surface from inside)
+    best_normal = ti.Vector([0.0, 1.0, 0.0])
+    best_point = ti.Vector([0.0, 0.0, 0.0])
+
+    for fi in range(face_count):
+        face = data.collision_faces[face_start + fi]
+        v0 = mesh_pos + quat_rotate(mesh_quat, data.collision_verts[face[0]])
+        v1 = mesh_pos + quat_rotate(mesh_quat, data.collision_verts[face[1]])
+        v2 = mesh_pos + quat_rotate(mesh_quat, data.collision_verts[face[2]])
+
+        # Face normal (outward)
+        fn = (v1 - v0).cross(v2 - v0)
+        fn_len = fn.norm()
+        if fn_len > 1e-10:
+            fn = fn / fn_len
+
+            # Signed distance from sphere center to face plane
+            dist = (sphere_pos - v0).dot(fn)
+
+            if dist > max_dist:
+                max_dist = dist
+                best_normal = fn
+                best_point = sphere_pos - fn * dist  # Project onto plane
+
+    # Contact if sphere penetrates: max_dist < sphere_radius
+    if max_dist < sphere_radius:
+        depth = sphere_radius - max_dist
+        normal = best_normal  # Points outward from hull
+        contact_point = best_point
+        has_contact = 1
+
+    return has_contact, contact_point, normal, depth
+
+
+@ti.func
+def collide_mesh_box(mesh_pos: ti.types.vector(3, ti.f32), mesh_quat: ti.types.vector(4, ti.f32),
+                     vert_start: ti.i32, vert_count: ti.i32,
+                     box_pos: ti.types.vector(3, ti.f32), box_quat: ti.types.vector(4, ti.f32),
+                     box_half: ti.types.vector(3, ti.f32),
+                     body_a: ti.i32, body_b: ti.i32, geom_a: ti.i32, geom_b: ti.i32):
+    """Mesh-box collision - check hull vertices against box."""
+    has_contact = 0
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    normal = ti.Vector([0.0, 1.0, 0.0])
+    max_depth = 0.0
+
+    # Box axes
+    ax0 = quat_rotate(box_quat, ti.Vector([1.0, 0.0, 0.0]))
+    ax1 = quat_rotate(box_quat, ti.Vector([0.0, 1.0, 0.0]))
+    ax2 = quat_rotate(box_quat, ti.Vector([0.0, 0.0, 1.0]))
+
+    for vi in range(vert_count):
+        local_v = data.collision_verts[vert_start + vi]
+        world_v = mesh_pos + quat_rotate(mesh_quat, local_v)
+
+        # Transform vertex to box local space
+        rel = world_v - box_pos
+        local_x = rel.dot(ax0)
+        local_y = rel.dot(ax1)
+        local_z = rel.dot(ax2)
+
+        # Check if inside box (with penetration)
+        dx = ti.abs(local_x) - box_half[0]
+        dy = ti.abs(local_y) - box_half[1]
+        dz = ti.abs(local_z) - box_half[2]
+
+        if dx < 0 and dy < 0 and dz < 0:
+            # Inside box - find shallowest penetration axis
+            depth = -ti.max(dx, ti.max(dy, dz))
+            if depth > max_depth:
+                max_depth = depth
+                has_contact = 1
+                contact_point = world_v
+
+                # Normal is along axis of shallowest penetration
+                if dx > dy and dx > dz:
+                    normal = ax0 if local_x > 0 else -ax0
+                elif dy > dz:
+                    normal = ax1 if local_y > 0 else -ax1
+                else:
+                    normal = ax2 if local_z > 0 else -ax2
+
+    return has_contact, contact_point, normal, max_depth
+
+
+@ti.func
+def collide_mesh_mesh(pos_a: ti.types.vector(3, ti.f32), quat_a: ti.types.vector(4, ti.f32),
+                      vert_start_a: ti.i32, vert_count_a: ti.i32, face_start_a: ti.i32, face_count_a: ti.i32,
+                      pos_b: ti.types.vector(3, ti.f32), quat_b: ti.types.vector(4, ti.f32),
+                      vert_start_b: ti.i32, vert_count_b: ti.i32, face_start_b: ti.i32, face_count_b: ti.i32,
+                      body_a: ti.i32, body_b: ti.i32, geom_a: ti.i32, geom_b: ti.i32):
+    """Mesh-mesh collision - check vertices of A against hull B and vice versa."""
+    has_contact = 0
+    contact_point = ti.Vector([0.0, 0.0, 0.0])
+    normal = ti.Vector([0.0, 1.0, 0.0])
+    max_depth = 0.0
+
+    # Check vertices of mesh A against faces of mesh B
+    for vi in range(vert_count_a):
+        local_v = data.collision_verts[vert_start_a + vi]
+        world_v = pos_a + quat_rotate(quat_a, local_v)
+
+        # Check if inside hull B by testing against all faces
+        inside = 1
+        min_dist = 1e10
+        closest_normal = ti.Vector([0.0, 1.0, 0.0])
+
+        for fi in range(face_count_b):
+            face = data.collision_faces[face_start_b + fi]
+            v0 = pos_b + quat_rotate(quat_b, data.collision_verts[face[0]])
+            v1 = pos_b + quat_rotate(quat_b, data.collision_verts[face[1]])
+            v2 = pos_b + quat_rotate(quat_b, data.collision_verts[face[2]])
+
+            # Face normal (outward)
+            fn = (v1 - v0).cross(v2 - v0)
+            fn_len = fn.norm()
+            if fn_len > 1e-10:
+                fn = fn / fn_len
+
+            # Signed distance from vertex to face plane
+            dist = (world_v - v0).dot(fn)
+
+            if dist > 0:
+                inside = 0  # Outside this face = outside hull
+            elif -dist < min_dist:
+                min_dist = -dist
+                closest_normal = -fn  # Points from B to A
+
+        if inside == 1 and min_dist < 1e10:
+            if min_dist > max_depth:
+                max_depth = min_dist
+                contact_point = world_v
+                normal = closest_normal
+                has_contact = 1
+
+    # Check vertices of mesh B against faces of mesh A
+    for vi in range(vert_count_b):
+        local_v = data.collision_verts[vert_start_b + vi]
+        world_v = pos_b + quat_rotate(quat_b, local_v)
+
+        inside = 1
+        min_dist = 1e10
+        closest_normal = ti.Vector([0.0, 1.0, 0.0])
+
+        for fi in range(face_count_a):
+            face = data.collision_faces[face_start_a + fi]
+            v0 = pos_a + quat_rotate(quat_a, data.collision_verts[face[0]])
+            v1 = pos_a + quat_rotate(quat_a, data.collision_verts[face[1]])
+            v2 = pos_a + quat_rotate(quat_a, data.collision_verts[face[2]])
+
+            fn = (v1 - v0).cross(v2 - v0)
+            fn_len = fn.norm()
+            if fn_len > 1e-10:
+                fn = fn / fn_len
+
+            dist = (world_v - v0).dot(fn)
+
+            if dist > 0:
+                inside = 0
+            elif -dist < min_dist:
+                min_dist = -dist
+                closest_normal = fn  # Points from A to B
+
+        if inside == 1 and min_dist < 1e10:
+            if min_dist > max_depth:
+                max_depth = min_dist
+                contact_point = world_v
+                normal = closest_normal
+                has_contact = 1
+
+    return has_contact, contact_point, normal, max_depth
+
+
+@ti.func
 def collide_box_box(pos_a: ti.types.vector(3, ti.f32), quat_a: ti.types.vector(4, ti.f32),
                     half_a: ti.types.vector(3, ti.f32),
                     pos_b: ti.types.vector(3, ti.f32), quat_b: ti.types.vector(4, ti.f32),
@@ -901,6 +1087,40 @@ def narrow_phase(num_pairs: ti.i32):
             has_contact, contact_point, normal, depth = collide_mesh_plane(
                 pos_a, quat_a, vert_start, vert_count, pos_b, plane_normal,
                 body_a, body_b, geom_a_idx, geom_b_idx)
+
+        # Sphere-Mesh (SPHERE=1 < MESH=5)
+        elif type_a == data.GEOM_SPHERE and type_b == data.GEOM_MESH:
+            radius = data_a[0]
+            face_start = ti.cast(data_b[2], ti.i32)
+            face_count = ti.cast(data_b[3], ti.i32)
+            has_contact, contact_point, normal, depth = collide_mesh_sphere(
+                pos_b, quat_b, face_start, face_count, pos_a, radius,
+                body_a, body_b, geom_a_idx, geom_b_idx)
+
+        # Box-Mesh (BOX=2 < MESH=5)
+        elif type_a == data.GEOM_BOX and type_b == data.GEOM_MESH:
+            half_a = ti.Vector([data_a[0], data_a[1], data_a[2]])
+            vert_start = ti.cast(data_b[0], ti.i32)
+            vert_count = ti.cast(data_b[1], ti.i32)
+            has_contact, contact_point, normal, depth = collide_mesh_box(
+                pos_b, quat_b, vert_start, vert_count, pos_a, quat_a, half_a,
+                body_a, body_b, geom_a_idx, geom_b_idx)
+
+        # Mesh-Mesh (MESH=5, MESH=5) - skip if same body
+        elif type_a == data.GEOM_MESH and type_b == data.GEOM_MESH:
+            if body_a != body_b:  # Don't collide geoms on same body
+                vert_start_a = ti.cast(data_a[0], ti.i32)
+                vert_count_a = ti.cast(data_a[1], ti.i32)
+                face_start_a = ti.cast(data_a[2], ti.i32)
+                face_count_a = ti.cast(data_a[3], ti.i32)
+                vert_start_b = ti.cast(data_b[0], ti.i32)
+                vert_count_b = ti.cast(data_b[1], ti.i32)
+                face_start_b = ti.cast(data_b[2], ti.i32)
+                face_count_b = ti.cast(data_b[3], ti.i32)
+                has_contact, contact_point, normal, depth = collide_mesh_mesh(
+                    pos_a, quat_a, vert_start_a, vert_count_a, face_start_a, face_count_a,
+                    pos_b, quat_b, vert_start_b, vert_count_b, face_start_b, face_count_b,
+                    body_a, body_b, geom_a_idx, geom_b_idx)
 
         # Add contact if found (for non-box-box collisions)
         if has_contact == 1 and depth > 0:

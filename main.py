@@ -37,7 +37,7 @@ class Settings:
         self.sky_intensity = 1.0
         self.debug_bvh = False
         self.highlight_contacts = False
-        self.target_fps = 3  # FPS limiter (0 = unlimited)
+        self.target_fps = 30  # FPS limiter (0 = unlimited)
         self.render_geoms = False  # Visual debug: render collision geom wireframes
 
 settings = Settings()
@@ -920,10 +920,10 @@ def create_demo_scene():
     
     scene.add_mesh_from_obj(
     "./models/cylinder.obj",
-    center=(-1, 2.5, 0),
+    center=(-5, 2.5, 0),
     size=2.0,
     color=(0.8, 0.3, 0.3),
-    rotation=(0, 180, 0)
+    rotation=(45, 180, 45)
     )
 
     # A box to show mixed shapes (dynamic)
