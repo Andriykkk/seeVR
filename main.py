@@ -955,17 +955,17 @@ def create_demo_scene():
     )
 
     # Spheres at various heights (dynamic, will drop with physics)
-    scene.add_sphere(center=(-2, 3, 0), radius=0.5, color=(0.9, 0.2, 0.2))   # Red
-    scene.add_sphere(center=(0, 5, 0), radius=0.7, color=(0.2, 0.9, 0.2))    # Green
-    scene.add_sphere(center=(2, 4, 1), radius=0.5, color=(0.2, 0.2, 0.9))    # Blue
-    scene.add_sphere(center=(-1, 6, -1), radius=0.6, color=(0.9, 0.9, 0.2))  # Yellow
-    scene.add_sphere(center=(1.5, 7, 0.5), radius=0.4, color=(0.9, 0.2, 0.9)) # Magenta
-    scene.add_sphere(center=(0, 8, 0), radius=0.8, color=(0.2, 0.9, 0.9)) 
+    # scene.add_sphere(center=(-2, 3, 0), radius=0.5, color=(0.9, 0.2, 0.2))   # Red
+    # scene.add_sphere(center=(0, 5, 0), radius=0.7, color=(0.2, 0.9, 0.2))    # Green
+    # scene.add_sphere(center=(2, 4, 1), radius=0.5, color=(0.2, 0.2, 0.9))    # Blue
+    # scene.add_sphere(center=(-1, 6, -1), radius=0.6, color=(0.9, 0.9, 0.2))  # Yellow
+    # scene.add_sphere(center=(-2.5, 7, 0.5), radius=0.4, color=(0.9, 0.2, 0.9)) # Magenta
+    # scene.add_sphere(center=(0, 8, 0), radius=0.8, color=(0.2, 0.9, 0.9)) 
     
     scene.add_mesh_from_obj(
-    "./models/dragon_smallest.obj",
+    "./models/cube.obj",
     center=(0, 2.5, -5),
-    size=2.0,
+    size=1.0,
     color=(0.8, 0.3, 0.3),
     rotation=(0, 180, 0)
     )

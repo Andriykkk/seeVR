@@ -254,5 +254,5 @@ def init_scene():
     num_collision_faces[None] = 0
     num_collision_pairs[None] = 0
     num_contacts[None] = 0
-    gravity[None] = [0.0, -9.81, 0.0]  # Default Earth gravity
-    # gravity[None] = [0.0, -2.0, 0.0]  # Default Earth gravity
+    # gravity[None] = [0.0, -9.81, 0.0]  # Default Earth gravity
+    gravity[None] = [0.0, -0.5, 0.0]  # Default Earth gravity
