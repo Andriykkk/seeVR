@@ -221,11 +221,11 @@ def mpr_collide(geom_a: ti.i32, geom_b: ti.i32):
     v2 = ti.Vector([0.0, 0.0, 0.0])
     v3 = ti.Vector([0.0, 0.0, 0.0])
 
+    dir2 = ti.Vector([0.0, 0.0, 0.0])
     if done == 0:
         dir2 = v0.cross(v1)
         if dir2.dot(dir2) < MPR_TOLERANCE:
             if v1.norm() < MPR_TOLERANCE:
-                # v1 is at origin — shapes touching
                 has_collision = 1
                 contact_normal = -v0.normalized()
                 sa = support_geom(geom_a, contact_normal)
@@ -270,67 +270,92 @@ def mpr_collide(geom_a: ti.i32, geom_b: ti.i32):
                         else:
                             done = 2  # tetrahedron complete
 
-        # =====================================================================
-        # PHASE 3: Portal refinement loop
-        # =====================================================================
-
+    # =====================================================================
+    # PHASE 3: Refine portal — confirm collision
+    # =====================================================================
+    if done == 2:
+        done = 0
         for _ in range(MPR_MAX_ITERATIONS):
             if done == 0:
-                # Compute portal normal (pointing outward from origin)
                 n = portal_normal(v1, v2, v3)
 
-                # Make sure normal points away from v0 (outward)
-                if n.dot(v1 - v0) < 0:
-                    n = -n
-                    # Swap v1 and v2 to fix winding
-                    v1, v2 = v2, v1
-                    n = portal_normal(v1, v2, v3)
-
-                # Check if origin is behind the portal (inside Minkowski shape)
-                dist_origin = n.dot(v1)
-
-                if dist_origin >= 0:
-                    # Origin is behind or on the portal → collision!
+                # portal encapsulates origin? (origin behind portal)
+                if v1.dot(n) > -MPR_TOLERANCE:
                     has_collision = 1
-                    penetration_depth = dist_origin
-                    contact_normal = n
-
-                    # Contact point from support points in world space
-                    support_a = support_geom(geom_a, n)
-                    support_b = support_geom(geom_b, -n)
-                    contact_point = (support_a + support_b) * 0.5
-
                     done = 1
-
-                if done == 0:
-                    # Get new support point in portal normal direction
+                else:
                     v4 = support_minkowski(geom_a, geom_b, n)
 
-                    # Check for convergence: did v4 make progress?
-                    progress = n.dot(v4) - n.dot(v1)
-                    if progress < MPR_TOLERANCE:
-                        # No more progress - origin is outside
-                        done = 1
+                    # can new point reach origin?
+                    if v4.dot(n) < MPR_TOLERANCE:
+                        done = 1  # no collision
 
                     if done == 0:
-                        # Determine which portal vertex to replace
-                        n1 = (v4 - v0).cross(v1 - v0)
-                        n2 = (v4 - v0).cross(v2 - v0)
-                        n3 = (v4 - v0).cross(v3 - v0)
+                        # convergence check
+                        dv1 = v1.dot(n)
+                        dv2 = v2.dot(n)
+                        dv3 = v3.dot(n)
+                        dv4 = v4.dot(n)
+                        progress = ti.min(dv4 - dv1, ti.min(dv4 - dv2, dv4 - dv3))
+                        if progress < MPR_TOLERANCE:
+                            done = 1  # no collision
 
-                        d1 = -n1.dot(v0)
-                        d2 = -n2.dot(v0)
-                        d3 = -n3.dot(v0)
-
-                        if d1 < 0:
-                            if d2 < 0:
+                    if done == 0:
+                        # expand portal
+                        v4v0 = v4.cross(v0)
+                        d1 = v1.dot(v4v0)
+                        if d1 > 0:
+                            d2 = v2.dot(v4v0)
+                            if d2 > 0:
                                 v1 = v4
                             else:
                                 v3 = v4
                         else:
-                            if d3 < 0:
+                            d3 = v3.dot(v4v0)
+                            if d3 > 0:
                                 v2 = v4
                             else:
                                 v1 = v4
+
+    # =====================================================================
+    # PHASE 4: Find penetration depth and contact point
+    # =====================================================================
+    if has_collision == 1:
+        done = 0
+        for _ in range(MPR_MAX_ITERATIONS):
+            if done == 0:
+                n = portal_normal(v1, v2, v3)
+                v4 = support_minkowski(geom_a, geom_b, n)
+
+                # convergence check
+                dv1 = v1.dot(n)
+                dv2 = v2.dot(n)
+                dv3 = v3.dot(n)
+                dv4 = v4.dot(n)
+                progress = ti.min(dv4 - dv1, ti.min(dv4 - dv2, dv4 - dv3))
+                if progress < MPR_TOLERANCE:
+                    penetration_depth = n.dot(v1)
+                    contact_normal = -n
+                    # contact point from support points along final normal
+                    sa = support_geom(geom_a, n)
+                    sb = support_geom(geom_b, -n)
+                    contact_point = (sa + sb) * 0.5
+                    done = 1
+                else:
+                    # expand portal for better accuracy
+                    v4v0 = v4.cross(v0)
+                    d1 = v1.dot(v4v0)
+                    if d1 > 0:
+                        d2 = v2.dot(v4v0)
+                        if d2 > 0:
+                            v1 = v4
+                        else:
+                            v3 = v4
+                    else:
+                        d3 = v3.dot(v4v0)
+                        if d3 > 0:
+                            v2 = v4
+                        else:
+                            v1 = v4
 
     return has_collision, contact_point, contact_normal, penetration_depth

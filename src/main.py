@@ -30,13 +30,69 @@ RigidBody = ti.types.struct(
 @ti.data_oriented
 class Data:
     def __init__(self):
-        self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
-        self.indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES * 3)
-        self.vertex_colors = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)
-        self.num_vertices = ti.field(dtype=ti.i32, shape=())
-        self.num_triangles = ti.field(dtype=ti.i32, shape=())
-        self.bodies = RigidBody.field(shape=MAX_BODIES)
-        self.num_bodies = ti.field(dtype=ti.i32, shape=())
+        # --- Render: mesh geometry passed to ti_scene.mesh() ---
+        self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)          # world-space vertex positions
+        self.indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES * 3)                # 3 indices per triangle into vertices
+        self.vertex_colors = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)     # per-vertex RGB color
+        self.num_vertices = ti.field(dtype=ti.i32, shape=())                          # current vertex count (atomic counter)
+        self.num_triangles = ti.field(dtype=ti.i32, shape=())                         # current triangle count (atomic counter)
+
+        # --- Physics: rigid body state updated each simulation step ---
+        self.bodies = RigidBody.field(shape=MAX_BODIES)                               # pos, quat, vel, inertia per body
+        self.num_bodies = ti.field(dtype=ti.i32, shape=())                            # current body count (atomic counter)
+
+        # --- Debug: wireframe overlay built from indices each frame ---
+        self.wire_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIANGLES * 6)   # 3 edges * 2 endpoints per triangle
+        self.num_wire_verts = ti.field(dtype=ti.i32, shape=())                        # = num_triangles * 6
+
+    @staticmethod
+    def _elem_bytes(field):
+        """Bytes per element, introspected from the Taichi field."""
+        if hasattr(field, 'keys'):  # struct field
+            return sum(Data._elem_bytes(getattr(field, k)) for k in field.keys)
+        elif hasattr(field, 'n'):   # vector field
+            return field.n * 4
+        return 4                    # scalar field
+
+    def _iter_fields(self):
+        """Yield (name, field, counter_field_or_None) for every Taichi field with shape."""
+        import math
+        for name in vars(self):
+            if name.startswith('_'):
+                continue
+            field = getattr(self, name)
+            if not hasattr(field, 'shape'):
+                continue
+            # skip scalar counters (shape=()) — they are used as counters, not data
+            if not field.shape:
+                continue
+            # try to find a matching num_{name} counter
+            counter = getattr(self, f"num_{name}", None)
+            yield name, field, counter
+
+    def gpu_memory(self):
+        """Returns (allocated_bytes, used_bytes, per-field details)."""
+        import math
+        allocated = 0
+        used = 0
+        details = []
+        for name, field, counter in self._iter_fields():
+            eb = self._elem_bytes(field)
+            max_count = math.prod(field.shape)
+            a = max_count * eb
+            u = counter[None] * eb if counter is not None else a
+            allocated += a
+            used += u
+            details.append((name, a, u))
+        return allocated, used, details
+
+    def gpu_memory_str(self):
+        allocated, used, details = self.gpu_memory()
+        lines = [f"GPU: {used / 1048576:.1f} / {allocated / 1048576:.1f} MB"]
+        for name, a, u in details:
+            pct = u * 100 // a if a > 0 else 0
+            lines.append(f"  {name:<16} {u / 1024:>7.0f} / {a / 1024:>7.0f} KB  ({pct}%)")
+        return "\n".join(lines)
 
 
 data = Data()
@@ -129,14 +185,30 @@ class Scene:
                 cur = vs + i * (segments + 1) + j
                 nxt = cur + segments + 1
                 t = ts * 3 + (i * segments + j) * 6
-                # Triangle 1
-                data.indices[t + 0] = cur
-                data.indices[t + 1] = nxt
-                data.indices[t + 2] = cur + 1
-                # Triangle 2
-                data.indices[t + 3] = cur + 1
-                data.indices[t + 4] = nxt
-                data.indices[t + 5] = nxt + 1
+                if i == 0:
+                    # Top pole: only fan triangle, duplicate it for slot 1
+                    data.indices[t + 0] = cur
+                    data.indices[t + 1] = nxt
+                    data.indices[t + 2] = nxt + 1
+                    data.indices[t + 3] = cur
+                    data.indices[t + 4] = nxt
+                    data.indices[t + 5] = nxt + 1
+                elif i == segments - 1:
+                    # Bottom pole: only fan triangle, duplicate it for slot 2
+                    data.indices[t + 0] = cur
+                    data.indices[t + 1] = nxt
+                    data.indices[t + 2] = cur + 1
+                    data.indices[t + 3] = cur
+                    data.indices[t + 4] = nxt
+                    data.indices[t + 5] = cur + 1
+                else:
+                    # Normal quad: two triangles
+                    data.indices[t + 0] = cur
+                    data.indices[t + 1] = nxt
+                    data.indices[t + 2] = cur + 1
+                    data.indices[t + 3] = cur + 1
+                    data.indices[t + 4] = nxt
+                    data.indices[t + 5] = nxt + 1
 
         # Rigid body
         data.bodies[bi].pos = center
@@ -265,9 +337,33 @@ def create_demo_scene():
         ti.sync()
 
 
+@ti.kernel
+def _build_wireframe():
+    num_t = data.num_triangles[None]
+    data.num_wire_verts[None] = num_t * 6
+    for i in range(num_t):
+        v0 = data.vertices[data.indices[i * 3 + 0]]
+        v1 = data.vertices[data.indices[i * 3 + 1]]
+        v2 = data.vertices[data.indices[i * 3 + 2]]
+        base = i * 6
+        data.wire_verts[base + 0] = v0
+        data.wire_verts[base + 1] = v1
+        data.wire_verts[base + 2] = v1
+        data.wire_verts[base + 3] = v2
+        data.wire_verts[base + 4] = v2
+        data.wire_verts[base + 5] = v0
+
+
 @benchmark
-def render_frame(camera, window, canvas, ti_scene, ti_camera, dt):
-    camera.handle_input(window, dt)
+def step(camera, scene, dt):
+    camera.handle_input(scene.window, dt)
+
+    if is_enabled_benchmark():
+        ti.sync()
+
+
+@benchmark
+def render(camera, scene, ti_scene, ti_camera):
     camera.apply(ti_camera)
 
     ti_scene.set_camera(ti_camera)
@@ -280,7 +376,15 @@ def render_frame(camera, window, canvas, ti_scene, ti_camera, dt):
         per_vertex_color=data.vertex_colors,
         two_sided=True,
     )
-    canvas.scene(ti_scene)
+    if scene.show_wireframe:
+        _build_wireframe()
+        ti_scene.lines(
+            data.wire_verts,
+            width=1.0,
+            color=(0.0, 0.0, 0.0),
+            vertex_count=data.num_wire_verts[None],
+        )
+    scene.canvas.scene(ti_scene)
 
     if is_enabled_benchmark():
         ti.sync()
@@ -289,38 +393,52 @@ def render_frame(camera, window, canvas, ti_scene, ti_camera, dt):
 FIXED_DT = 1.0 / 64
 
 
+# --- Scene ---
+
+class Scene:
+    def __init__(self, title="Simple Viewer", width=WIDTH, height=HEIGHT):
+        self.window = ti.ui.Window(title, (width, height), vsync=False)
+        self.canvas = self.window.get_canvas()
+        self.ti_scene = self.window.get_scene()
+        self.ti_camera = ti.ui.Camera()
+        self.frame = 0
+        self.last_time = time.perf_counter()
+        self.fps_smooth = 0.0
+        # Debug flags
+        self.show_wireframe = False
+
+    def update(self):
+        now = time.perf_counter()
+        dt = now - self.last_time
+        self.last_time = now
+        if dt > 0:
+            self.fps_smooth = 0.1 * (1.0 / dt) + 0.9 * self.fps_smooth
+
+        gui = self.window.get_gui()
+        gui.begin("Debug", 0.02, 0.02, 0.3, 0.25)
+        gui.text(f"FPS: {self.fps_smooth:.1f}")
+        gui.text(f"Frame: {self.frame}")
+        gui.text(f"Verts: {data.num_vertices[None]}  Tris: {data.num_triangles[None]}  Bodies: {data.num_bodies[None]}")
+        allocated, used, _ = data.gpu_memory()
+        gui.text(f"GPU: {used / 1048576:.1f} / {allocated / 1048576:.1f} MB")
+        self.show_wireframe = gui.checkbox("Wireframe", self.show_wireframe)
+        gui.end()
+
+        self.frame += 1
+        self.window.show()
+
+
 def main():
     create_demo_scene()
     print(f"Scene: {data.num_vertices[None]} vertices, {data.num_triangles[None]} triangles")
 
-    window = ti.ui.Window("Simple Viewer", (WIDTH, HEIGHT), vsync=False)
-    canvas = window.get_canvas()
-    ti_scene = window.get_scene()
-    ti_camera = ti.ui.Camera()
+    scene = Scene()
     camera = Camera(position=(0, 5, 15), yaw=-90, pitch=-15)
 
-    frame = 0
-    last_time = time.perf_counter()
-    fps_smooth = 0.0
-
-    while window.running:
-        render_frame(camera, window, canvas, ti_scene, ti_camera, FIXED_DT)
-
-        now = time.perf_counter()
-        dt = now - last_time
-        last_time = now
-        if dt > 0:
-            fps_smooth = 0.1 * (1.0 / dt) + 0.9 * fps_smooth
-
-        gui = window.get_gui()
-        gui.begin("Debug", 0.02, 0.02, 0.25, 0.15)
-        gui.text(f"FPS: {fps_smooth:.1f}")
-        gui.text(f"Frame: {frame}")
-        gui.text(f"Verts: {data.num_vertices[None]}  Tris: {data.num_triangles[None]}  Bodies: {data.num_bodies[None]}")
-        gui.end()
-
-        frame += 1
-        window.show()
+    while scene.window.running:
+        step(camera, scene, FIXED_DT)
+        render(camera, scene, scene.ti_scene, scene.ti_camera)
+        scene.update()
 
 
 if __name__ == '__main__':
