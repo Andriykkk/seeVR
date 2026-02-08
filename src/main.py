@@ -2,106 +2,19 @@ import taichi as ti
 import math
 import time
 from benchmark import benchmark, is_enabled_benchmark
-
-ti.init(arch=ti.gpu)
-
-# --- Data ---
-
-MAX_VERTICES = 100000
-MAX_TRIANGLES = 100000
-WIDTH, HEIGHT = 800, 600
-MAX_BODIES = 1000
-
-RigidBody = ti.types.struct(
-    pos=ti.types.vector(3, ti.f32),       # Center of mass position
-    quat=ti.types.vector(4, ti.f32),      # Orientation quaternion (w, x, y, z)
-    vel=ti.types.vector(3, ti.f32),       # Linear velocity
-    omega=ti.types.vector(3, ti.f32),     # Angular velocity
-    mass=ti.f32,                          # Mass (0 = static/infinite mass)
-    inv_mass=ti.f32,                      # 1/mass (0 for static)
-    inertia=ti.types.vector(3, ti.f32),   # Diagonal inertia tensor (local space)
-    inv_inertia=ti.types.vector(3, ti.f32), # 1/inertia
-    # Render mesh mapping
-    vert_start=ti.i32,                    # Start index in vertices array
-    vert_count=ti.i32,                    # Number of vertices for this body
-)
-
-
-@ti.data_oriented
-class Data:
-    def __init__(self):
-        # --- Render: mesh geometry passed to ti_scene.mesh() ---
-        self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)          # world-space vertex positions
-        self.indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES * 3)                # 3 indices per triangle into vertices
-        self.vertex_colors = ti.Vector.field(3, dtype=ti.f32, shape=MAX_VERTICES)     # per-vertex RGB color
-        self.num_vertices = ti.field(dtype=ti.i32, shape=())                          # current vertex count (atomic counter)
-        self.num_triangles = ti.field(dtype=ti.i32, shape=())                         # current triangle count (atomic counter)
-
-        # --- Physics: rigid body state updated each simulation step ---
-        self.bodies = RigidBody.field(shape=MAX_BODIES)                               # pos, quat, vel, inertia per body
-        self.num_bodies = ti.field(dtype=ti.i32, shape=())                            # current body count (atomic counter)
-
-        # --- Debug: wireframe overlay built from indices each frame ---
-        self.wire_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIANGLES * 6)   # 3 edges * 2 endpoints per triangle
-        self.num_wire_verts = ti.field(dtype=ti.i32, shape=())                        # = num_triangles * 6
-
-    @staticmethod
-    def _elem_bytes(field):
-        """Bytes per element, introspected from the Taichi field."""
-        if hasattr(field, 'keys'):  # struct field
-            return sum(Data._elem_bytes(getattr(field, k)) for k in field.keys)
-        elif hasattr(field, 'n'):   # vector field
-            return field.n * 4
-        return 4                    # scalar field
-
-    def _iter_fields(self):
-        """Yield (name, field, counter_field_or_None) for every Taichi field with shape."""
-        import math
-        for name in vars(self):
-            if name.startswith('_'):
-                continue
-            field = getattr(self, name)
-            if not hasattr(field, 'shape'):
-                continue
-            # skip scalar counters (shape=()) — they are used as counters, not data
-            if not field.shape:
-                continue
-            # try to find a matching num_{name} counter
-            counter = getattr(self, f"num_{name}", None)
-            yield name, field, counter
-
-    def gpu_memory(self):
-        """Returns (allocated_bytes, used_bytes, per-field details)."""
-        import math
-        allocated = 0
-        used = 0
-        details = []
-        for name, field, counter in self._iter_fields():
-            eb = self._elem_bytes(field)
-            max_count = math.prod(field.shape)
-            a = max_count * eb
-            u = counter[None] * eb if counter is not None else a
-            allocated += a
-            used += u
-            details.append((name, a, u))
-        return allocated, used, details
-
-    def gpu_memory_str(self):
-        allocated, used, details = self.gpu_memory()
-        lines = [f"GPU: {used / 1048576:.1f} / {allocated / 1048576:.1f} MB"]
-        for name, a, u in details:
-            pct = u * 100 // a if a > 0 else 0
-            lines.append(f"  {name:<16} {u / 1024:>7.0f} / {a / 1024:>7.0f} KB  ({pct}%)")
-        return "\n".join(lines)
-
-
-data = Data()
+from data import data, GEOM_BOX, GEOM_SPHERE, MAX_VERTICES, MAX_TRIANGLES, MAX_BODIES, MAX_GEOMS, WIDTH, HEIGHT, FIXED_DT, FRAME_TIME, DEBUG
+from physics import apply_gravity, integrate_bodies, compute_aabb
+from utils import quat_rotate
 
 # --- Scene ---
 
-
 @ti.data_oriented
 class Scene:
+    def __init__(self, title="Simple Viewer", width=WIDTH, height=HEIGHT):
+        self.window = ti.ui.Window(title, (width, height), vsync=False)
+        self.canvas = self.window.get_canvas()
+        self.ti_scene = self.window.get_scene()
+        self.ti_camera = ti.ui.Camera()
 
     @ti.kernel
     def _add_box_gpu(self, center: ti.types.vector(3, ti.f32),
@@ -111,6 +24,7 @@ class Scene:
         vs = ti.atomic_add(data.num_vertices[None], 8)
         ts = ti.atomic_add(data.num_triangles[None], 12)
         bi = ti.atomic_add(data.num_bodies[None], 1)
+        gi = ti.atomic_add(data.num_geoms[None], 1)
 
         box_v = ti.static([
             [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
@@ -126,7 +40,9 @@ class Scene:
         ])
 
         for i in ti.static(range(8)):
-            data.vertices[vs + i] = center + half_size * ti.Vector(box_v[i])
+            local = half_size * ti.Vector(box_v[i])
+            data.original_vertices[vs + i] = local
+            data.vertices[vs + i] = center + local
             data.vertex_colors[vs + i] = color
 
         for i in ti.static(range(12)):
@@ -156,6 +72,14 @@ class Scene:
             data.bodies[bi].inertia = ti.Vector([0.0, 0.0, 0.0])
             data.bodies[bi].inv_inertia = ti.Vector([0.0, 0.0, 0.0])
 
+        # Collision geom
+        data.geoms[gi].geom_type = GEOM_BOX
+        data.geoms[gi].body_idx = bi
+        data.geoms[gi].local_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[gi].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].data = ti.Vector([half_size[0], half_size[1], half_size[2], 0.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].aabb_min, data.geoms[gi].aabb_max = compute_aabb(data.vertices, vs, vs + 8, center)
+
     @ti.kernel
     def _add_sphere_gpu(self, center: ti.types.vector(3, ti.f32), radius: ti.f32,
                         color: ti.types.vector(3, ti.f32), segments: ti.i32,
@@ -165,6 +89,7 @@ class Scene:
         vs = ti.atomic_add(data.num_vertices[None], num_v)
         ts = ti.atomic_add(data.num_triangles[None], num_t)
         bi = ti.atomic_add(data.num_bodies[None], 1)
+        gi = ti.atomic_add(data.num_geoms[None], 1)
 
         pi = 3.14159265358979
 
@@ -175,9 +100,11 @@ class Scene:
             for j in range(segments + 1):
                 lon = 2.0 * pi * ti.cast(j, ti.f32) / ti.cast(segments, ti.f32)
                 idx = vs + i * (segments + 1) + j
-                data.vertices[idx] = center + radius * ti.Vector([
+                local = radius * ti.Vector([
                     ti.cos(lon) * sin_lat, cos_lat, ti.sin(lon) * sin_lat
                 ])
+                data.original_vertices[idx] = local
+                data.vertices[idx] = center + local
                 data.vertex_colors[idx] = color
 
         for i in range(segments):
@@ -227,6 +154,14 @@ class Scene:
         else:
             data.bodies[bi].inertia = ti.Vector([0.0, 0.0, 0.0])
             data.bodies[bi].inv_inertia = ti.Vector([0.0, 0.0, 0.0])
+
+        # Collision geom
+        data.geoms[gi].geom_type = GEOM_SPHERE
+        data.geoms[gi].body_idx = bi
+        data.geoms[gi].local_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[gi].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].data = ti.Vector([radius, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].aabb_min, data.geoms[gi].aabb_max = compute_aabb(data.vertices, vs, vs + num_v, center)
 
     @benchmark
     def add_box(self, center, half_size, color, mass=1.0):
@@ -353,57 +288,73 @@ def _build_wireframe():
         data.wire_verts[base + 4] = v2
         data.wire_verts[base + 5] = v0
 
+@ti.kernel
+def update_render_vertices(num_bodies: ti.i32):
+    """Transform render mesh vertices from local to world space.
+
+    world_vertex = body.pos + quat_rotate(body.quat, local_vertex)
+    """
+    for b in range(num_bodies):
+        body_pos = data.bodies[b].pos
+        body_quat = data.bodies[b].quat
+        start = data.bodies[b].vert_start
+        count = data.bodies[b].vert_count
+
+        for v in range(start, start + count):
+            local_pos = data.original_vertices[v]
+            data.vertices[v] = body_pos + quat_rotate(body_quat, local_pos)
 
 @benchmark
-def step(camera, scene, dt):
+def step(camera, scene, dt, physics_dt):
     camera.handle_input(scene.window, dt)
+    # physics_dt = dt * time_scale (0 = paused, <1 = slow-mo, 1 = real-time)
+    # TODO: integrate physics here with physics_dt
+
+    apply_gravity(data.num_bodies[None], physics_dt)
+
+    integrate_bodies(data.num_bodies[None], physics_dt)
+    update_render_vertices(data.num_bodies[None])
 
     if is_enabled_benchmark():
         ti.sync()
 
 
 @benchmark
-def render(camera, scene, ti_scene, ti_camera):
-    camera.apply(ti_camera)
+def render(camera, scene, gui):
+    camera.apply(scene.ti_camera)
 
-    ti_scene.set_camera(ti_camera)
-    ti_scene.ambient_light((0.4, 0.4, 0.4))
-    ti_scene.point_light(pos=(10, 10, 10), color=(0.8, 0.8, 0.8))
-    ti_scene.point_light(pos=(-10, 8, -10), color=(0.5, 0.5, 0.5))
-    ti_scene.mesh(
+    scene.ti_scene.set_camera(scene.ti_camera)
+    scene.ti_scene.ambient_light((0.4, 0.4, 0.4))
+    scene.ti_scene.point_light(pos=(10, 10, 10), color=(0.8, 0.8, 0.8))
+    scene.ti_scene.point_light(pos=(-10, 8, -10), color=(0.5, 0.5, 0.5))
+    scene.ti_scene.mesh(
         data.vertices,
         indices=data.indices,
         per_vertex_color=data.vertex_colors,
         two_sided=True,
     )
-    if scene.show_wireframe:
+    if DEBUG and gui.show_wireframe:
         _build_wireframe()
-        ti_scene.lines(
+        scene.ti_scene.lines(
             data.wire_verts,
             width=1.0,
             color=(0.0, 0.0, 0.0),
             vertex_count=data.num_wire_verts[None],
         )
-    scene.canvas.scene(ti_scene)
+    scene.canvas.scene(scene.ti_scene)
 
     if is_enabled_benchmark():
         ti.sync()
 
+# --- GUI ---
 
-FIXED_DT = 1.0 / 64
-
-
-# --- Scene ---
-
-class Scene:
-    def __init__(self, title="Simple Viewer", width=WIDTH, height=HEIGHT):
-        self.window = ti.ui.Window(title, (width, height), vsync=False)
-        self.canvas = self.window.get_canvas()
-        self.ti_scene = self.window.get_scene()
-        self.ti_camera = ti.ui.Camera()
+class GUI:
+    def __init__(self, scene):
+        self.scene = scene
         self.frame = 0
         self.last_time = time.perf_counter()
         self.fps_smooth = 0.0
+        self.time_scale = 1.0
         # Debug flags
         self.show_wireframe = False
 
@@ -414,31 +365,33 @@ class Scene:
         if dt > 0:
             self.fps_smooth = 0.1 * (1.0 / dt) + 0.9 * self.fps_smooth
 
-        gui = self.window.get_gui()
-        gui.begin("Debug", 0.02, 0.02, 0.3, 0.25)
-        gui.text(f"FPS: {self.fps_smooth:.1f}")
-        gui.text(f"Frame: {self.frame}")
-        gui.text(f"Verts: {data.num_vertices[None]}  Tris: {data.num_triangles[None]}  Bodies: {data.num_bodies[None]}")
-        allocated, used, _ = data.gpu_memory()
-        gui.text(f"GPU: {used / 1048576:.1f} / {allocated / 1048576:.1f} MB")
-        self.show_wireframe = gui.checkbox("Wireframe", self.show_wireframe)
-        gui.end()
+        if DEBUG:
+            imgui = self.scene.window.get_gui()
+            imgui.begin("Debug", 0.02, 0.02, 0.3, 0.3)
+            imgui.text(f"FPS: {self.fps_smooth:.1f}")
+            imgui.text(f"Frame: {self.frame}")
+            imgui.text(f"Verts: {data.num_vertices[None]}  Tris: {data.num_triangles[None]}  Bodies: {data.num_bodies[None]}  Geoms: {data.num_geoms[None]}")
+            allocated, used, _ = data.gpu_memory()
+            imgui.text(f"GPU: {used / 1048576:.1f} / {allocated / 1048576:.1f} MB")
+            self.time_scale = imgui.slider_float("Time Scale", self.time_scale, 0.0, 2.0)
+            self.show_wireframe = imgui.checkbox("Wireframe", self.show_wireframe)
+            imgui.end()
 
         self.frame += 1
-        self.window.show()
+        self.scene.window.show()
 
 
 def main():
     create_demo_scene()
     print(f"Scene: {data.num_vertices[None]} vertices, {data.num_triangles[None]} triangles")
 
-    scene = Scene()
+    gui = GUI(scene)
     camera = Camera(position=(0, 5, 15), yaw=-90, pitch=-15)
 
     while scene.window.running:
-        step(camera, scene, FIXED_DT)
-        render(camera, scene, scene.ti_scene, scene.ti_camera)
-        scene.update()
+        step(camera, scene, FIXED_DT, FIXED_DT * gui.time_scale)
+        render(camera, scene, gui)
+        gui.update()
 
 
 if __name__ == '__main__':
