@@ -3,7 +3,7 @@ import math
 import time
 from benchmark import benchmark, is_enabled_benchmark
 from data import data, GEOM_BOX, GEOM_SPHERE, MAX_VERTICES, MAX_TRIANGLES, MAX_BODIES, MAX_GEOMS, WIDTH, HEIGHT, FIXED_DT, FRAME_TIME, DEBUG
-from physics import apply_gravity, integrate_bodies, compute_aabb
+from physics import apply_gravity, integrate_bodies, compute_aabb, get_world_aabb
 from utils import quat_rotate
 
 # --- Scene ---
@@ -79,6 +79,7 @@ class Scene:
         data.geoms[gi].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
         data.geoms[gi].data = ti.Vector([half_size[0], half_size[1], half_size[2], 0.0, 0.0, 0.0, 0.0])
         data.geoms[gi].aabb_min, data.geoms[gi].aabb_max = compute_aabb(data.vertices, vs, vs + 8, center)
+        print(f"Added box: body {bi}, geom {gi}, mass {mass}, aabb {data.geoms[gi].aabb_min} to {data.geoms[gi].aabb_max}")
 
     @ti.kernel
     def _add_sphere_gpu(self, center: ti.types.vector(3, ti.f32), radius: ti.f32,
@@ -289,6 +290,39 @@ def _build_wireframe():
         data.wire_verts[base + 5] = v0
 
 @ti.kernel
+def _build_aabb_lines():
+    num_g = data.num_geoms[None]
+    data.num_aabb_verts[None] = num_g * 24
+    for i in range(num_g):
+        mn, mx = get_world_aabb(i)
+        # 8 corners of the AABB box
+        c0 = ti.Vector([mn[0], mn[1], mn[2]])
+        c1 = ti.Vector([mx[0], mn[1], mn[2]])
+        c2 = ti.Vector([mx[0], mx[1], mn[2]])
+        c3 = ti.Vector([mn[0], mx[1], mn[2]])
+        c4 = ti.Vector([mn[0], mn[1], mx[2]])
+        c5 = ti.Vector([mx[0], mn[1], mx[2]])
+        c6 = ti.Vector([mx[0], mx[1], mx[2]])
+        c7 = ti.Vector([mn[0], mx[1], mx[2]])
+        # 12 edges = 24 line endpoints
+        base = i * 24
+        # Bottom face
+        data.aabb_verts[base + 0] = c0; data.aabb_verts[base + 1] = c1
+        data.aabb_verts[base + 2] = c1; data.aabb_verts[base + 3] = c2
+        data.aabb_verts[base + 4] = c2; data.aabb_verts[base + 5] = c3
+        data.aabb_verts[base + 6] = c3; data.aabb_verts[base + 7] = c0
+        # Top face
+        data.aabb_verts[base + 8] = c4; data.aabb_verts[base + 9] = c5
+        data.aabb_verts[base + 10] = c5; data.aabb_verts[base + 11] = c6
+        data.aabb_verts[base + 12] = c6; data.aabb_verts[base + 13] = c7
+        data.aabb_verts[base + 14] = c7; data.aabb_verts[base + 15] = c4
+        # Vertical edges
+        data.aabb_verts[base + 16] = c0; data.aabb_verts[base + 17] = c4
+        data.aabb_verts[base + 18] = c1; data.aabb_verts[base + 19] = c5
+        data.aabb_verts[base + 20] = c2; data.aabb_verts[base + 21] = c6
+        data.aabb_verts[base + 22] = c3; data.aabb_verts[base + 23] = c7
+
+@ti.kernel
 def update_render_vertices(num_bodies: ti.i32):
     """Transform render mesh vertices from local to world space.
 
@@ -341,6 +375,14 @@ def render(camera, scene, gui):
             color=(0.0, 0.0, 0.0),
             vertex_count=data.num_wire_verts[None],
         )
+    if DEBUG and gui.show_aabb:
+        _build_aabb_lines()
+        scene.ti_scene.lines(
+            data.aabb_verts,
+            width=3.0,
+            color=(0.0, 1.0, 0.0),
+            vertex_count=data.num_aabb_verts[None],
+        )
     scene.canvas.scene(scene.ti_scene)
 
     if is_enabled_benchmark():
@@ -357,6 +399,7 @@ class GUI:
         self.time_scale = 1.0
         # Debug flags
         self.show_wireframe = False
+        self.show_aabb = False
 
     def update(self):
         now = time.perf_counter()
@@ -375,6 +418,7 @@ class GUI:
             imgui.text(f"GPU: {used / 1048576:.1f} / {allocated / 1048576:.1f} MB")
             self.time_scale = imgui.slider_float("Time Scale", self.time_scale, 0.0, 2.0)
             self.show_wireframe = imgui.checkbox("Wireframe", self.show_wireframe)
+            self.show_aabb = imgui.checkbox("AABB", self.show_aabb)
             imgui.end()
 
         self.frame += 1

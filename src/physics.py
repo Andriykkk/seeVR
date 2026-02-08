@@ -40,10 +40,12 @@ def compute_aabb(verts: ti.template(), start: ti.i32, end: ti.i32, center: ti.ty
     """Compute local AABB from verts[start..end) relative to center."""
     aabb_min = ti.Vector([1e10, 1e10, 1e10])
     aabb_max = ti.Vector([-1e10, -1e10, -1e10])
-    for v in range(start, end):
+    v = start
+    while v < end:
         p = verts[v]
         aabb_min = ti.min(aabb_min, p)
         aabb_max = ti.max(aabb_max, p)
+        v += 1
     return aabb_min - center, aabb_max - center
 
 @ti.func

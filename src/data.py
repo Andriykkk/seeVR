@@ -86,6 +86,8 @@ class Data:
         if DEBUG:
             self.wire_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIANGLES * 6)   # 3 edges * 2 endpoints per triangle
             self.num_wire_verts = ti.field(dtype=ti.i32, shape=())                        # = num_triangles * 6
+            self.aabb_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_GEOMS * 24)      # 12 edges * 2 endpoints per geom
+            self.num_aabb_verts = ti.field(dtype=ti.i32, shape=())                        # = num_geoms * 24
 
     @staticmethod
     def _dtype_size(dtype):
@@ -147,4 +149,4 @@ class Data:
 
 data = Data()
 # data.gravity[None] = [0.0, -9.81, 0.0]
-data.gravity[None] = [0.0, -0.81, 0.0]
+data.gravity[None] = [0.0, -0.0, 0.0]
