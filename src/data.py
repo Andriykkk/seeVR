@@ -18,6 +18,7 @@ MAX_BODIES = 1000
 MAX_GEOMS = 2000
 MAX_COLLISION_PAIRS = 10000
 MAX_CONTACTS = 10000
+MAX_COLLISION_VERTS = 50000
 MPR_EPS = 1e-9
 MPR_TOLERANCE = 1e-6
 MPR_MAX_ITERATIONS = 50
@@ -72,6 +73,16 @@ CollisionGeom = ti.types.struct(
     aabb_max=ti.types.vector(3, ti.f32),
 )
 
+
+BVHNode = ti.types.struct(
+    aabb_min=ti.types.vector(3, ti.f32),
+    aabb_max=ti.types.vector(3, ti.f32),
+    left_first=ti.u32,
+    right_child=ti.u32,
+    tri_count=ti.u32,
+    parent_idx=ti.u32,  # Parent node index (0xFFFFFFFF for root)
+)
+
 @ti.data_oriented
 class Data:
     def __init__(self):
@@ -89,6 +100,22 @@ class Data:
         self.geoms = CollisionGeom.field(shape=MAX_GEOMS)                             # collision shapes attached to bodies
         self.num_geoms = ti.field(dtype=ti.i32, shape=())                             # current geom count (atomic counter)
         self.gravity = ti.Vector.field(3, dtype=ti.f32, shape=())                    # gravity vector (adjustable)
+        self.collision_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_COLLISION_VERTS)  # convex hull vertices for mesh geoms
+        self.num_collision_verts = ti.field(dtype=ti.i32, shape=())                        # current collision vert count
+
+        # --- Raytracing: BVH ---
+        self.tri_centroids = ti.Vector.field(3, dtype=ti.f32, shape=MAX_TRIANGLES)
+        self.bvh_prim_indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)
+        self.scene_aabb_min = ti.Vector.field(3, dtype=ti.f32, shape=())
+        self.scene_aabb_max = ti.Vector.field(3, dtype=ti.f32, shape=())
+        self.morton_codes = ti.field(dtype=ti.u32, shape=MAX_TRIANGLES)
+        self.morton_codes_temp = ti.field(dtype=ti.u32, shape=MAX_TRIANGLES)
+        self.sort_indices = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)
+        self.sort_indices_temp = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)
+        self.bvh_nodes = BVHNode.field(shape=MAX_TRIANGLES * 2)
+        self.bvh_aabb_flags = ti.field(dtype=ti.i32, shape=MAX_TRIANGLES)
+        self.num_bvh_nodes = ti.field(dtype=ti.i32, shape=())
+        self.pixels = ti.Vector.field(3, dtype=ti.f32, shape=(WIDTH, HEIGHT))
 
         # --- Collision: broad phase output ---
         self.collision_pairs = ti.Vector.field(2, dtype=ti.i32, shape=MAX_COLLISION_PAIRS)
@@ -106,6 +133,8 @@ class Data:
             self.num_aabb_verts = ti.field(dtype=ti.i32, shape=())                        # = num_geoms * 24
             self.contact_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_CONTACTS * 2) # contact pos + pos+normal line
             self.num_contact_verts = ti.field(dtype=ti.i32, shape=())
+            self.hull_debug_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_COLLISION_VERTS)  # world-space hull verts for debug
+            self.num_hull_debug_verts = ti.field(dtype=ti.i32, shape=())
 
     @staticmethod
     def _dtype_size(dtype):
@@ -166,5 +195,5 @@ class Data:
 
 
 data = Data()
-# data.gravity[None] = [0.0, -9.81, 0.0]
-data.gravity[None] = [0.0, -0.81, 0.0]
+data.gravity[None] = [0.0, -9.81, 0.0]
+# data.gravity[None] = [0.0, -0.81, 0.0]

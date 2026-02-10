@@ -1,5 +1,5 @@
 import taichi as ti
-from data import data, GEOM_SPHERE, GEOM_BOX, MPR_EPS, MPR_TOLERANCE, MPR_MAX_ITERATIONS
+from data import data, GEOM_SPHERE, GEOM_BOX, GEOM_MESH, MPR_EPS, MPR_TOLERANCE, MPR_MAX_ITERATIONS
 from utils import quat_conjugate, quat_from_angular_velocity, quat_mul, quat_normalize, quat_rotate
 
 @ti.kernel
@@ -63,12 +63,33 @@ def support_box(gi: ti.i32, direction: ti.types.vector(3, ti.f32)) -> ti.types.v
     return pos + quat_rotate(q, corner)
 
 @ti.func
+def support_mesh(gi: ti.i32, direction: ti.types.vector(3, ti.f32)) -> ti.types.vector(3, ti.f32):
+    pos = data.geoms[gi].world_pos
+    q = data.geoms[gi].world_quat
+    d_local = quat_rotate(quat_conjugate(q), direction)
+    start = ti.cast(data.geoms[gi].data[0], ti.i32)
+    count = ti.cast(data.geoms[gi].data[1], ti.i32)
+    best = data.collision_verts[start]
+    best_dot = best.dot(d_local)
+    i = 1
+    while i < count:
+        v = data.collision_verts[start + i]
+        d = v.dot(d_local)
+        if d > best_dot:
+            best_dot = d
+            best = v
+        i += 1
+    return pos + quat_rotate(q, best)
+
+@ti.func
 def support(gi: ti.i32, direction: ti.types.vector(3, ti.f32)) -> ti.types.vector(3, ti.f32):
     v = ti.Vector([0.0, 0.0, 0.0])
     if data.geoms[gi].geom_type == GEOM_SPHERE:
         v = support_sphere(gi, direction)
     elif data.geoms[gi].geom_type == GEOM_BOX:
         v = support_box(gi, direction)
+    elif data.geoms[gi].geom_type == GEOM_MESH:
+        v = support_mesh(gi, direction)
     return v
 
 @ti.func

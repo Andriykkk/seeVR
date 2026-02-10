@@ -834,149 +834,7 @@ def run_physics(dt):
 
     if is_enabled_benchmark():
         ti.sync()
-
-@benchmark
-def run_rasterize(ti_scene, ti_camera, canvas, cam):
-    cam.apply_to_ti_camera(ti_camera)
-    ti_scene.set_camera(ti_camera)
-    ti_scene.ambient_light((0.2, 0.2, 0.2))
-    ti_scene.point_light(pos=(10, 10, 10), color=(1, 1, 1))
-    ti_scene.mesh(
-        data.vertices,
-        indices=data.indices,
-        per_vertex_color=data.vertex_colors,
-        two_sided=True
-    )
-    # Render collision geom hulls as wireframe mesh
-    if settings.render_geoms and data.num_collision_faces[None] > 0:
-        ti_scene.mesh(
-            data.debug_geom_verts,
-            indices=data.debug_geom_indices,
-            per_vertex_color=data.debug_geom_colors,
-            two_sided=True
-        )
-        # Render normal arrows as lines
-        num_faces = data.num_collision_faces[None]
-        ti_scene.lines(
-            data.debug_normal_verts,
-            per_vertex_color=data.debug_normal_colors,
-            width=3.0,
-            vertex_count=num_faces * 2
-        )
-    # Render contact points and normals
-    num_contacts = data.num_contacts[None]
-    if settings.debug_contacts and num_contacts > 0:
-        # Contact points as particles (yellow)
-        ti_scene.particles(
-            data.debug_contact_points,
-            radius=0.02,
-            color=(1.0, 1.0, 0.0),
-            index_count=num_contacts
-        )
-        # Contact normals as lines (cyan)
-        ti_scene.lines(
-            data.debug_contact_normals,
-            width=4.0,
-            color=(0.0, 1.0, 1.0),
-            vertex_count=num_contacts * 2
-        )
-    # Render solver force/impulse arrows (green->yellow->red based on strength)
-    if settings.debug_forces and num_contacts > 0:
-        ti_scene.lines(
-            data.debug_force_verts,
-            per_vertex_color=data.debug_force_colors,
-            width=5.0,
-            vertex_count=num_contacts * 2
-        )
-    canvas.scene(ti_scene)
-    if is_enabled_benchmark():
-        ti.sync()
-
-# def create_demo_scene():
-#     """Create demo scene - dragon inside a room"""
-#     room_size = 10
-#     wall_thickness = 0.5
-#     half = room_size / 2
-
-#     # Floor
-#     scene.add_box(
-#         center=(0, -wall_thickness / 2, 0),
-#         size=(room_size, wall_thickness, room_size),
-#         color=(0.4, 0.4, 0.4)
-#     )
-
-#     # Ceiling
-#     scene.add_box(
-#         center=(0, room_size - wall_thickness / 2, 0),
-#         size=(room_size, wall_thickness, room_size),
-#         color=(0.5, 0.5, 0.5)
-#     )
-
-#     # Back wall (far from camera)
-#     scene.add_box(
-#         center=(0, half, -half - wall_thickness / 2),
-#         size=(room_size, room_size, wall_thickness),
-#         color=(0.6, 0.6, 0.7)
-#     )
-
-#     # Left wall
-#     scene.add_box(
-#         center=(-half - wall_thickness / 2, half, 0),
-#         size=(wall_thickness, room_size, room_size),
-#         color=(0.7, 0.5, 0.5)
-#     )
-
-#     # Right wall
-#     scene.add_box(
-#         center=(half + wall_thickness / 2, half, 0),
-#         size=(wall_thickness, room_size, room_size),
-#         color=(0.5, 0.7, 0.5)
-#     )
-
-#     # Front wall is OPEN (no wall) so we can see inside
-
-#     # Dragon inside the room
-#     scene.add_mesh_from_obj(
-#         "./models/dragon_small.obj",
-#         center=(0, 2.5, 0),
-#         size=8.0,
-#         color=(0.8, 0.3, 0.3),
-#         rotation=(0, 180, 0)
-#     )
-
-def create_demo_scene():
-    """Create demo scene - spheres dropping onto a ground plane"""
-    # Large ground plane (static)
-    scene.add_box(
-        center=(0, -0.25, 0),
-        size=(20, 0.5, 20),
-        color=(0.3, 0.3, 0.35),
-        is_static=True
-    )
-
-    # Spheres at various heights (dynamic, will drop with physics)
-    # scene.add_sphere(center=(-2, 3, 0), radius=0.5, color=(0.9, 0.2, 0.2))   # Red
-    # scene.add_sphere(center=(0, 5, 0), radius=0.7, color=(0.2, 0.9, 0.2))    # Green
-    # scene.add_sphere(center=(2, 4, 1), radius=0.5, color=(0.2, 0.2, 0.9))    # Blue
-    # scene.add_sphere(center=(-1, 6, -1), radius=0.6, color=(0.9, 0.9, 0.2))  # Yellow
-    # scene.add_sphere(center=(-2.5, 7, 0.5), radius=0.4, color=(0.9, 0.2, 0.9)) # Magenta
-    # scene.add_sphere(center=(0, 8, 0), radius=0.8, color=(0.2, 0.9, 0.9)) 
-    
-    scene.add_mesh_from_obj(
-    "./models/cube.obj",
-    center=(0, 2.5, -5),
-    size=1.0,
-    color=(0.8, 0.3, 0.3),
-    rotation=(0, 180, 0)
-    )
-
-    # A box to show mixed shapes (dynamic)
-    scene.add_box(
-        center=(-3, 2, 2),
-        size=(1, 1, 1),
-        color=(0.8, 0.5, 0.2)
-    )
-
+ 
 
 @benchmark
 def render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytracing):
@@ -994,8 +852,6 @@ def render_frame(camera, frame, window, canvas, ti_scene, ti_camera, use_raytrac
             run_raytrace(camera, frame, settings)
             rays = WIDTH * HEIGHT * settings.samples_per_pixel * settings.max_bounces
         canvas.set_image(data.pixels)
-    else:
-        run_rasterize(ti_scene, ti_camera, canvas, camera)
 
     if is_enabled_benchmark():
         ti.sync()
@@ -1010,9 +866,6 @@ def main():
 
     use_raytracing = args.raytrace
 
-    create_demo_scene()
-
-    # Compute local-space vertices for physics (once, before simulation)
     compute_local_vertices(data.num_bodies[None])
 
     print(f"Scene: {data.num_vertices[None]} vertices, {data.num_triangles[None]} triangles")

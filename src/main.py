@@ -1,10 +1,95 @@
 import taichi as ti
 import math
 import time
+import numpy as np
 from benchmark import benchmark, is_enabled_benchmark
-from data import data, GEOM_BOX, GEOM_SPHERE, MAX_VERTICES, MAX_TRIANGLES, MAX_BODIES, MAX_GEOMS, WIDTH, HEIGHT, FIXED_DT, FRAME_TIME, DEBUG
+from data import data, GEOM_BOX, GEOM_SPHERE, GEOM_MESH, MAX_VERTICES, MAX_TRIANGLES, MAX_BODIES, MAX_GEOMS, WIDTH, HEIGHT, FIXED_DT, FRAME_TIME, DEBUG
 from physics import apply_gravity, integrate_bodies, compute_aabb, get_world_aabb, update_geom_transforms, broad_phase, narrow_phase, solve_contacts
 from utils import quat_rotate
+from raytracing import run_raytrace
+from bvh import build_lbvh
+
+USE_RAYTRACING = True
+
+# --- Quickhull ---
+
+def _face_normal(pts, f):
+    n = np.cross(pts[f[1]] - pts[f[0]], pts[f[2]] - pts[f[0]])
+    ln = np.linalg.norm(n)
+    return n / ln if ln > 1e-10 else n
+
+def _point_dist(pts, pi, f):
+    return np.dot(pts[pi] - pts[f[0]], _face_normal(pts, f))
+
+def _orient_face(pts, f, centroid):
+    fc = (pts[f[0]] + pts[f[1]] + pts[f[2]]) / 3.0
+    if np.dot(_face_normal(pts, f), fc - centroid) < 0:
+        return [f[0], f[2], f[1]]
+    return f
+
+def quickhull_3d(verts):
+    pts = np.asarray(verts, dtype=np.float64)
+    n = len(pts)
+    if n < 4:
+        return pts.astype(np.float32)
+
+    # Initial tetrahedron from extreme points
+    ext = [np.argmin(pts[:,i//2]) if i%2==0 else np.argmax(pts[:,i//2]) for i in range(6)]
+    p0, p1 = max(((ext[i], ext[j]) for i in range(6) for j in range(i+1,6)),
+                  key=lambda p: np.linalg.norm(pts[p[0]] - pts[p[1]]))
+
+    line = pts[p1] - pts[p0]
+    line /= np.linalg.norm(line)
+    p2 = max((i for i in range(n) if i not in (p0,p1)),
+             key=lambda i: np.linalg.norm(pts[i] - pts[p0] - np.dot(pts[i]-pts[p0], line)*line))
+
+    norm = np.cross(pts[p1]-pts[p0], pts[p2]-pts[p0])
+    norm /= np.linalg.norm(norm)
+    p3 = max((i for i in range(n) if i not in (p0,p1,p2)),
+             key=lambda i: abs(np.dot(pts[i]-pts[p0], norm)))
+
+    centroid = (pts[p0] + pts[p1] + pts[p2] + pts[p3]) / 4.0
+    on_hull = {p0, p1, p2, p3}
+
+    faces = [_orient_face(pts, f, centroid) for f in [[p0,p1,p2], [p0,p2,p3], [p0,p3,p1], [p1,p3,p2]]]
+    outside = [[i for i in range(n) if i not in on_hull and _point_dist(pts, i, f) > 1e-10] for f in faces]
+
+    while True:
+        best = (-1, -1, 0)
+        for fi, f in enumerate(faces):
+            for pi in outside[fi]:
+                d = _point_dist(pts, pi, f)
+                if d > best[2]:
+                    best = (fi, pi, d)
+        if best[0] < 0:
+            break
+
+        new_pt = best[1]
+        on_hull.add(new_pt)
+
+        visible = [fi for fi, f in enumerate(faces) if _point_dist(pts, new_pt, f) > 1e-10]
+        edges = {}
+        for fi in visible:
+            for i in range(3):
+                e = (faces[fi][i], faces[fi][(i+1)%3])
+                k = (min(e), max(e))
+                edges[k] = edges.get(k, []) + [e]
+        horizon = [es[0] for es in edges.values() if len(es) == 1]
+
+        all_out = {pi for fi in visible for pi in outside[fi]} - {new_pt}
+
+        for fi in sorted(visible, reverse=True):
+            faces.pop(fi)
+            outside.pop(fi)
+
+        for e0, e1 in horizon:
+            nf = _orient_face(pts, [e1, e0, new_pt], centroid)
+            faces.append(nf)
+            outside.append([pi for pi in all_out if pi not in on_hull and _point_dist(pts, pi, nf) > 1e-10])
+
+    hull_idx = sorted(on_hull)
+    return np.asarray(verts)[hull_idx].astype(np.float32)
+
 
 # --- Scene ---
 
@@ -175,6 +260,95 @@ class Scene:
         if is_enabled_benchmark():
             ti.sync()
 
+    @ti.kernel
+    def _add_mesh_gpu(self, verts_np: ti.types.ndarray(dtype=ti.f32, ndim=2),
+                      faces_np: ti.types.ndarray(dtype=ti.i32, ndim=2),
+                      hull_verts: ti.types.ndarray(dtype=ti.f32, ndim=2),
+                      num_v: ti.i32, num_t: ti.i32, num_hull: ti.i32,
+                      center: ti.types.vector(3, ti.f32),
+                      color: ti.types.vector(3, ti.f32),
+                      mass: ti.f32):
+        vs = ti.atomic_add(data.num_vertices[None], num_v)
+        ts = ti.atomic_add(data.num_triangles[None], num_t)
+        cs = ti.atomic_add(data.num_collision_verts[None], num_hull)
+        bi = ti.atomic_add(data.num_bodies[None], 1)
+        gi = ti.atomic_add(data.num_geoms[None], 1)
+
+        for i in range(num_v):
+            local = ti.Vector([verts_np[i, 0], verts_np[i, 1], verts_np[i, 2]])
+            data.original_vertices[vs + i] = local
+            data.vertices[vs + i] = center + local
+            data.vertex_colors[vs + i] = color
+
+        for i in range(num_t):
+            data.indices[(ts + i) * 3 + 0] = vs + faces_np[i, 0]
+            data.indices[(ts + i) * 3 + 1] = vs + faces_np[i, 1]
+            data.indices[(ts + i) * 3 + 2] = vs + faces_np[i, 2]
+
+        # Copy hull vertices to collision_verts
+        for i in range(num_hull):
+            data.collision_verts[cs + i] = ti.Vector([hull_verts[i, 0], hull_verts[i, 1], hull_verts[i, 2]])
+
+        data.bodies[bi].pos = center
+        data.bodies[bi].quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.bodies[bi].vel = ti.Vector([0.0, 0.0, 0.0])
+        data.bodies[bi].omega = ti.Vector([0.0, 0.0, 0.0])
+        data.bodies[bi].mass = mass
+        data.bodies[bi].inv_mass = 1.0 / mass if mass > 0.0 else 0.0
+        data.bodies[bi].vert_start = vs
+        data.bodies[bi].vert_count = num_v
+
+        if mass > 0.0:
+            # Rough inertia from AABB
+            aabb_min, aabb_max = compute_aabb(data.vertices, vs, vs + num_v, center)
+            sz = aabb_max - aabb_min
+            ix = mass / 12.0 * (sz[1] * sz[1] + sz[2] * sz[2])
+            iy = mass / 12.0 * (sz[0] * sz[0] + sz[2] * sz[2])
+            iz = mass / 12.0 * (sz[0] * sz[0] + sz[1] * sz[1])
+            data.bodies[bi].inertia = ti.Vector([ix, iy, iz])
+            data.bodies[bi].inv_inertia = ti.Vector([1.0 / ix, 1.0 / iy, 1.0 / iz])
+        else:
+            data.bodies[bi].inertia = ti.Vector([0.0, 0.0, 0.0])
+            data.bodies[bi].inv_inertia = ti.Vector([0.0, 0.0, 0.0])
+
+        # Collision geom — GEOM_MESH with hull verts in collision_verts
+        aabb_min, aabb_max = compute_aabb(data.vertices, vs, vs + num_v, center)
+        data.geoms[gi].geom_type = GEOM_MESH
+        data.geoms[gi].body_idx = bi
+        data.geoms[gi].local_pos = ti.Vector([0.0, 0.0, 0.0])
+        data.geoms[gi].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].data = ti.Vector([ti.cast(cs, ti.f32), ti.cast(num_hull, ti.f32), 0.0, 0.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].aabb_min = aabb_min
+        data.geoms[gi].aabb_max = aabb_max
+
+    def add_mesh(self, filename, center, color, mass=1.0, scale=1.0):
+        raw_verts = []
+        faces = []
+        with open(filename, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                if parts[0] == 'v':
+                    raw_verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                elif parts[0] == 'f':
+                    indices = [int(p.split('/')[0]) - 1 for p in parts[1:]]
+                    for i in range(1, len(indices) - 1):
+                        faces.append([indices[0], indices[i], indices[i + 1]])
+
+        if not raw_verts:
+            return
+
+        verts_np = np.array(raw_verts, dtype=np.float32)
+        centroid = verts_np.mean(axis=0)
+        verts_np -= centroid
+        verts_np *= scale
+
+        hull_verts = quickhull_3d(verts_np)
+
+        faces_np = np.array(faces, dtype=np.int32)
+        self._add_mesh_gpu(verts_np, faces_np, hull_verts, len(raw_verts), len(faces), len(hull_verts), center, color, mass)
+
 
 # --- Camera ---
 
@@ -187,14 +361,30 @@ class Camera:
         self.sensitivity = 0.5
         self._last_mouse = None
         self.direction = [0, 0, -1]
+        self.right = [1, 0, 0]
+        self.up = [0, 1, 0]
 
     def _update_vectors(self):
         ry = math.radians(self.yaw)
         rp = math.radians(self.pitch)
-        self.direction = [
-            math.cos(rp) * math.cos(ry),
-            math.sin(rp),
-            math.cos(rp) * math.sin(ry),
+        dx = math.cos(rp) * math.cos(ry)
+        dy = math.sin(rp)
+        dz = math.cos(rp) * math.sin(ry)
+        self.direction = [dx, dy, dz]
+        # right = normalize(direction x (0,1,0)) = (-dz, 0, dx)
+        rx = -dz
+        ry2 = 0.0
+        rz = dx
+        rl = math.sqrt(rx * rx + rz * rz)
+        if rl > 1e-8:
+            rx /= rl
+            rz /= rl
+        self.right = [rx, ry2, rz]
+        # up = right x direction
+        self.up = [
+            ry2 * dz - rz * dy,
+            rz * dx - rx * dz,
+            rx * dy - ry2 * dx,
         ]
 
     def handle_input(self, window, dt):
@@ -268,6 +458,9 @@ def create_demo_scene():
     scene.add_sphere(ti.Vector([-2.0, 1.5, 0.0]), 0.7, ti.Vector([0.2, 0.2, 0.9]), 16)
     scene.add_sphere(ti.Vector([0.0, 3.0, -2.0]), 0.5, ti.Vector([0.9, 0.9, 0.2]), 16)
 
+    # Mesh
+    scene.add_mesh("../models/cylinder.obj", ti.Vector([0.0, 2.0, 2.0]), ti.Vector([0.9, 0.5, 0.2]), scale=0.2)
+
     if is_enabled_benchmark():
         ti.sync()
 
@@ -337,6 +530,21 @@ def _build_contact_lines(cam_pos: ti.types.vector(3, ti.f32), cam_dir: ti.types.
         data.contact_verts[i * 2 + 1] = screen_n
 
 @ti.kernel
+def _build_hull_dots(num_geoms: ti.i32):
+    count = 0
+    for gi in range(num_geoms):
+        if data.geoms[gi].geom_type == GEOM_MESH:
+            start = ti.cast(data.geoms[gi].data[0], ti.i32)
+            num_h = ti.cast(data.geoms[gi].data[1], ti.i32)
+            pos = data.geoms[gi].world_pos
+            q = data.geoms[gi].world_quat
+            base = ti.atomic_add(count, num_h)
+            for i in range(num_h):
+                local_v = data.collision_verts[start + i]
+                data.hull_debug_verts[base + i] = pos + quat_rotate(q, local_v)
+    data.num_hull_debug_verts[None] = count
+
+@ti.kernel
 def update_render_vertices(num_bodies: ti.i32):
     """Transform render mesh vertices from local to world space.
 
@@ -351,6 +559,14 @@ def update_render_vertices(num_bodies: ti.i32):
         for v in range(start, start + count):
             local_pos = data.original_vertices[v]
             data.vertices[v] = body_pos + quat_rotate(body_quat, local_pos)
+
+
+@benchmark
+def build_bvh():
+    """Build BVH acceleration structure using GPU LBVH"""
+    build_lbvh(data.num_triangles[None])
+    if is_enabled_benchmark():
+        ti.sync()
 
 @benchmark
 def step(camera, scene, dt, physics_dt):
@@ -372,50 +588,64 @@ def step(camera, scene, dt, physics_dt):
     if is_enabled_benchmark():
         ti.sync()
 
-
 @benchmark
 def render(camera, scene, gui):
     camera.apply(scene.ti_camera)
-
     scene.ti_scene.set_camera(scene.ti_camera)
-    scene.ti_scene.ambient_light((0.4, 0.4, 0.4))
-    scene.ti_scene.point_light(pos=(10, 10, 10), color=(0.8, 0.8, 0.8))
-    scene.ti_scene.point_light(pos=(-10, 8, -10), color=(0.5, 0.5, 0.5))
-    scene.ti_scene.mesh(
-        data.vertices,
-        indices=data.indices,
-        per_vertex_color=data.vertex_colors,
-        two_sided=True,
-    )
-    if DEBUG and gui.show_wireframe:
-        _build_wireframe()
-        scene.ti_scene.lines(
-            data.wire_verts,
-            width=1.0,
-            color=(0.0, 0.0, 0.0),
-            vertex_count=data.num_wire_verts[None],
+
+    if USE_RAYTRACING:
+        build_bvh()
+        run_raytrace(camera, gui.frame, gui)
+        scene.canvas.set_image(data.pixels)
+    else:
+        scene.ti_scene.ambient_light((0.4, 0.4, 0.4))
+        scene.ti_scene.point_light(pos=(10, 10, 10), color=(0.8, 0.8, 0.8))
+        scene.ti_scene.point_light(pos=(-10, 8, -10), color=(0.5, 0.5, 0.5))
+        scene.ti_scene.mesh(
+            data.vertices,
+            indices=data.indices,
+            per_vertex_color=data.vertex_colors,
+            two_sided=True,
         )
-    if DEBUG and gui.show_aabb:
-        _build_aabb_lines()
-        scene.ti_scene.lines(
-            data.aabb_verts,
-            width=3.0,
-            color=(0.0, 1.0, 0.0),
-            vertex_count=data.num_aabb_verts[None],
-        )
-    if DEBUG and gui.show_contacts:
-        cam = ti.Vector([camera.pos[0], camera.pos[1], camera.pos[2]])
-        cam_d = ti.Vector([camera.direction[0], camera.direction[1], camera.direction[2]])
-        _build_contact_lines(cam, cam_d)
-        nc = data.num_contact_verts[None]
-        if nc > 0:
+        if DEBUG and gui.show_wireframe:
+            _build_wireframe()
             scene.ti_scene.lines(
-                data.contact_verts,
-                width=3.0,
-                color=(1.0, 0.0, 0.0),
-                vertex_count=nc,
+                data.wire_verts,
+                width=1.0,
+                color=(0.0, 0.0, 0.0),
+                vertex_count=data.num_wire_verts[None],
             )
-    scene.canvas.scene(scene.ti_scene)
+        if DEBUG and gui.show_aabb:
+            _build_aabb_lines()
+            scene.ti_scene.lines(
+                data.aabb_verts,
+                width=3.0,
+                color=(0.0, 1.0, 0.0),
+                vertex_count=data.num_aabb_verts[None],
+            )
+        if DEBUG and gui.show_hull:
+            _build_hull_dots(data.num_geoms[None])
+            nh = data.num_hull_debug_verts[None]
+            if nh > 0:
+                scene.ti_scene.particles(
+                    data.hull_debug_verts,
+                    radius=0.03,
+                    color=(1.0, 1.0, 0.0),
+                    index_count=nh,
+                )
+        if DEBUG and gui.show_contacts:
+            cam = ti.Vector([camera.pos[0], camera.pos[1], camera.pos[2]])
+            cam_d = ti.Vector([camera.direction[0], camera.direction[1], camera.direction[2]])
+            _build_contact_lines(cam, cam_d)
+            nc = data.num_contact_verts[None]
+            if nc > 0:
+                scene.ti_scene.lines(
+                    data.contact_verts,
+                    width=3.0,
+                    color=(1.0, 0.0, 0.0),
+                    vertex_count=nc,
+                )
+        scene.canvas.scene(scene.ti_scene)
 
     if is_enabled_benchmark():
         ti.sync()
@@ -433,6 +663,11 @@ class GUI:
         self.show_wireframe = False
         self.show_aabb = False
         self.show_contacts = False
+        self.show_hull = False
+        # Raytracing settings
+        self.max_bounces = 4
+        self.samples_per_pixel = 1
+        self.sky_intensity = 1.0
 
     def update(self):
         now = time.perf_counter()
@@ -454,6 +689,11 @@ class GUI:
             self.show_wireframe = imgui.checkbox("Wireframe", self.show_wireframe)
             self.show_aabb = imgui.checkbox("AABB", self.show_aabb)
             self.show_contacts = imgui.checkbox("Contacts", self.show_contacts)
+            self.show_hull = imgui.checkbox("Hull", self.show_hull)
+            if USE_RAYTRACING:
+                self.max_bounces = int(imgui.slider_float("Max Bounces", self.max_bounces, 1, 16))
+                self.samples_per_pixel = int(imgui.slider_float("Samples/Pixel", self.samples_per_pixel, 1, 32))
+                self.sky_intensity = imgui.slider_float("Sky Intensity", self.sky_intensity, 0.0, 5.0)
             imgui.end()
 
         self.frame += 1
