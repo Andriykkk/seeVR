@@ -104,6 +104,8 @@ class Data:
             self.num_wire_verts = ti.field(dtype=ti.i32, shape=())                        # = num_triangles * 6
             self.aabb_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_GEOMS * 24)      # 12 edges * 2 endpoints per geom
             self.num_aabb_verts = ti.field(dtype=ti.i32, shape=())                        # = num_geoms * 24
+            self.contact_verts = ti.Vector.field(3, dtype=ti.f32, shape=MAX_CONTACTS * 2) # contact pos + pos+normal line
+            self.num_contact_verts = ti.field(dtype=ti.i32, shape=())
 
     @staticmethod
     def _dtype_size(dtype):

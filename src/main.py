@@ -3,7 +3,7 @@ import math
 import time
 from benchmark import benchmark, is_enabled_benchmark
 from data import data, GEOM_BOX, GEOM_SPHERE, MAX_VERTICES, MAX_TRIANGLES, MAX_BODIES, MAX_GEOMS, WIDTH, HEIGHT, FIXED_DT, FRAME_TIME, DEBUG
-from physics import apply_gravity, integrate_bodies, compute_aabb, get_world_aabb, update_geom_transforms, broad_phase, narrow_phase
+from physics import apply_gravity, integrate_bodies, compute_aabb, get_world_aabb, update_geom_transforms, broad_phase, narrow_phase, solve_contacts
 from utils import quat_rotate
 
 # --- Scene ---
@@ -322,6 +322,21 @@ def _build_aabb_lines():
         data.aabb_verts[base + 22] = c3; data.aabb_verts[base + 23] = c7
 
 @ti.kernel
+def _build_contact_lines(cam_pos: ti.types.vector(3, ti.f32), cam_dir: ti.types.vector(3, ti.f32)):
+    nc = data.num_contacts[None]
+    data.num_contact_verts[None] = nc * 2
+    near = 0.5  # distance from camera
+    for i in range(nc):
+        p = data.contacts[i].pos
+        n = data.contacts[i].normal
+        # Project to near-camera plane: offset along view direction
+        to_point = (p - cam_pos).normalized()
+        screen_p = cam_pos + to_point * near
+        screen_n = cam_pos + (p + n * 0.3 - cam_pos).normalized() * near
+        data.contact_verts[i * 2 + 0] = screen_p
+        data.contact_verts[i * 2 + 1] = screen_n
+
+@ti.kernel
 def update_render_vertices(num_bodies: ti.i32):
     """Transform render mesh vertices from local to world space.
 
@@ -352,6 +367,7 @@ def step(camera, scene, dt, physics_dt):
 
     broad_phase(data.num_geoms[None])
     narrow_phase(data.num_collision_pairs[None])
+    solve_contacts(physics_dt)
 
     if is_enabled_benchmark():
         ti.sync()
@@ -387,6 +403,18 @@ def render(camera, scene, gui):
             color=(0.0, 1.0, 0.0),
             vertex_count=data.num_aabb_verts[None],
         )
+    if DEBUG and gui.show_contacts:
+        cam = ti.Vector([camera.pos[0], camera.pos[1], camera.pos[2]])
+        cam_d = ti.Vector([camera.direction[0], camera.direction[1], camera.direction[2]])
+        _build_contact_lines(cam, cam_d)
+        nc = data.num_contact_verts[None]
+        if nc > 0:
+            scene.ti_scene.lines(
+                data.contact_verts,
+                width=3.0,
+                color=(1.0, 0.0, 0.0),
+                vertex_count=nc,
+            )
     scene.canvas.scene(scene.ti_scene)
 
     if is_enabled_benchmark():
@@ -404,6 +432,7 @@ class GUI:
         # Debug flags
         self.show_wireframe = False
         self.show_aabb = False
+        self.show_contacts = False
 
     def update(self):
         now = time.perf_counter()
@@ -424,6 +453,7 @@ class GUI:
             self.time_scale = imgui.slider_float("Time Scale", self.time_scale, 0.0, 2.0)
             self.show_wireframe = imgui.checkbox("Wireframe", self.show_wireframe)
             self.show_aabb = imgui.checkbox("AABB", self.show_aabb)
+            self.show_contacts = imgui.checkbox("Contacts", self.show_contacts)
             imgui.end()
 
         self.frame += 1

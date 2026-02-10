@@ -373,6 +373,80 @@ def narrow_phase(num_pairs: ti.i32):
                 data.contacts[idx].geom_a = gi_a
                 data.contacts[idx].geom_b = gi_b
 
+# --- Contact solver ---
+
+@ti.kernel
+def solve_contacts(dt: ti.f32):
+    restitution = 0.3
+    baumgarte = 0.2  # position correction factor
+    slop = 0.005     # penetration slop (don't correct tiny overlaps)
+
+    nc = data.num_contacts[None]
+    iteration = 0
+    while iteration < 10:
+        for i in range(nc):
+            c = data.contacts[i]
+            n = c.normal
+            bi_a = data.geoms[c.geom_a].body_idx
+            bi_b = data.geoms[c.geom_b].body_idx
+            inv_ma = data.bodies[bi_a].inv_mass
+            inv_mb = data.bodies[bi_b].inv_mass
+
+            # Skip if both static
+            if inv_ma == 0.0 and inv_mb == 0.0:
+                continue
+
+            # Lever arms from body centers to contact point
+            ra = c.pos - data.bodies[bi_a].pos
+            rb = c.pos - data.bodies[bi_b].pos
+
+            inv_ia = data.bodies[bi_a].inv_inertia
+            inv_ib = data.bodies[bi_b].inv_inertia
+
+            # Velocity at contact point: v + omega x r
+            va = data.bodies[bi_a].vel + data.bodies[bi_a].omega.cross(ra)
+            vb = data.bodies[bi_b].vel + data.bodies[bi_b].omega.cross(rb)
+            v_rel = va - vb
+            v_rel_n = v_rel.dot(n)
+
+            # Only resolve if approaching
+            if v_rel_n < 0.0:
+                # Angular contribution to effective mass
+                ra_cross_n = ra.cross(n)
+                rb_cross_n = rb.cross(n)
+                # Approximate: use diagonal inertia (world-aligned, good enough for now)
+                ang_a = ti.Vector([ra_cross_n[0] * inv_ia[0],
+                                   ra_cross_n[1] * inv_ia[1],
+                                   ra_cross_n[2] * inv_ia[2]])
+                ang_b = ti.Vector([rb_cross_n[0] * inv_ib[0],
+                                   rb_cross_n[1] * inv_ib[1],
+                                   rb_cross_n[2] * inv_ib[2]])
+                eff_mass = inv_ma + inv_mb + ang_a.cross(ra).dot(n) + ang_b.cross(rb).dot(n)
+
+                # Impulse magnitude
+                j = -(1.0 + restitution) * v_rel_n / eff_mass
+
+                # Baumgarte position correction bias
+                bias = (baumgarte / dt) * ti.max(c.penetration - slop, 0.0)
+                j += bias / eff_mass
+
+                impulse = j * n
+
+                # Apply to velocities
+                data.bodies[bi_a].vel += impulse * inv_ma
+                data.bodies[bi_b].vel -= impulse * inv_mb
+                data.bodies[bi_a].omega += ti.Vector([
+                    (ra.cross(impulse))[0] * inv_ia[0],
+                    (ra.cross(impulse))[1] * inv_ia[1],
+                    (ra.cross(impulse))[2] * inv_ia[2],
+                ])
+                data.bodies[bi_b].omega -= ti.Vector([
+                    (rb.cross(impulse))[0] * inv_ib[0],
+                    (rb.cross(impulse))[1] * inv_ib[1],
+                    (rb.cross(impulse))[2] * inv_ib[2],
+                ])
+        iteration += 1
+
 # --- AABB ---
 
 @ti.func
