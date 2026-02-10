@@ -24,7 +24,6 @@ def quat_rotate(q: ti.types.vector(4, ti.f32), v: ti.types.vector(3, ti.f32)) ->
     """Rotate vector v by quaternion q."""
     w, x, y, z = q[0], q[1], q[2], q[3]
 
-    # Optimized quaternion-vector rotation (faster than q * v * q_conj)
     t = 2.0 * ti.Vector([y*v[2] - z*v[1], z*v[0] - x*v[2], x*v[1] - y*v[0]])
     return v + w * t + ti.Vector([y*t[2] - z*t[1], z*t[0] - x*t[2], x*t[1] - y*t[0]])
 

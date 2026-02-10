@@ -17,6 +17,10 @@ WIDTH, HEIGHT = 800, 600
 MAX_BODIES = 1000
 MAX_GEOMS = 2000
 MAX_COLLISION_PAIRS = 10000
+MAX_CONTACTS = 10000
+MPR_EPS = 1e-9
+MPR_TOLERANCE = 1e-6
+MPR_MAX_ITERATIONS = 50
 
 GEOM_SPHERE = 1
 GEOM_BOX = 2
@@ -24,6 +28,14 @@ GEOM_PLANE = 3
 GEOM_CAPSULE = 4
 GEOM_MESH = 5
 GEOM_SDF = 6
+
+Contact = ti.types.struct(
+    pos=ti.types.vector(3, ti.f32),       # Contact position (world space)
+    normal=ti.types.vector(3, ti.f32),    # Contact normal (A → B)
+    penetration=ti.f32,                    # Penetration depth
+    geom_a=ti.i32,                        # Geom index A
+    geom_b=ti.i32,                        # Geom index B
+)
 
 RigidBody = ti.types.struct(
     pos=ti.types.vector(3, ti.f32),       # Center of mass position
@@ -79,8 +91,12 @@ class Data:
         self.gravity = ti.Vector.field(3, dtype=ti.f32, shape=())                    # gravity vector (adjustable)
 
         # --- Collision: broad phase output ---
-        self.collision_pairs = ti.Vector.field(2, dtype=ti.i32, shape=MAX_COLLISION_PAIRS)  # write: broad_phase | read: narrow_phase
-        self.num_collision_pairs = ti.field(dtype=ti.i32, shape=())                         # write: broad_phase | read: narrow_phase, GUI
+        self.collision_pairs = ti.Vector.field(2, dtype=ti.i32, shape=MAX_COLLISION_PAIRS)
+        self.num_collision_pairs = ti.field(dtype=ti.i32, shape=())
+
+        # --- Collision: narrow phase output ---
+        self.contacts = Contact.field(shape=MAX_CONTACTS)
+        self.num_contacts = ti.field(dtype=ti.i32, shape=())
 
         # --- Debug: wireframe overlay built from indices each frame ---
         if DEBUG:
@@ -149,4 +165,4 @@ class Data:
 
 data = Data()
 # data.gravity[None] = [0.0, -9.81, 0.0]
-data.gravity[None] = [0.0, -0.0, 0.0]
+data.gravity[None] = [0.0, -0.81, 0.0]

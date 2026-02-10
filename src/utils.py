@@ -1,6 +1,11 @@
 import taichi as ti
 
 @ti.func
+def quat_conjugate(q: ti.types.vector(4, ti.f32)) -> ti.types.vector(4, ti.f32):
+    """Return conjugate of quaternion (inverse for unit quaternions)."""
+    return ti.Vector([q[0], -q[1], -q[2], -q[3]])
+
+@ti.func
 def quat_from_angular_velocity(omega: ti.types.vector(3, ti.f32), dt: ti.f32) -> ti.types.vector(4, ti.f32):
     """Create quaternion from angular velocity * dt (small angle approximation)."""
     half_angle = omega * (dt * 0.5)

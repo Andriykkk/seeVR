@@ -3,7 +3,7 @@ import math
 import time
 from benchmark import benchmark, is_enabled_benchmark
 from data import data, GEOM_BOX, GEOM_SPHERE, MAX_VERTICES, MAX_TRIANGLES, MAX_BODIES, MAX_GEOMS, WIDTH, HEIGHT, FIXED_DT, FRAME_TIME, DEBUG
-from physics import apply_gravity, integrate_bodies, compute_aabb, get_world_aabb
+from physics import apply_gravity, integrate_bodies, compute_aabb, get_world_aabb, update_geom_transforms, broad_phase, narrow_phase
 from utils import quat_rotate
 
 # --- Scene ---
@@ -31,12 +31,12 @@ class Scene:
             [-1, -1,  1], [1, -1,  1], [1, 1,  1], [-1, 1,  1],
         ])
         box_f = ti.static([
-            [0, 1, 2], [0, 2, 3],
-            [5, 4, 7], [5, 7, 6],
-            [4, 0, 3], [4, 3, 7],
-            [1, 5, 6], [1, 6, 2],
-            [3, 2, 6], [3, 6, 7],
-            [4, 5, 1], [4, 1, 0],
+            [0, 2, 1], [0, 3, 2],   # front  (-Z)
+            [5, 7, 4], [5, 6, 7],   # back   (+Z)
+            [4, 3, 0], [4, 7, 3],   # left   (-X)
+            [1, 6, 5], [1, 2, 6],   # right  (+X)
+            [3, 6, 2], [3, 7, 6],   # top    (+Y)
+            [4, 1, 5], [4, 0, 1],   # bottom (-Y)
         ])
 
         for i in ti.static(range(8)):
@@ -79,7 +79,6 @@ class Scene:
         data.geoms[gi].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
         data.geoms[gi].data = ti.Vector([half_size[0], half_size[1], half_size[2], 0.0, 0.0, 0.0, 0.0])
         data.geoms[gi].aabb_min, data.geoms[gi].aabb_max = compute_aabb(data.vertices, vs, vs + 8, center)
-        print(f"Added box: body {bi}, geom {gi}, mass {mass}, aabb {data.geoms[gi].aabb_min} to {data.geoms[gi].aabb_max}")
 
     @ti.kernel
     def _add_sphere_gpu(self, center: ti.types.vector(3, ti.f32), radius: ti.f32,
@@ -347,7 +346,12 @@ def step(camera, scene, dt, physics_dt):
     apply_gravity(data.num_bodies[None], physics_dt)
 
     integrate_bodies(data.num_bodies[None], physics_dt)
+    
     update_render_vertices(data.num_bodies[None])
+    update_geom_transforms(data.num_geoms[None])
+
+    broad_phase(data.num_geoms[None])
+    narrow_phase(data.num_collision_pairs[None])
 
     if is_enabled_benchmark():
         ti.sync()
@@ -414,6 +418,7 @@ class GUI:
             imgui.text(f"FPS: {self.fps_smooth:.1f}")
             imgui.text(f"Frame: {self.frame}")
             imgui.text(f"Verts: {data.num_vertices[None]}  Tris: {data.num_triangles[None]}  Bodies: {data.num_bodies[None]}  Geoms: {data.num_geoms[None]}")
+            imgui.text(f"Collision pairs: {data.num_collision_pairs[None]}  Contacts: {data.num_contacts[None]}")
             allocated, used, _ = data.gpu_memory()
             imgui.text(f"GPU: {used / 1048576:.1f} / {allocated / 1048576:.1f} MB")
             self.time_scale = imgui.slider_float("Time Scale", self.time_scale, 0.0, 2.0)
