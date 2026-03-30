@@ -36,6 +36,11 @@ Contact = ti.types.struct(
     penetration=ti.f32,                    # Penetration depth
     geom_a=ti.i32,                        # Geom index A
     geom_b=ti.i32,                        # Geom index B
+
+    # PGS accumulated impulses
+    lambda_n=ti.f32,                      # Accumulated normal impulse
+    lambda_t1=ti.f32,                     # Accumulated tangent impulse 1
+    lambda_t2=ti.f32,                     # Accumulated tangent impulse 2
 )
 
 RigidBody = ti.types.struct(
@@ -66,6 +71,7 @@ CollisionGeom = ti.types.struct(
     #   - mesh_subtype: MESH_SINGLE_HULL, MESH_DECOMPOSED
     # SDF: [grid_start, resolution_x, resolution_y, resolution_z, voxel_size, 0, 0]
     data=ti.types.vector(7, ti.f32),
+    friction=ti.f32,                      # Coulomb friction coefficient (mu)
     # Cached world-space transform (updated each frame)
     world_pos=ti.types.vector(3, ti.f32),
     world_quat=ti.types.vector(4, ti.f32),

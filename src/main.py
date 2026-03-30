@@ -9,7 +9,7 @@ from utils import quat_rotate
 from raytracing import run_raytrace
 from bvh import build_lbvh
 
-USE_RAYTRACING = True
+USE_RAYTRACING = False
 
 # --- Quickhull ---
 
@@ -163,6 +163,7 @@ class Scene:
         data.geoms[gi].local_pos = ti.Vector([0.0, 0.0, 0.0])
         data.geoms[gi].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
         data.geoms[gi].data = ti.Vector([half_size[0], half_size[1], half_size[2], 0.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].friction = 0.5
         data.geoms[gi].aabb_min, data.geoms[gi].aabb_max = compute_aabb(data.vertices, vs, vs + 8, center)
 
     @ti.kernel
@@ -246,6 +247,7 @@ class Scene:
         data.geoms[gi].local_pos = ti.Vector([0.0, 0.0, 0.0])
         data.geoms[gi].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
         data.geoms[gi].data = ti.Vector([radius, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].friction = 0.5
         data.geoms[gi].aabb_min, data.geoms[gi].aabb_max = compute_aabb(data.vertices, vs, vs + num_v, center)
 
     @benchmark
@@ -318,6 +320,7 @@ class Scene:
         data.geoms[gi].local_pos = ti.Vector([0.0, 0.0, 0.0])
         data.geoms[gi].local_quat = ti.Vector([1.0, 0.0, 0.0, 0.0])
         data.geoms[gi].data = ti.Vector([ti.cast(cs, ti.f32), ti.cast(num_hull, ti.f32), 0.0, 0.0, 0.0, 0.0, 0.0])
+        data.geoms[gi].friction = 0.5
         data.geoms[gi].aabb_min = aabb_min
         data.geoms[gi].aabb_max = aabb_max
 
@@ -574,16 +577,20 @@ def step(camera, scene, dt, physics_dt):
     # physics_dt = dt * time_scale (0 = paused, <1 = slow-mo, 1 = real-time)
     # TODO: integrate physics here with physics_dt
 
-    apply_gravity(data.num_bodies[None], physics_dt)
-
-    integrate_bodies(data.num_bodies[None], physics_dt)
-    
-    update_render_vertices(data.num_bodies[None])
+    # Update transforms for collision detection
     update_geom_transforms(data.num_geoms[None])
 
+    # Detect and solve contacts BEFORE integration
     broad_phase(data.num_geoms[None])
     narrow_phase(data.num_collision_pairs[None])
     solve_contacts(physics_dt)
+
+    # Apply gravity and integrate
+    apply_gravity(data.num_bodies[None], physics_dt)
+    integrate_bodies(data.num_bodies[None], physics_dt)
+
+    # Sync render vertices
+    update_render_vertices(data.num_bodies[None])
 
     if is_enabled_benchmark():
         ti.sync()

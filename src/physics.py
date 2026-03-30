@@ -396,13 +396,37 @@ def narrow_phase(num_pairs: ti.i32):
 
 # --- Contact solver ---
 
+@ti.func
+def compute_eff_mass(inv_ma: ti.f32, inv_mb: ti.f32, inv_ia, inv_ib, ra, rb, direction):
+    ra_cross = ra.cross(direction)
+    rb_cross = rb.cross(direction)
+    ang_a = ti.Vector([ra_cross[0] * inv_ia[0], ra_cross[1] * inv_ia[1], ra_cross[2] * inv_ia[2]])
+    ang_b = ti.Vector([rb_cross[0] * inv_ib[0], rb_cross[1] * inv_ib[1], rb_cross[2] * inv_ib[2]])
+    return inv_ma + inv_mb + ang_a.cross(ra).dot(direction) + ang_b.cross(rb).dot(direction)
+
+@ti.func
+def apply_impulse(bi_a: ti.i32, bi_b: ti.i32, impulse, ra, rb, inv_ma: ti.f32, inv_mb: ti.f32, inv_ia, inv_ib):
+    data.bodies[bi_a].vel += impulse * inv_ma
+    data.bodies[bi_b].vel -= impulse * inv_mb
+    ra_cross_imp = ra.cross(impulse)
+    rb_cross_imp = rb.cross(impulse)
+    data.bodies[bi_a].omega += ti.Vector([ra_cross_imp[0] * inv_ia[0], ra_cross_imp[1] * inv_ia[1], ra_cross_imp[2] * inv_ia[2]])
+    data.bodies[bi_b].omega -= ti.Vector([rb_cross_imp[0] * inv_ib[0], rb_cross_imp[1] * inv_ib[1], rb_cross_imp[2] * inv_ib[2]])
+
 @ti.kernel
 def solve_contacts(dt: ti.f32):
     restitution = 0.3
-    baumgarte = 0.2  # position correction factor
-    slop = 0.005     # penetration slop (don't correct tiny overlaps)
+    baumgarte = 0.2
+    slop = 0.005
 
     nc = data.num_contacts[None]
+
+    # Init accumulated lambdas to 0
+    for i in range(nc):
+        data.contacts[i].lambda_n = 0.0
+        data.contacts[i].lambda_t1 = 0.0
+        data.contacts[i].lambda_t2 = 0.0
+
     iteration = 0
     while iteration < 10:
         for i in range(nc):
@@ -413,59 +437,75 @@ def solve_contacts(dt: ti.f32):
             inv_ma = data.bodies[bi_a].inv_mass
             inv_mb = data.bodies[bi_b].inv_mass
 
-            # Skip if both static
             if inv_ma == 0.0 and inv_mb == 0.0:
                 continue
 
-            # Lever arms from body centers to contact point
             ra = c.pos - data.bodies[bi_a].pos
             rb = c.pos - data.bodies[bi_b].pos
-
             inv_ia = data.bodies[bi_a].inv_inertia
             inv_ib = data.bodies[bi_b].inv_inertia
 
-            # Velocity at contact point: v + omega x r
+            # Relative velocity at contact
             va = data.bodies[bi_a].vel + data.bodies[bi_a].omega.cross(ra)
             vb = data.bodies[bi_b].vel + data.bodies[bi_b].omega.cross(rb)
             v_rel = va - vb
+
+            # --- Normal impulse (PGS) ---
             v_rel_n = v_rel.dot(n)
+            eff_mass_n = compute_eff_mass(inv_ma, inv_mb, inv_ia, inv_ib, ra, rb, n)
 
-            # Only resolve if approaching
-            if v_rel_n < 0.0:
-                # Angular contribution to effective mass
-                ra_cross_n = ra.cross(n)
-                rb_cross_n = rb.cross(n)
-                # Approximate: use diagonal inertia (world-aligned, good enough for now)
-                ang_a = ti.Vector([ra_cross_n[0] * inv_ia[0],
-                                   ra_cross_n[1] * inv_ia[1],
-                                   ra_cross_n[2] * inv_ia[2]])
-                ang_b = ti.Vector([rb_cross_n[0] * inv_ib[0],
-                                   rb_cross_n[1] * inv_ib[1],
-                                   rb_cross_n[2] * inv_ib[2]])
-                eff_mass = inv_ma + inv_mb + ang_a.cross(ra).dot(n) + ang_b.cross(rb).dot(n)
+            bias = (baumgarte / dt) * ti.max(c.penetration - slop, 0.0)
+            delta_lambda_n = -(v_rel_n + bias) / eff_mass_n
 
-                # Impulse magnitude
-                j = -(1.0 + restitution) * v_rel_n / eff_mass
+            # Only apply restitution on first iteration
+            if iteration == 0 and v_rel_n < -0.5:
+                delta_lambda_n += (-restitution * v_rel_n) / eff_mass_n
 
-                # Baumgarte position correction bias
-                bias = (baumgarte / dt) * ti.max(c.penetration - slop, 0.0)
-                j += bias / eff_mass
+            old_lambda_n = data.contacts[i].lambda_n
+            data.contacts[i].lambda_n = ti.max(0.0, old_lambda_n + delta_lambda_n)
+            actual_delta_n = data.contacts[i].lambda_n - old_lambda_n
 
-                impulse = j * n
+            apply_impulse(bi_a, bi_b, actual_delta_n * n, ra, rb, inv_ma, inv_mb, inv_ia, inv_ib)
 
-                # Apply to velocities
-                data.bodies[bi_a].vel += impulse * inv_ma
-                data.bodies[bi_b].vel -= impulse * inv_mb
-                data.bodies[bi_a].omega += ti.Vector([
-                    (ra.cross(impulse))[0] * inv_ia[0],
-                    (ra.cross(impulse))[1] * inv_ia[1],
-                    (ra.cross(impulse))[2] * inv_ia[2],
-                ])
-                data.bodies[bi_b].omega -= ti.Vector([
-                    (rb.cross(impulse))[0] * inv_ib[0],
-                    (rb.cross(impulse))[1] * inv_ib[1],
-                    (rb.cross(impulse))[2] * inv_ib[2],
-                ])
+            # --- Friction impulses ---
+            mu = 0.5 * (data.geoms[c.geom_a].friction + data.geoms[c.geom_b].friction)
+            friction_limit = mu * data.contacts[i].lambda_n
+
+            # Build tangent basis
+            t1 = ti.Vector([0.0, 0.0, 0.0])
+            if ti.abs(n[1]) < 0.9:
+                t1 = ti.Vector([0.0, 1.0, 0.0]).cross(n)
+            else:
+                t1 = ti.Vector([1.0, 0.0, 0.0]).cross(n)
+            t1 = t1.normalized()
+            t2 = n.cross(t1)
+
+            # Re-read velocity after normal impulse
+            va = data.bodies[bi_a].vel + data.bodies[bi_a].omega.cross(ra)
+            vb = data.bodies[bi_b].vel + data.bodies[bi_b].omega.cross(rb)
+            v_rel = va - vb
+
+            # Tangent 1
+            v_rel_t1 = v_rel.dot(t1)
+            eff_mass_t1 = compute_eff_mass(inv_ma, inv_mb, inv_ia, inv_ib, ra, rb, t1)
+            delta_lambda_t1 = -v_rel_t1 / eff_mass_t1
+            old_lambda_t1 = data.contacts[i].lambda_t1
+            data.contacts[i].lambda_t1 = ti.max(-friction_limit, ti.min(friction_limit, old_lambda_t1 + delta_lambda_t1))
+            actual_delta_t1 = data.contacts[i].lambda_t1 - old_lambda_t1
+            apply_impulse(bi_a, bi_b, actual_delta_t1 * t1, ra, rb, inv_ma, inv_mb, inv_ia, inv_ib)
+
+            # Tangent 2
+            va = data.bodies[bi_a].vel + data.bodies[bi_a].omega.cross(ra)
+            vb = data.bodies[bi_b].vel + data.bodies[bi_b].omega.cross(rb)
+            v_rel = va - vb
+            v_rel_t2 = v_rel.dot(t2)
+            eff_mass_t2 = compute_eff_mass(inv_ma, inv_mb, inv_ia, inv_ib, ra, rb, t2)
+            delta_lambda_t2 = -v_rel_t2 / eff_mass_t2
+            old_lambda_t2 = data.contacts[i].lambda_t2
+            data.contacts[i].lambda_t2 = ti.max(-friction_limit, ti.min(friction_limit, old_lambda_t2 + delta_lambda_t2))
+            actual_delta_t2 = data.contacts[i].lambda_t2 - old_lambda_t2
+            apply_impulse(bi_a, bi_b, actual_delta_t2 * t2, ra, rb, inv_ma, inv_mb, inv_ia, inv_ib)
+
         iteration += 1
 
 # --- AABB ---
