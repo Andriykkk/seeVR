@@ -4,7 +4,7 @@ import time
 import numpy as np
 from benchmark import benchmark, is_enabled_benchmark
 from data import data, GEOM_BOX, GEOM_SPHERE, GEOM_MESH, MAX_VERTICES, MAX_TRIANGLES, MAX_BODIES, MAX_GEOMS, WIDTH, HEIGHT, FIXED_DT, FRAME_TIME, DEBUG
-from physics import apply_gravity, integrate_bodies, compute_aabb, get_world_aabb, update_geom_transforms, broad_phase, narrow_phase, solve_contacts
+from physics import apply_gravity, integrate_bodies, compute_aabb, get_world_aabb, update_geom_transforms, broad_phase, narrow_phase, solve_contacts, solve_contacts_penalty
 from utils import quat_rotate
 from raytracing import run_raytrace
 from bvh import build_lbvh
@@ -580,13 +580,15 @@ def step(camera, scene, dt, physics_dt):
     # Update transforms for collision detection
     update_geom_transforms(data.num_geoms[None])
 
-    # Detect and solve contacts BEFORE integration
+    # Collision detection
     broad_phase(data.num_geoms[None])
     narrow_phase(data.num_collision_pairs[None])
+
+    # Apply gravity, then solve contacts (so solver cancels gravity at contacts)
+    apply_gravity(data.num_bodies[None], physics_dt)
     solve_contacts(physics_dt)
 
-    # Apply gravity and integrate
-    apply_gravity(data.num_bodies[None], physics_dt)
+    # Integrate with corrected velocities
     integrate_bodies(data.num_bodies[None], physics_dt)
 
     # Sync render vertices

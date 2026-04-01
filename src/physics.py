@@ -389,12 +389,45 @@ def narrow_phase(num_pairs: ti.i32):
             idx = ti.atomic_add(data.num_contacts[None], 1)
             if idx < data.contacts.shape[0]:
                 data.contacts[idx].pos = pos
-                data.contacts[idx].normal = normal
+                data.contacts[idx].normal = normal  # flip: MPR gives inward, solver needs outward
                 data.contacts[idx].penetration = penetration
                 data.contacts[idx].geom_a = gi_a
                 data.contacts[idx].geom_b = gi_b
 
-# --- Contact solver ---
+# --- Penalty force solver (simple test) ---
+
+@ti.kernel
+def solve_contacts_penalty(dt: ti.f32):
+    stiffness = 5000.0
+    damping = 50.0
+    nc = data.num_contacts[None]
+    for i in range(nc):
+        c = data.contacts[i]
+        n = c.normal
+        depth = c.penetration
+        if depth <= 0.0:
+            continue
+
+        bi_a = data.geoms[c.geom_a].body_idx
+        bi_b = data.geoms[c.geom_b].body_idx
+        inv_ma = data.bodies[bi_a].inv_mass
+        inv_mb = data.bodies[bi_b].inv_mass
+        if inv_ma == 0.0 and inv_mb == 0.0:
+            continue
+
+        # Relative velocity along normal for damping
+        v_rel = (data.bodies[bi_a].vel - data.bodies[bi_b].vel).dot(n)
+
+        # Penalty force: spring + damper
+        f = stiffness * depth - damping * v_rel
+        if f < 0.0:
+            f = 0.0
+
+        impulse = f * dt * n
+        data.bodies[bi_a].vel += impulse * inv_ma
+        data.bodies[bi_b].vel -= impulse * inv_mb
+
+# --- Contact solver (PGS) ---
 
 @ti.func
 def compute_eff_mass(inv_ma: ti.f32, inv_mb: ti.f32, inv_ia, inv_ib, ra, rb, direction):
@@ -414,18 +447,17 @@ def apply_impulse(bi_a: ti.i32, bi_b: ti.i32, impulse, ra, rb, inv_ma: ti.f32, i
     data.bodies[bi_b].omega -= ti.Vector([rb_cross_imp[0] * inv_ib[0], rb_cross_imp[1] * inv_ib[1], rb_cross_imp[2] * inv_ib[2]])
 
 @ti.kernel
-def solve_contacts(dt: ti.f32):
-    restitution = 0.3
-    baumgarte = 0.2
-    slop = 0.005
-
-    nc = data.num_contacts[None]
-
-    # Init accumulated lambdas to 0
+def _init_lambdas(nc: ti.i32):
     for i in range(nc):
         data.contacts[i].lambda_n = 0.0
         data.contacts[i].lambda_t1 = 0.0
         data.contacts[i].lambda_t2 = 0.0
+
+@ti.kernel
+def _solve_contacts_iter(dt: ti.f32, nc: ti.i32):
+    restitution = 0.3
+    baumgarte = 0.2
+    slop = 0.005
 
     iteration = 0
     while iteration < 10:
@@ -455,7 +487,7 @@ def solve_contacts(dt: ti.f32):
             eff_mass_n = compute_eff_mass(inv_ma, inv_mb, inv_ia, inv_ib, ra, rb, n)
 
             bias = (baumgarte / dt) * ti.max(c.penetration - slop, 0.0)
-            delta_lambda_n = -(v_rel_n + bias) / eff_mass_n
+            delta_lambda_n = -(v_rel_n - bias) / eff_mass_n
 
             # Only apply restitution on first iteration
             if iteration == 0 and v_rel_n < -0.5:
@@ -464,6 +496,11 @@ def solve_contacts(dt: ti.f32):
             old_lambda_n = data.contacts[i].lambda_n
             data.contacts[i].lambda_n = ti.max(0.0, old_lambda_n + delta_lambda_n)
             actual_delta_n = data.contacts[i].lambda_n - old_lambda_n
+
+            if iteration == 0 and i == 0:
+                print("vrel_n=", v_rel_n, "eff_m=", eff_mass_n, "bias=", bias,
+                      "dlam=", delta_lambda_n, "lam=", data.contacts[i].lambda_n,
+                      "actual=", actual_delta_n)
 
             apply_impulse(bi_a, bi_b, actual_delta_n * n, ra, rb, inv_ma, inv_mb, inv_ia, inv_ib)
 
@@ -507,6 +544,13 @@ def solve_contacts(dt: ti.f32):
             apply_impulse(bi_a, bi_b, actual_delta_t2 * t2, ra, rb, inv_ma, inv_mb, inv_ia, inv_ib)
 
         iteration += 1
+
+def solve_contacts(dt):
+    nc = data.num_contacts[None]
+    if nc == 0:
+        return
+    _init_lambdas(nc)
+    _solve_contacts_iter(dt, nc)
 
 # --- AABB ---
 
