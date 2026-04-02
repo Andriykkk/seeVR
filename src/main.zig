@@ -95,7 +95,7 @@ pub fn main() !void {
         const mvp = camera.mvp(aspect);
 
         // Physics: update transforms → compute AABBs → broad phase
-        try physics.step(d.num_bodies, d.num_geoms, dt);
+        try physics.step(d.num_bodies, d.num_geoms, dt, .{ 0, -9.81, 0 });
         try bvh.build(d.num_triangles);
 
         if (mode == .raster) {

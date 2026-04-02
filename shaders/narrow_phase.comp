@@ -1,0 +1,373 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint step;       // 0=narrow_phase, 1=perturb
+    uint count;      // num_pairs or num_contacts
+    float sign0;     // perturbation direction signs
+    float sign1;
+};
+
+// Geom buffers
+layout(set = 0, binding = 0) buffer GeomType      { int   geom_type[]; };
+layout(set = 0, binding = 1) buffer GeomBodyIdx   { uint  geom_body_idx[]; };
+layout(set = 0, binding = 2) buffer GeomWorldPos  { float geom_world_pos[]; };
+layout(set = 0, binding = 3) buffer GeomWorldQuat { float geom_world_quat[]; };
+layout(set = 0, binding = 4) buffer GeomData      { float geom_data[]; };      // [n*7]
+layout(set = 0, binding = 5) buffer CollisionVerts{ float coll_verts[]; };      // hull vertices
+
+// Collision input/output
+layout(set = 0, binding = 6)  buffer CollisionPairs { uint  pairs[]; };          // flat: a0,b0,a1,b1,...
+layout(set = 0, binding = 7)  buffer Counters       { uint  counters[]; };       // [0]=num_pairs, [1]=num_contacts
+
+// Contact output
+layout(set = 0, binding = 8)  buffer ContactPos     { float contact_pos[]; };
+layout(set = 0, binding = 9)  buffer ContactNormal  { float contact_normal[]; };
+layout(set = 0, binding = 10) buffer ContactPen     { float contact_pen[]; };
+layout(set = 0, binding = 11) buffer ContactGeomA   { uint  contact_geom_a[]; };
+layout(set = 0, binding = 12) buffer ContactGeomB   { uint  contact_geom_b[]; };
+
+const float MPR_EPS = 1e-9;
+const float MPR_TOLERANCE = 1e-6;
+const int   MPR_MAX_ITER = 50;
+const int   GEOM_SPHERE = 1;
+const int   GEOM_BOX = 2;
+const int   GEOM_MESH = 5;
+
+// --- Quaternion helpers ---
+
+vec4 quat_conj(vec4 q) { return vec4(q.x, -q.y, -q.z, -q.w); }
+
+vec3 quat_rotate(vec4 q, vec3 v) {
+    float w = q.x, x = q.y, y = q.z, z = q.w;
+    vec3 t = 2.0 * vec3(y*v.z - z*v.y, z*v.x - x*v.z, x*v.y - y*v.x);
+    return v + w * t + vec3(y*t.z - z*t.y, z*t.x - x*t.z, x*t.y - y*t.x);
+}
+
+// --- Geom accessors ---
+
+vec3 get_world_pos(uint gi) {
+    return vec3(geom_world_pos[gi*3], geom_world_pos[gi*3+1], geom_world_pos[gi*3+2]);
+}
+vec4 get_world_quat(uint gi) {
+    return vec4(geom_world_quat[gi*4], geom_world_quat[gi*4+1], geom_world_quat[gi*4+2], geom_world_quat[gi*4+3]);
+}
+
+// --- Support functions ---
+
+vec3 support_sphere(uint gi, vec3 dir) {
+    vec3 pos = get_world_pos(gi);
+    float r = geom_data[gi*7];
+    return pos + normalize(dir) * r;
+}
+
+vec3 support_box(uint gi, vec3 dir) {
+    vec3 pos = get_world_pos(gi);
+    vec4 q = get_world_quat(gi);
+    vec3 d_local = quat_rotate(quat_conj(q), dir);
+    vec3 corner = vec3(
+        sign(d_local.x) * geom_data[gi*7+0],
+        sign(d_local.y) * geom_data[gi*7+1],
+        sign(d_local.z) * geom_data[gi*7+2]);
+    return pos + quat_rotate(q, corner);
+}
+
+vec3 support_mesh(uint gi, vec3 dir) {
+    vec3 pos = get_world_pos(gi);
+    vec4 q = get_world_quat(gi);
+    vec3 d_local = quat_rotate(quat_conj(q), dir);
+    int start = int(geom_data[gi*7+0]);
+    int count = int(geom_data[gi*7+1]);
+    vec3 best = vec3(coll_verts[start*3], coll_verts[start*3+1], coll_verts[start*3+2]);
+    float best_dot = dot(best, d_local);
+    for (int i = 1; i < count; i++) {
+        vec3 v = vec3(coll_verts[(start+i)*3], coll_verts[(start+i)*3+1], coll_verts[(start+i)*3+2]);
+        float d = dot(v, d_local);
+        if (d > best_dot) { best_dot = d; best = v; }
+    }
+    return pos + quat_rotate(q, best);
+}
+
+vec3 support(uint gi, vec3 dir) {
+    int t = geom_type[gi];
+    if (t == GEOM_SPHERE) return support_sphere(gi, dir);
+    if (t == GEOM_BOX) return support_box(gi, dir);
+    if (t == GEOM_MESH) return support_mesh(gi, dir);
+    return vec3(0);
+}
+
+// Minkowski support: A(dir) - B(-dir)
+void compute_support(vec3 dir, uint ga, uint gb,
+                     out vec3 v, out vec3 va, out vec3 vb) {
+    va = support(ga, dir);
+    vb = support(gb, -dir);
+    v = va - vb;
+}
+
+// --- MPR portal helpers ---
+
+vec3 portal_dir(vec3 v1, vec3 v2, vec3 v3) {
+    return normalize(cross(v2 - v1, v3 - v1));
+}
+
+bool portal_reach_tol(vec3 v1, vec3 v2, vec3 v3, vec3 v4, vec3 dir) {
+    float d4 = dot(v4, dir);
+    float d1 = min(min(d4 - dot(v1,dir), d4 - dot(v2,dir)), d4 - dot(v3,dir));
+    return d1 < MPR_TOLERANCE + MPR_EPS * max(1.0, d1);
+}
+
+void expand_portal(vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3,
+                   inout vec3 v1a, inout vec3 v2a, inout vec3 v3a,
+                   inout vec3 v1b, inout vec3 v2b, inout vec3 v3b,
+                   vec3 v, vec3 va, vec3 vb) {
+    vec3 v4v0 = cross(v, v0);
+    float d = dot(v1, v4v0);
+    if (d > 0) {
+        if (dot(v2, v4v0) > 0) { v1=v; v1a=va; v1b=vb; }
+        else                    { v3=v; v3a=va; v3b=vb; }
+    } else {
+        if (dot(v3, v4v0) > 0) { v2=v; v2a=va; v2b=vb; }
+        else                    { v1=v; v1a=va; v1b=vb; }
+    }
+}
+
+// --- MPR find contact position (barycentric) ---
+
+vec3 mpr_find_pos(vec3 v0, vec3 v1, vec3 v2, vec3 v3,
+                  vec3 v0a, vec3 v1a, vec3 v2a, vec3 v3a,
+                  vec3 v0b, vec3 v1b, vec3 v2b, vec3 v3b) {
+    vec3 vs[4] = vec3[](v0, v1, v2, v3);
+    vec3 as[4] = vec3[](v0a, v1a, v2a, v3a);
+    vec3 bs[4] = vec3[](v0b, v1b, v2b, v3b);
+
+    vec4 b = vec4(0);
+    int i1s[4] = int[](1,2,1,2);
+    int i2s[4] = int[](2,0,3,1);
+    int i3s[4] = int[](3,3,0,0);
+    float signs[4] = float[](1,-1,-1,1);
+    for (int i = 0; i < 4; i++) {
+        b[i] = dot(cross(vs[i1s[i]], vs[i2s[i]]), vs[i3s[i]]) * signs[i];
+    }
+    float total = b.x + b.y + b.z + b.w;
+
+    if (total < MPR_EPS) {
+        vec3 dir = portal_dir(v1, v2, v3);
+        b.x = 0;
+        b.y = dot(cross(vs[2], vs[3]), dir);
+        b.z = dot(cross(vs[3], vs[1]), dir);
+        b.w = dot(cross(vs[1], vs[2]), dir);
+        total = b.y + b.z + b.w;
+    }
+
+    vec3 p1 = vec3(0), p2 = vec3(0);
+    for (int i = 0; i < 4; i++) {
+        p1 += b[i] * as[i];
+        p2 += b[i] * bs[i];
+    }
+    return (0.5 / total) * (p1 + p2);
+}
+
+// --- MPR collide ---
+
+void mpr_collide(uint ga, uint gb,
+                 out int is_col, out vec3 normal, out vec3 pos, out float pen) {
+    is_col = 0; normal = vec3(0); pos = vec3(0); pen = 0;
+
+    vec3 ca = get_world_pos(ga), cb = get_world_pos(gb);
+    vec3 v0 = ca - cb, v0a = ca, v0b = cb;
+    if (abs(v0.x) < MPR_EPS && abs(v0.y) < MPR_EPS && abs(v0.z) < MPR_EPS) v0.x += 10.0 * MPR_EPS;
+
+    vec3 dir = -normalize(v0);
+    vec3 v1, v1a, v1b; compute_support(dir, ga, gb, v1, v1a, v1b);
+
+    if (dot(v1, dir) < MPR_EPS) return; // no collision
+
+    dir = cross(v0, v1);
+    if (dot(dir,dir) < MPR_EPS) {
+        if (abs(v1.x)<MPR_EPS && abs(v1.y)<MPR_EPS && abs(v1.z)<MPR_EPS) {
+            is_col=1; normal=-normalize(v0); pos=(v1a+v1b)*0.5; return; // touching
+        }
+        is_col=1; normal=-normalize(v1); pos=(v1a+v1b)*0.5; pen=length(v1); return; // segment
+    }
+
+    dir = normalize(dir);
+    vec3 v2, v2a, v2b; compute_support(dir, ga, gb, v2, v2a, v2b);
+    if (dot(v2,dir) < MPR_EPS) return;
+
+    // Orient triangle toward origin
+    dir = normalize(cross(v1-v0, v2-v0));
+    if (dot(dir,v0) > 0) {
+        vec3 t=v1; v1=v2; v2=t; t=v1a; v1a=v2a; v2a=t; t=v1b; v1b=v2b; v2b=t;
+        dir = -dir;
+    }
+
+    // Find v3
+    vec3 v3, v3a, v3b;
+    for (int trial = 0; trial < 15; trial++) {
+        compute_support(dir, ga, gb, v3, v3a, v3b);
+        if (dot(v3,dir) < MPR_EPS) return;
+
+        bool cont = false;
+        if (dot(cross(v1,v3), v0) < -MPR_EPS) { v2=v3; v2a=v3a; v2b=v3b; cont=true; }
+        else if (dot(cross(v3,v2), v0) < -MPR_EPS) { v1=v3; v1a=v3a; v1b=v3b; cont=true; }
+
+        if (cont) { dir = normalize(cross(v1-v0, v2-v0)); }
+        else break; // tetrahedron found
+    }
+
+    // Refine portal
+    for (int i = 0; i < MPR_MAX_ITER; i++) {
+        dir = portal_dir(v1,v2,v3);
+        if (dot(v1,dir) > -MPR_EPS) break; // origin behind portal
+        vec3 v4, v4a, v4b; compute_support(dir, ga, gb, v4, v4a, v4b);
+        if (dot(v4,dir) < -MPR_EPS) return;
+        if (portal_reach_tol(v1,v2,v3,v4,dir)) return;
+        expand_portal(v0, v1,v2,v3, v1a,v2a,v3a, v1b,v2b,v3b, v4,v4a,v4b);
+    }
+
+    // Find penetration
+    for (int i = 0; i < MPR_MAX_ITER; i++) {
+        dir = portal_dir(v1,v2,v3);
+        vec3 v4, v4a, v4b; compute_support(dir, ga, gb, v4, v4a, v4b);
+        if (portal_reach_tol(v1,v2,v3,v4,dir) || i == MPR_MAX_ITER-1) {
+            is_col = 1;
+            pen = dot(dir, v1);
+            normal = -dir;
+            pos = mpr_find_pos(v0,v1,v2,v3, v0a,v1a,v2a,v3a, v0b,v1b,v2b,v3b);
+            return;
+        }
+        expand_portal(v0, v1,v2,v3, v1a,v2a,v3a, v1b,v2b,v3b, v4,v4a,v4b);
+    }
+}
+
+// --- Quaternion helpers for perturbation ---
+
+vec4 quat_mul(vec4 q1, vec4 q2) {
+    return vec4(
+        q1.x*q2.x - q1.y*q2.y - q1.z*q2.z - q1.w*q2.w,
+        q1.x*q2.y + q1.y*q2.x + q1.z*q2.w - q1.w*q2.z,
+        q1.x*q2.z - q1.y*q2.w + q1.z*q2.x + q1.w*q2.y,
+        q1.x*q2.w + q1.y*q2.z - q1.z*q2.y + q1.w*q2.x);
+}
+
+vec4 quat_from_axis_angle(vec3 axis, float angle) {
+    float h = angle * 0.5;
+    float s = sin(h);
+    return vec4(cos(h), axis.x*s, axis.y*s, axis.z*s);
+}
+
+vec4 quat_normalize(vec4 q) {
+    float l = length(q);
+    return l > 1e-8 ? q / l : vec4(1,0,0,0);
+}
+
+void add_contact(vec3 pos, vec3 normal, float pen, uint ga, uint gb) {
+    uint idx = atomicAdd(counters[1], 1);
+    if (idx < 10000) {
+        contact_pos[idx*3]   = pos.x;
+        contact_pos[idx*3+1] = pos.y;
+        contact_pos[idx*3+2] = pos.z;
+        contact_normal[idx*3]   = normal.x;
+        contact_normal[idx*3+1] = normal.y;
+        contact_normal[idx*3+2] = normal.z;
+        contact_pen[idx] = pen;
+        contact_geom_a[idx] = ga;
+        contact_geom_b[idx] = gb;
+    }
+}
+
+// --- Step 0: Narrow phase ---
+
+void step_narrow_phase() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i == 0) counters[1] = 0;
+    barrier();
+    memoryBarrierBuffer();
+
+    if (i >= count) return;
+
+    uint ga = pairs[i*2];
+    uint gb = pairs[i*2+1];
+
+    int is_col; vec3 normal, pos; float pen;
+    mpr_collide(ga, gb, is_col, normal, pos, pen);
+
+    if (is_col == 1) add_contact(pos, normal, pen, ga, gb);
+}
+
+// --- Step 1: Perturb contacts (one direction per dispatch) ---
+// sign0, sign1 come from push constants — called 4 times with (+1,+1), (-1,+1), (+1,-1), (-1,-1)
+
+void step_perturb() {
+    uint ci = gl_GlobalInvocationID.x;
+    if (ci >= count) return;
+
+    const float PERTURB_ANGLE = 0.01;
+    const float DEDUP_TOL_SQ = 0.01 * 0.01;
+
+    uint ga = contact_geom_a[ci];
+    uint gb = contact_geom_b[ci];
+    vec3 n = vec3(contact_normal[ci*3], contact_normal[ci*3+1], contact_normal[ci*3+2]);
+    vec3 pivot = vec3(contact_pos[ci*3], contact_pos[ci*3+1], contact_pos[ci*3+2]);
+
+    // Build tangent basis
+    vec3 t0;
+    if (abs(n.y) < 0.9) t0 = normalize(cross(vec3(0,1,0), n));
+    else                 t0 = normalize(cross(vec3(1,0,0), n));
+    vec3 t1 = cross(n, t0);
+
+    vec3 axis = normalize(sign0 * t0 + sign1 * t1);
+
+    // Save original transform
+    vec3 orig_pos = get_world_pos(ga);
+    vec4 orig_quat = get_world_quat(ga);
+
+    // Perturb geom A around pivot
+    vec4 dq = quat_from_axis_angle(axis, PERTURB_ANGLE);
+    vec4 new_quat = quat_normalize(quat_mul(dq, orig_quat));
+    vec3 new_pos = pivot + quat_rotate(dq, orig_pos - pivot);
+
+    // Temporarily write perturbed transform
+    geom_world_pos[ga*3]   = new_pos.x;
+    geom_world_pos[ga*3+1] = new_pos.y;
+    geom_world_pos[ga*3+2] = new_pos.z;
+    geom_world_quat[ga*4]   = new_quat.x;
+    geom_world_quat[ga*4+1] = new_quat.y;
+    geom_world_quat[ga*4+2] = new_quat.z;
+    geom_world_quat[ga*4+3] = new_quat.w;
+
+    // Run MPR
+    int is_col; vec3 normal; vec3 pos; float pen;
+    mpr_collide(ga, gb, is_col, normal, pos, pen);
+
+    // Restore original transform
+    geom_world_pos[ga*3]   = orig_pos.x;
+    geom_world_pos[ga*3+1] = orig_pos.y;
+    geom_world_pos[ga*3+2] = orig_pos.z;
+    geom_world_quat[ga*4]   = orig_quat.x;
+    geom_world_quat[ga*4+1] = orig_quat.y;
+    geom_world_quat[ga*4+2] = orig_quat.z;
+    geom_world_quat[ga*4+3] = orig_quat.w;
+
+    if (is_col == 1) {
+        // Dedup against existing contacts
+        uint nc = counters[1];
+        bool is_dup = false;
+        for (uint j = 0; j < nc; j++) {
+            vec3 cp = vec3(contact_pos[j*3], contact_pos[j*3+1], contact_pos[j*3+2]);
+            vec3 diff = pos - cp;
+            if (dot(diff, diff) < DEDUP_TOL_SQ) { is_dup = true; break; }
+        }
+        if (!is_dup) add_contact(pos, normal, pen, ga, gb);
+    }
+}
+
+// --- Main ---
+
+void main() {
+    switch (step) {
+        case 0: step_narrow_phase(); break;
+        case 1: step_perturb();      break;
+    }
+}
