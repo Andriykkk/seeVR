@@ -322,6 +322,18 @@ pub const Data = struct {
         try v.uploadSlice(self.geom_friction, f32, self.s_geom_friction[0..self.num_geoms]);
     }
 
+    /// Total GPU memory allocated by all buffers
+    pub fn gpuMemoryBytes(self: *const Data) usize {
+        return self.vertices.size + self.colors.size + self.indices.size + self.original_vertices.size +
+            self.body_pos.size + self.body_quat.size + self.body_vel.size + self.body_omega.size +
+            self.body_inv_mass.size + self.body_inertia.size + self.body_inv_inertia.size +
+            self.body_vert_start.size + self.body_vert_count.size +
+            self.geom_type.size + self.geom_body_idx.size + self.geom_data.size + self.geom_friction.size +
+            self.geom_world_pos.size + self.geom_world_quat.size + self.geom_aabb_min.size + self.geom_aabb_max.size +
+            self.contact_pos.size + self.contact_normal.size + self.contact_penetration.size +
+            self.contact_geom_a.size + self.contact_geom_b.size;
+    }
+
     pub fn deinit(self: *Data) void {
         const bufs = &[_]*Buffer{
             &self.vertices, &self.colors, &self.indices, &self.original_vertices,

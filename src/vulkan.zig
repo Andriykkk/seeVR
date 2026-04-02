@@ -397,6 +397,25 @@ pub const Vulkan = struct {
         c.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
     }
 
+    /// Create a descriptor pool (needed for ImGui)
+    pub fn createDescriptorPool(self: *Vulkan) !c.VkDescriptorPool {
+        const pool_sizes = [_]c.VkDescriptorPoolSize{
+            .{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 100 },
+            .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 100 },
+        };
+        var pool: c.VkDescriptorPool = null;
+        if (c.vkCreateDescriptorPool(self.device, &c.VkDescriptorPoolCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = null,
+            .flags = c.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+            .maxSets = 100,
+            .poolSizeCount = pool_sizes.len,
+            .pPoolSizes = &pool_sizes,
+        }, null, &pool) != c.VK_SUCCESS)
+            return error.DescriptorPoolCreateFailed;
+        return pool;
+    }
+
     pub fn destroyBuffer(self: *Vulkan, buf: Buffer) void {
         c.vkDestroyBuffer(self.device, buf.handle, null);
         c.vkFreeMemory(self.device, buf.memory, null);
