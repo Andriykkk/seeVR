@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
 
     mod.linkSystemLibrary("glfw", .{});
     mod.linkSystemLibrary("vulkan", .{});
+    mod.linkSystemLibrary("shaderc", .{});
 
     const exe = b.addExecutable(.{
         .name = "robotics",
@@ -22,6 +23,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
+    run_cmd.setCwd(b.path("."));
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the engine");
     run_step.dependOn(&run_cmd.step);

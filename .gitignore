@@ -1,4 +1,6 @@
 .zig-cache
+zig-out
+*.spv
 
 /docs
 TODO.md
