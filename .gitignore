@@ -8,6 +8,7 @@ TODO.md
 /Genesis
 CoACD/
 /models
+src/models/*
 
 # Python
 __pycache__/

@@ -65,6 +65,8 @@ pub fn main() !void {
     _ = try d.addBox(.{ 0, 1, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 0.8, 0.3, 0.3 }, 1);
     _ = try d.addBox(.{ 2, 0.75, -1 }, .{ 0.75, 0.75, 0.75 }, .{ 0.3, 0.8, 0.3 }, 1);
     _ = try d.addSphere(.{ -2, 1.5, 0 }, 0.7, .{ 0.2, 0.2, 0.9 }, 16, 1);
+    _ = try d.addMesh("models/cylinder.obj", .{ 0, 2, 2 }, .{ 0.9, 0.5, 0.2 }, 1, 0.2);
+
     try d.upload();
 
     std.debug.print("Scene: {} vertices, {} triangles, {} bodies\n", .{ d.num_vertices, d.num_triangles, d.num_bodies });

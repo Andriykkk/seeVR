@@ -1,6 +1,9 @@
 const std = @import("std");
 const Vulkan = @import("vulkan.zig").Vulkan;
 const Buffer = Vulkan.Buffer;
+const fs = @import("fs.zig");
+const Vec = @import("vec.zig").Vec;
+const quickhull3d = @import("quickhull.zig").quickhull3d;
 
 
 pub const MAX_VERTICES: u32 = 100_000;
@@ -8,6 +11,7 @@ pub const MAX_TRIANGLES: u32 = 100_000;
 pub const MAX_BODIES: u32 = 1_000;
 pub const MAX_GEOMS: u32 = 2_000;
 pub const MAX_CONTACTS: u32 = 10_000;
+pub const MAX_COLLISION_VERTS: u32 = 50_000;
 pub const FIXED_DT: f32 = 1.0 / 60.0;
 
 const VERTEX = Vulkan.USAGE_VERTEX;
@@ -51,6 +55,9 @@ pub const Data = struct {
     contact_geom_a: Buffer, // [MAX_CONTACTS] uint — geom index A
     contact_geom_b: Buffer, // [MAX_CONTACTS] uint — geom index B
 
+    // Collision hull vertices (for mesh geoms, used by MPR/GJK support function)
+    collision_verts: Buffer, // [MAX_COLLISION_VERTS] float3 — convex hull vertices
+
     // CPU staging
     s_vertices: []f32,
     s_colors: []f32,
@@ -69,6 +76,7 @@ pub const Data = struct {
     s_geom_body_idx: []u32,
     s_geom_data: []f32,
     s_geom_friction: []f32,
+    s_collision_verts: []f32,
     alloc: std.mem.Allocator,
 
     // Counters
@@ -76,6 +84,7 @@ pub const Data = struct {
     num_triangles: u32,
     num_bodies: u32,
     num_geoms: u32,
+    num_collision_verts: u32,
 
     pub fn init(vk_ctx: *Vulkan, alloc: std.mem.Allocator) !Data {
         return Data{
@@ -108,6 +117,7 @@ pub const Data = struct {
             .contact_penetration = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
             .contact_geom_a = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
             .contact_geom_b = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
+            .collision_verts = try vk_ctx.createBuffer(MAX_COLLISION_VERTS * @sizeOf([3]f32), STORAGE),
 
             .s_vertices = try alloc.alloc(f32, MAX_VERTICES * 3),
             .s_colors = try alloc.alloc(f32, MAX_VERTICES * 3),
@@ -126,11 +136,13 @@ pub const Data = struct {
             .s_geom_body_idx = try alloc.alloc(u32, MAX_GEOMS),
             .s_geom_data = try alloc.alloc(f32, MAX_GEOMS * 7),
             .s_geom_friction = try alloc.alloc(f32, MAX_GEOMS),
+            .s_collision_verts = try alloc.alloc(f32, MAX_COLLISION_VERTS * 3),
 
             .num_vertices = 0,
             .num_triangles = 0,
             .num_bodies = 0,
             .num_geoms = 0,
+            .num_collision_verts = 0,
         };
     }
 
@@ -300,6 +312,166 @@ pub const Data = struct {
         return bi;
     }
 
+    /// Load an OBJ mesh file, center it, scale it, create body + geom
+    pub fn addMesh(self: *Data, filename: [*:0]const u8, center: [3]f32, color: [3]f32, mass: f32, scale: f32) !u32 {
+        // Read OBJ file
+        const file_data = try fs.readFile(filename, self.alloc);
+        defer self.alloc.free(file_data);
+
+        // Parse vertices and faces
+        var verts = Vec([3]f32).init(self.alloc);
+        defer verts.deinit();
+        var faces = Vec([3]u32).init(self.alloc);
+        defer faces.deinit();
+
+        var line_start: usize = 0;
+        for (file_data, 0..) |byte, i| {
+            if (byte == '\n' or i == file_data.len - 1) {
+                const line = file_data[line_start .. if (byte == '\n') i else i + 1];
+                line_start = i + 1;
+
+                if (line.len < 2) continue;
+
+                if (line[0] == 'v' and line[1] == ' ') {
+                    // Parse vertex: "v x y z"
+                    var it = std.mem.splitScalar(u8, line[2..], ' ');
+                    var v: [3]f32 = undefined;
+                    var vi: u32 = 0;
+                    while (it.next()) |tok| {
+                        if (tok.len == 0) continue;
+                        if (vi < 3) {
+                            v[vi] = std.fmt.parseFloat(f32, tok) catch 0;
+                            vi += 1;
+                        }
+                    }
+                    if (vi == 3) try verts.push(v);
+                } else if (line[0] == 'f' and line[1] == ' ') {
+                    // Parse face: "f v1 v2 v3" or "f v1/vt1 v2/vt2 v3/vt3" — triangulate fan
+                    var it = std.mem.splitScalar(u8, line[2..], ' ');
+                    var idx: [32]u32 = undefined;
+                    var count: u32 = 0;
+                    while (it.next()) |tok| {
+                        if (tok.len == 0) continue;
+                        // Take first number before '/'
+                        var slash_it = std.mem.splitScalar(u8, tok, '/');
+                        const num_str = slash_it.next() orelse continue;
+                        const val = std.fmt.parseInt(u32, num_str, 10) catch continue;
+                        if (count < 32) {
+                            idx[count] = val - 1; // OBJ is 1-indexed
+                            count += 1;
+                        }
+                    }
+                    // Triangulate as fan
+                    var fi: u32 = 1;
+                    while (fi + 1 < count) : (fi += 1) {
+                        try faces.push(.{ idx[0], idx[fi], idx[fi + 1] });
+                    }
+                }
+            }
+        }
+
+        if (verts.len == 0) return error.EmptyMesh;
+
+        // Center and scale vertices
+        var centroid = [3]f32{ 0, 0, 0 };
+        for (verts.items[0..verts.len]) |v| {
+            centroid[0] += v[0];
+            centroid[1] += v[1];
+            centroid[2] += v[2];
+        }
+        const n: f32 = @floatFromInt(verts.len);
+        centroid[0] /= n;
+        centroid[1] /= n;
+        centroid[2] /= n;
+
+        for (verts.items[0..verts.len]) |*v| {
+            v[0] = (v[0] - centroid[0]) * scale;
+            v[1] = (v[1] - centroid[1]) * scale;
+            v[2] = (v[2] - centroid[2]) * scale;
+        }
+
+        // Write to staging
+        const vs = self.num_vertices;
+        const ts = self.num_triangles;
+        const bi = self.num_bodies;
+        const gi = self.num_geoms;
+        const num_v: u32 = verts.len;
+        const num_t: u32 = faces.len;
+
+        for (0..num_v) |i| {
+            const b = (vs + @as(u32, @intCast(i))) * 3;
+            for (0..3) |j| {
+                self.s_orig_verts[b + j] = verts.items[i][j];
+                self.s_vertices[b + j] = center[j] + verts.items[i][j];
+                self.s_colors[b + j] = color[j];
+            }
+        }
+        for (0..num_t) |i| {
+            const b = (ts + @as(u32, @intCast(i))) * 3;
+            for (0..3) |j| self.s_indices[b + j] = vs + faces.items[i][j];
+        }
+        self.num_vertices += num_v;
+        self.num_triangles += num_t;
+
+        // Body
+        const b3 = bi * 3;
+        self.s_body_pos[b3..][0..3].* = center;
+        self.s_body_quat[bi * 4 ..][0..4].* = .{ 1, 0, 0, 0 };
+        self.s_body_vel[b3..][0..3].* = .{ 0, 0, 0 };
+        self.s_body_omega[b3..][0..3].* = .{ 0, 0, 0 };
+        self.s_body_inv_mass[bi] = if (mass > 0) 1.0 / mass else 0;
+        self.s_body_vert_start[bi] = vs;
+        self.s_body_vert_count[bi] = num_v;
+
+        if (mass > 0) {
+            // Rough inertia from AABB
+            var aabb_min = [3]f32{ 1e10, 1e10, 1e10 };
+            var aabb_max = [3]f32{ -1e10, -1e10, -1e10 };
+            for (verts.items[0..verts.len]) |v| {
+                for (0..3) |j| {
+                    aabb_min[j] = @min(aabb_min[j], v[j]);
+                    aabb_max[j] = @max(aabb_max[j], v[j]);
+                }
+            }
+            const sx = aabb_max[0] - aabb_min[0];
+            const sy = aabb_max[1] - aabb_min[1];
+            const sz = aabb_max[2] - aabb_min[2];
+            self.s_body_inertia[b3 + 0] = mass / 12.0 * (sy * sy + sz * sz);
+            self.s_body_inertia[b3 + 1] = mass / 12.0 * (sx * sx + sz * sz);
+            self.s_body_inertia[b3 + 2] = mass / 12.0 * (sx * sx + sy * sy);
+            self.s_body_inv_inertia[b3 + 0] = 1.0 / self.s_body_inertia[b3 + 0];
+            self.s_body_inv_inertia[b3 + 1] = 1.0 / self.s_body_inertia[b3 + 1];
+            self.s_body_inv_inertia[b3 + 2] = 1.0 / self.s_body_inertia[b3 + 2];
+        } else {
+            self.s_body_inertia[b3..][0..3].* = .{ 0, 0, 0 };
+            self.s_body_inv_inertia[b3..][0..3].* = .{ 0, 0, 0 };
+        }
+        self.num_bodies += 1;
+
+        // Convex hull for collision
+        var hull_idx = try quickhull3d(verts.items[0..verts.len], self.alloc);
+        defer hull_idx.deinit();
+        const cs = self.num_collision_verts;
+        const num_hull: u32 = hull_idx.len;
+        for (0..num_hull) |i| {
+            const hi = hull_idx.items[i];
+            const b = (cs + @as(u32, @intCast(i))) * 3;
+            for (0..3) |j| {
+                self.s_collision_verts[b + j] = verts.items[hi][j];
+            }
+        }
+        self.num_collision_verts += num_hull;
+
+        // Geom (MESH type = 5): data = [hull_start, hull_count, 0, 0, 0, 0, 0]
+        self.s_geom_type[gi] = 5;
+        self.s_geom_body_idx[gi] = bi;
+        self.s_geom_data[gi * 7 ..][0..7].* = .{ @floatFromInt(cs), @floatFromInt(num_hull), 0, 0, 0, 0, 0 };
+        self.s_geom_friction[gi] = 0.5;
+        self.num_geoms += 1;
+
+        return bi;
+    }
+
     /// Upload all staging data to GPU
     pub fn upload(self: *Data) !void {
         const v = self.vk;
@@ -320,6 +492,8 @@ pub const Data = struct {
         try v.uploadSlice(self.geom_body_idx, u32, self.s_geom_body_idx[0..self.num_geoms]);
         try v.uploadSlice(self.geom_data, f32, self.s_geom_data[0 .. self.num_geoms * 7]);
         try v.uploadSlice(self.geom_friction, f32, self.s_geom_friction[0..self.num_geoms]);
+        if (self.num_collision_verts > 0)
+            try v.uploadSlice(self.collision_verts, f32, self.s_collision_verts[0 .. self.num_collision_verts * 3]);
     }
 
     /// Total GPU memory allocated by all buffers
@@ -331,7 +505,8 @@ pub const Data = struct {
             self.geom_type.size + self.geom_body_idx.size + self.geom_data.size + self.geom_friction.size +
             self.geom_world_pos.size + self.geom_world_quat.size + self.geom_aabb_min.size + self.geom_aabb_max.size +
             self.contact_pos.size + self.contact_normal.size + self.contact_penetration.size +
-            self.contact_geom_a.size + self.contact_geom_b.size;
+            self.contact_geom_a.size + self.contact_geom_b.size +
+            self.collision_verts.size;
     }
 
     pub fn deinit(self: *Data) void {
@@ -343,7 +518,7 @@ pub const Data = struct {
             &self.geom_type, &self.geom_body_idx, &self.geom_data, &self.geom_friction,
             &self.geom_world_pos, &self.geom_world_quat, &self.geom_aabb_min, &self.geom_aabb_max,
             &self.contact_pos, &self.contact_normal, &self.contact_penetration,
-            &self.contact_geom_a, &self.contact_geom_b,
+            &self.contact_geom_a, &self.contact_geom_b, &self.collision_verts,
         };
         for (bufs) |b| self.vk.destroyBuffer(b.*);
 
@@ -364,5 +539,6 @@ pub const Data = struct {
         self.alloc.free(self.s_geom_body_idx);
         self.alloc.free(self.s_geom_data);
         self.alloc.free(self.s_geom_friction);
+        self.alloc.free(self.s_collision_verts);
     }
 };
