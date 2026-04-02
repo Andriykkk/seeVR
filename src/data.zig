@@ -10,6 +10,7 @@ pub const MAX_VERTICES: u32 = 100_000;
 pub const MAX_TRIANGLES: u32 = 100_000;
 pub const MAX_BODIES: u32 = 1_000;
 pub const MAX_GEOMS: u32 = 2_000;
+pub const MAX_COLLISION_PAIRS: u32 = 10_000;
 pub const MAX_CONTACTS: u32 = 10_000;
 pub const MAX_COLLISION_VERTS: u32 = 50_000;
 pub const FIXED_DT: f32 = 1.0 / 60.0;
@@ -41,12 +42,18 @@ pub const Data = struct {
     // Geom: collision shapes attached to bodies, indexed by geom ID
     geom_type: Buffer, // [MAX_GEOMS] int — 1=sphere, 2=box, 5=mesh
     geom_body_idx: Buffer, // [MAX_GEOMS] uint — which body owns this geom
+    geom_local_pos: Buffer, // [MAX_GEOMS] float3 — offset from body center
+    geom_local_quat: Buffer, // [MAX_GEOMS] float4 — rotation relative to body
     geom_data: Buffer, // [MAX_GEOMS] float7 — type-specific (box: half_x/y/z, sphere: radius, ...)
     geom_friction: Buffer, // [MAX_GEOMS] float — Coulomb friction coefficient
     geom_world_pos: Buffer, // [MAX_GEOMS] float3 — cached world position (updated each frame)
     geom_world_quat: Buffer, // [MAX_GEOMS] float4 — cached world orientation
     geom_aabb_min: Buffer, // [MAX_GEOMS] float3 — axis-aligned bounding box min
     geom_aabb_max: Buffer, // [MAX_GEOMS] float3 — axis-aligned bounding box max
+
+    // Broad phase output
+    collision_pairs: Buffer, // [MAX_COLLISION_PAIRS*2] uint — pairs of geom indices (flat: a0,b0,a1,b1,...)
+    atomic_counters: Buffer, // [4] uint — [0]=num_collision_pairs, [1]=num_contacts, ...
 
     // Contact: collision results from narrow phase, indexed by contact ID
     contact_pos: Buffer, // [MAX_CONTACTS] float3 — contact point in world space
@@ -90,6 +97,8 @@ pub const Data = struct {
     s_body_vert_count: []u32,
     s_geom_type: []i32,
     s_geom_body_idx: []u32,
+    s_geom_local_pos: []f32,
+    s_geom_local_quat: []f32,
     s_geom_data: []f32,
     s_geom_friction: []f32,
     s_collision_verts: []f32,
@@ -122,12 +131,16 @@ pub const Data = struct {
             .body_vert_count = try vk_ctx.createBuffer(MAX_BODIES * @sizeOf(u32), STORAGE),
             .geom_type = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf(i32), STORAGE),
             .geom_body_idx = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf(u32), STORAGE),
+            .geom_local_pos = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf([3]f32), STORAGE),
+            .geom_local_quat = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf([4]f32), STORAGE),
             .geom_data = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf([7]f32), STORAGE),
             .geom_friction = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
             .geom_world_pos = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf([3]f32), STORAGE),
             .geom_world_quat = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf([4]f32), STORAGE),
             .geom_aabb_min = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf([3]f32), STORAGE),
             .geom_aabb_max = try vk_ctx.createBuffer(MAX_GEOMS * @sizeOf([3]f32), STORAGE),
+            .collision_pairs = try vk_ctx.createBuffer(MAX_COLLISION_PAIRS * 2 * @sizeOf(u32), STORAGE),
+            .atomic_counters = try vk_ctx.createBuffer(4 * @sizeOf(u32), STORAGE),
             .contact_pos = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf([3]f32), STORAGE),
             .contact_normal = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf([3]f32), STORAGE),
             .contact_penetration = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
@@ -165,6 +178,8 @@ pub const Data = struct {
             .s_body_vert_count = try alloc.alloc(u32, MAX_BODIES),
             .s_geom_type = try alloc.alloc(i32, MAX_GEOMS),
             .s_geom_body_idx = try alloc.alloc(u32, MAX_GEOMS),
+            .s_geom_local_pos = try alloc.alloc(f32, MAX_GEOMS * 3),
+            .s_geom_local_quat = try alloc.alloc(f32, MAX_GEOMS * 4),
             .s_geom_data = try alloc.alloc(f32, MAX_GEOMS * 7),
             .s_geom_friction = try alloc.alloc(f32, MAX_GEOMS),
             .s_collision_verts = try alloc.alloc(f32, MAX_COLLISION_VERTS * 3),
@@ -238,6 +253,8 @@ pub const Data = struct {
 
         self.s_geom_type[gi] = 2;
         self.s_geom_body_idx[gi] = bi;
+        self.s_geom_local_pos[gi * 3 ..][0..3].* = .{ 0, 0, 0 };
+        self.s_geom_local_quat[gi * 4 ..][0..4].* = .{ 1, 0, 0, 0 };
         self.s_geom_data[gi * 7 ..][0..7].* = .{ half[0], half[1], half[2], 0, 0, 0, 0 };
         self.s_geom_friction[gi] = 0.5;
         self.num_geoms += 1;
@@ -336,6 +353,8 @@ pub const Data = struct {
         // Geom
         self.s_geom_type[gi] = 1; // SPHERE
         self.s_geom_body_idx[gi] = bi;
+        self.s_geom_local_pos[gi * 3 ..][0..3].* = .{ 0, 0, 0 };
+        self.s_geom_local_quat[gi * 4 ..][0..4].* = .{ 1, 0, 0, 0 };
         self.s_geom_data[gi * 7 ..][0..7].* = .{ radius, 0, 0, 0, 0, 0, 0 };
         self.s_geom_friction[gi] = 0.5;
         self.num_geoms += 1;
@@ -496,6 +515,8 @@ pub const Data = struct {
         // Geom (MESH type = 5): data = [hull_start, hull_count, 0, 0, 0, 0, 0]
         self.s_geom_type[gi] = 5;
         self.s_geom_body_idx[gi] = bi;
+        self.s_geom_local_pos[gi * 3 ..][0..3].* = .{ 0, 0, 0 };
+        self.s_geom_local_quat[gi * 4 ..][0..4].* = .{ 1, 0, 0, 0 };
         self.s_geom_data[gi * 7 ..][0..7].* = .{ @floatFromInt(cs), @floatFromInt(num_hull), 0, 0, 0, 0, 0 };
         self.s_geom_friction[gi] = 0.5;
         self.num_geoms += 1;
@@ -521,6 +542,8 @@ pub const Data = struct {
         try v.uploadSlice(self.body_vert_count, u32, self.s_body_vert_count[0..self.num_bodies]);
         try v.uploadSlice(self.geom_type, i32, self.s_geom_type[0..self.num_geoms]);
         try v.uploadSlice(self.geom_body_idx, u32, self.s_geom_body_idx[0..self.num_geoms]);
+        try v.uploadSlice(self.geom_local_pos, f32, self.s_geom_local_pos[0 .. self.num_geoms * 3]);
+        try v.uploadSlice(self.geom_local_quat, f32, self.s_geom_local_quat[0 .. self.num_geoms * 4]);
         try v.uploadSlice(self.geom_data, f32, self.s_geom_data[0 .. self.num_geoms * 7]);
         try v.uploadSlice(self.geom_friction, f32, self.s_geom_friction[0..self.num_geoms]);
         if (self.num_collision_verts > 0)
@@ -533,9 +556,11 @@ pub const Data = struct {
             self.body_pos.size + self.body_quat.size + self.body_vel.size + self.body_omega.size +
             self.body_inv_mass.size + self.body_inertia.size + self.body_inv_inertia.size +
             self.body_vert_start.size + self.body_vert_count.size +
-            self.geom_type.size + self.geom_body_idx.size + self.geom_data.size + self.geom_friction.size +
+            self.geom_type.size + self.geom_body_idx.size + self.geom_local_pos.size + self.geom_local_quat.size +
+            self.geom_data.size + self.geom_friction.size +
             self.geom_world_pos.size + self.geom_world_quat.size + self.geom_aabb_min.size + self.geom_aabb_max.size +
             self.contact_pos.size + self.contact_normal.size + self.contact_penetration.size +
+            self.collision_pairs.size + self.atomic_counters.size +
             self.contact_geom_a.size + self.contact_geom_b.size +
             self.collision_verts.size +
             self.bvh_nodes_min.size + self.bvh_nodes_max.size +
@@ -553,9 +578,11 @@ pub const Data = struct {
             &self.body_pos, &self.body_quat, &self.body_vel, &self.body_omega,
             &self.body_inv_mass, &self.body_inertia, &self.body_inv_inertia,
             &self.body_vert_start, &self.body_vert_count,
-            &self.geom_type, &self.geom_body_idx, &self.geom_data, &self.geom_friction,
+            &self.geom_type, &self.geom_body_idx, &self.geom_local_pos, &self.geom_local_quat,
+            &self.geom_data, &self.geom_friction,
             &self.geom_world_pos, &self.geom_world_quat, &self.geom_aabb_min, &self.geom_aabb_max,
             &self.contact_pos, &self.contact_normal, &self.contact_penetration,
+            &self.collision_pairs, &self.atomic_counters,
             &self.contact_geom_a, &self.contact_geom_b, &self.collision_verts,
             &self.bvh_nodes_min, &self.bvh_nodes_max, &self.bvh_nodes_left,
             &self.bvh_nodes_right, &self.bvh_nodes_count, &self.bvh_nodes_parent,
@@ -580,6 +607,8 @@ pub const Data = struct {
         self.alloc.free(self.s_body_vert_count);
         self.alloc.free(self.s_geom_type);
         self.alloc.free(self.s_geom_body_idx);
+        self.alloc.free(self.s_geom_local_pos);
+        self.alloc.free(self.s_geom_local_quat);
         self.alloc.free(self.s_geom_data);
         self.alloc.free(self.s_geom_friction);
         self.alloc.free(self.s_collision_verts);

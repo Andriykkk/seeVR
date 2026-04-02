@@ -1,0 +1,175 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint step;
+    uint count;  // num_bodies or num_geoms depending on step
+    float dt;
+};
+
+// Body buffers
+layout(set = 0, binding = 0)  buffer BodyPos       { float body_pos[]; };
+layout(set = 0, binding = 1)  buffer BodyQuat      { float body_quat[]; };
+layout(set = 0, binding = 2)  buffer BodyVel       { float body_vel[]; };
+layout(set = 0, binding = 3)  buffer BodyOmega     { float body_omega[]; };
+layout(set = 0, binding = 4)  buffer BodyInvMass   { float body_inv_mass[]; };
+layout(set = 0, binding = 5)  buffer BodyInertia   { float body_inertia[]; };
+layout(set = 0, binding = 6)  buffer BodyInvInertia{ float body_inv_inertia[]; };
+layout(set = 0, binding = 7)  buffer BodyVertStart { uint  body_vert_start[]; };
+layout(set = 0, binding = 8)  buffer BodyVertCount { uint  body_vert_count[]; };
+
+// Geom buffers
+layout(set = 0, binding = 9)  buffer GeomType      { int   geom_type[]; };
+layout(set = 0, binding = 10) buffer GeomBodyIdx   { uint  geom_body_idx[]; };
+layout(set = 0, binding = 11) buffer GeomLocalPos  { float geom_local_pos[]; };
+layout(set = 0, binding = 12) buffer GeomLocalQuat { float geom_local_quat[]; };
+layout(set = 0, binding = 13) buffer GeomWorldPos  { float geom_world_pos[]; };
+layout(set = 0, binding = 14) buffer GeomWorldQuat { float geom_world_quat[]; };
+layout(set = 0, binding = 15) buffer GeomAabbMin   { float geom_aabb_min[]; };
+layout(set = 0, binding = 16) buffer GeomAabbMax   { float geom_aabb_max[]; };
+layout(set = 0, binding = 17) buffer GeomData      { float geom_data[]; };
+
+// Vertex data (for AABB computation)
+layout(set = 0, binding = 18) buffer Vertices      { float verts[]; };
+
+// Collision output
+layout(set = 0, binding = 19) buffer CollisionPairs { uint collision_pairs[]; }; // flat: a0,b0,a1,b1,...
+layout(set = 0, binding = 20) buffer AtomicCounters { uint counters[]; };        // [0]=num_pairs, [1]=num_contacts
+
+// --- Quaternion helpers ---
+
+vec3 quat_rotate(vec4 q, vec3 v) {
+    float w = q.x, x = q.y, y = q.z, z = q.w;
+    vec3 t = 2.0 * vec3(y*v.z - z*v.y, z*v.x - x*v.z, x*v.y - y*v.x);
+    return v + w * t + vec3(y*t.z - z*t.y, z*t.x - x*t.z, x*t.y - y*t.x);
+}
+
+vec4 quat_mul(vec4 q1, vec4 q2) {
+    return vec4(
+        q1.x*q2.x - q1.y*q2.y - q1.z*q2.z - q1.w*q2.w,
+        q1.x*q2.y + q1.y*q2.x + q1.z*q2.w - q1.w*q2.z,
+        q1.x*q2.z - q1.y*q2.w + q1.z*q2.x + q1.w*q2.y,
+        q1.x*q2.w + q1.y*q2.z - q1.z*q2.y + q1.w*q2.x
+    );
+}
+
+// --- AABB helpers ---
+
+void get_world_aabb(uint gi, out vec3 wmin, out vec3 wmax) {
+    uint bi = geom_body_idx[gi];
+    vec4 bq = vec4(body_quat[bi*4], body_quat[bi*4+1], body_quat[bi*4+2], body_quat[bi*4+3]);
+    vec3 bp = vec3(body_pos[bi*3], body_pos[bi*3+1], body_pos[bi*3+2]);
+
+    vec3 local_min = vec3(geom_aabb_min[gi*3], geom_aabb_min[gi*3+1], geom_aabb_min[gi*3+2]);
+    vec3 local_max = vec3(geom_aabb_max[gi*3], geom_aabb_max[gi*3+1], geom_aabb_max[gi*3+2]);
+    vec3 local_center = (local_min + local_max) * 0.5;
+    vec3 local_half = (local_max - local_min) * 0.5;
+
+    vec3 world_center = bp + quat_rotate(bq, local_center);
+
+    // Project rotated half-extents onto world axes
+    vec3 ex = abs(quat_rotate(bq, vec3(local_half.x, 0, 0)));
+    vec3 ey = abs(quat_rotate(bq, vec3(0, local_half.y, 0)));
+    vec3 ez = abs(quat_rotate(bq, vec3(0, 0, local_half.z)));
+    vec3 world_half = ex + ey + ez;
+
+    wmin = world_center - world_half;
+    wmax = world_center + world_half;
+}
+
+bool aabb_overlap(vec3 min_a, vec3 max_a, vec3 min_b, vec3 max_b) {
+    return !(max_a.x < min_b.x || max_b.x < min_a.x ||
+             max_a.y < min_b.y || max_b.y < min_a.y ||
+             max_a.z < min_b.z || max_b.z < min_a.z);
+}
+
+// --- Step 0: Update geom transforms ---
+
+void step_update_geom_transforms() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+
+    uint bi = geom_body_idx[i];
+    vec3 bp = vec3(body_pos[bi*3], body_pos[bi*3+1], body_pos[bi*3+2]);
+    vec4 bq = vec4(body_quat[bi*4], body_quat[bi*4+1], body_quat[bi*4+2], body_quat[bi*4+3]);
+    vec3 lp = vec3(geom_local_pos[i*3], geom_local_pos[i*3+1], geom_local_pos[i*3+2]);
+    vec4 lq = vec4(geom_local_quat[i*4], geom_local_quat[i*4+1], geom_local_quat[i*4+2], geom_local_quat[i*4+3]);
+
+    vec3 wp = bp + quat_rotate(bq, lp);
+    vec4 wq = quat_mul(bq, lq);
+
+    geom_world_pos[i*3]   = wp.x;
+    geom_world_pos[i*3+1] = wp.y;
+    geom_world_pos[i*3+2] = wp.z;
+    geom_world_quat[i*4]   = wq.x;
+    geom_world_quat[i*4+1] = wq.y;
+    geom_world_quat[i*4+2] = wq.z;
+    geom_world_quat[i*4+3] = wq.w;
+}
+
+// --- Step 1: Compute geom AABBs from vertices ---
+
+void step_compute_aabb() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+
+    uint bi = geom_body_idx[i];
+    uint vs = body_vert_start[bi];
+    uint vc = body_vert_count[bi];
+    vec3 center = vec3(body_pos[bi*3], body_pos[bi*3+1], body_pos[bi*3+2]);
+
+    vec3 amin = vec3(1e10);
+    vec3 amax = vec3(-1e10);
+    for (uint v = vs; v < vs + vc; v++) {
+        vec3 p = vec3(verts[v*3], verts[v*3+1], verts[v*3+2]);
+        amin = min(amin, p);
+        amax = max(amax, p);
+    }
+
+    // Store as local AABB (relative to center)
+    geom_aabb_min[i*3]   = amin.x - center.x;
+    geom_aabb_min[i*3+1] = amin.y - center.y;
+    geom_aabb_min[i*3+2] = amin.z - center.z;
+    geom_aabb_max[i*3]   = amax.x - center.x;
+    geom_aabb_max[i*3+1] = amax.y - center.y;
+    geom_aabb_max[i*3+2] = amax.z - center.z;
+}
+
+// --- Step 2: Broad phase (N^2 AABB overlap test) ---
+
+void step_broad_phase() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+
+    // Thread 0 clears counter
+    if (i == 0) counters[0] = 0;
+    barrier();
+    memoryBarrierBuffer();
+
+    vec3 min_a, max_a;
+    get_world_aabb(i, min_a, max_a);
+
+    for (uint j = i + 1; j < count; j++) {
+        vec3 min_b, max_b;
+        get_world_aabb(j, min_b, max_b);
+
+        if (aabb_overlap(min_a, max_a, min_b, max_b)) {
+            uint idx = atomicAdd(counters[0], 1);
+            if (idx < 10000) { // MAX_COLLISION_PAIRS
+                collision_pairs[idx * 2]     = i;
+                collision_pairs[idx * 2 + 1] = j;
+            }
+        }
+    }
+}
+
+// --- Main ---
+
+void main() {
+    switch (step) {
+        case 0: step_update_geom_transforms(); break;
+        case 1: step_compute_aabb();           break;
+        case 2: step_broad_phase();            break;
+    }
+}
