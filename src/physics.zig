@@ -27,15 +27,16 @@ pub const Physics = struct {
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator) !Physics {
         // Physics pipeline (transforms, AABBs, broad phase)
         const phys_shader = try vk.getShader("shaders/physics.comp", .compute, allocator);
-        const phys_buffers = [21]Vulkan.Buffer{
+        const phys_buffers = [22]Vulkan.Buffer{
             data.body_pos, data.body_quat, data.body_vel, data.body_omega,
             data.body_inv_mass, data.body_inertia, data.body_inv_inertia,
             data.body_vert_start, data.body_vert_count,
             data.geom_type, data.geom_body_idx, data.geom_local_pos, data.geom_local_quat,
             data.geom_world_pos, data.geom_world_quat, data.geom_aabb_min, data.geom_aabb_max,
             data.geom_data, data.vertices, data.collision_pairs, data.atomic_counters,
+            data.original_vertices,
         };
-        const physics_pipe = try vk.createComputePipeline(phys_shader, 21, &phys_buffers, @sizeOf(PhysicsPC));
+        const physics_pipe = try vk.createComputePipeline(phys_shader, 22, &phys_buffers, @sizeOf(PhysicsPC));
 
         // Narrow phase pipeline (MPR)
         const narrow_shader = try vk.getShader("shaders/narrow_phase.comp", .compute, allocator);
@@ -129,6 +130,21 @@ pub const Physics = struct {
             c.vkCmdDispatch(cmd, narrow_groups, 1, 1);
             c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
         }
+
+        // --- Back to physics pipeline for integration ---
+        c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.physics_pipe.pipeline);
+        c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.physics_pipe.layout, 0, 1, &self.physics_pipe.desc_set, 0, null);
+
+        // TODO: contact solver would go here (step between narrow phase and integration)
+
+        // Step 4: integrate bodies (pos += vel*dt)
+        pushPhysics(cmd, self.physics_pipe.layout, .{ .step = 4, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz });
+        c.vkCmdDispatch(cmd, body_groups, 1, 1);
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+
+        // Step 5: update render vertices
+        pushPhysics(cmd, self.physics_pipe.layout, .{ .step = 5, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz });
+        c.vkCmdDispatch(cmd, body_groups, 1, 1);
 
         _ = c.vkEndCommandBuffer(cmd);
 
