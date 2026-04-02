@@ -6,6 +6,7 @@ const Scene = @import("scene.zig").Scene;
 const Mode = @import("scene.zig").Mode;
 const Camera = @import("camera.zig").Camera;
 const imgui = @import("imgui.zig");
+const BVH = @import("bvh.zig").BVH;
 
 const WIDTH = 800;
 const HEIGHT = 600;
@@ -69,6 +70,9 @@ pub fn main() !void {
 
     try d.upload();
 
+    var bvh = try BVH.init(&vk_ctx, &d, allocator);
+    defer bvh.deinit();
+
     std.debug.print("Scene: {} vertices, {} triangles, {} bodies\n", .{ d.num_vertices, d.num_triangles, d.num_bodies });
 
     var camera = Camera.init(0, 5, 15, -90, -15);
@@ -85,6 +89,9 @@ pub fn main() !void {
         scene.pollEvents();
         if (window) |w| camera.update(w, dt);
         const mvp = camera.mvp(aspect);
+
+        // Build BVH each frame (needed when objects move)
+        try bvh.build(d.num_triangles);
 
         if (mode == .raster) {
             try scene.beginFrame();

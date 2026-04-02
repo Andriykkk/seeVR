@@ -58,6 +58,22 @@ pub const Data = struct {
     // Collision hull vertices (for mesh geoms, used by MPR/GJK support function)
     collision_verts: Buffer, // [MAX_COLLISION_VERTS] float3 — convex hull vertices
 
+    // BVH (for raytracing + broad phase)
+    bvh_nodes_min: Buffer, // [MAX_TRIANGLES*2] float3 — node AABB min
+    bvh_nodes_max: Buffer, // [MAX_TRIANGLES*2] float3 — node AABB max
+    bvh_nodes_left: Buffer, // [MAX_TRIANGLES*2] uint — left child / first prim
+    bvh_nodes_right: Buffer, // [MAX_TRIANGLES*2] uint — right child
+    bvh_nodes_count: Buffer, // [MAX_TRIANGLES*2] uint — 0=internal, >0=leaf
+    bvh_nodes_parent: Buffer, // [MAX_TRIANGLES*2] uint — parent index
+    bvh_prim_indices: Buffer, // [MAX_TRIANGLES] uint — sorted triangle indices
+    bvh_morton_codes: Buffer, // [MAX_TRIANGLES] uint — morton codes
+    bvh_morton_temp: Buffer, // [MAX_TRIANGLES] uint — temp for radix sort
+    bvh_sort_indices: Buffer, // [MAX_TRIANGLES] uint — sort indices
+    bvh_sort_temp: Buffer, // [MAX_TRIANGLES] uint — temp for radix sort
+    bvh_tri_centroids: Buffer, // [MAX_TRIANGLES] float3 — triangle centroids
+    bvh_flags: Buffer, // [MAX_TRIANGLES] uint — atomic flags for AABB propagation
+    bvh_scene_bounds: Buffer, // [2] float3 — scene AABB min/max
+
     // CPU staging
     s_vertices: []f32,
     s_colors: []f32,
@@ -118,6 +134,21 @@ pub const Data = struct {
             .contact_geom_a = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
             .contact_geom_b = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
             .collision_verts = try vk_ctx.createBuffer(MAX_COLLISION_VERTS * @sizeOf([3]f32), STORAGE),
+
+            .bvh_nodes_min = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE),
+            .bvh_nodes_max = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE),
+            .bvh_nodes_left = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf(u32), STORAGE),
+            .bvh_nodes_right = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf(u32), STORAGE),
+            .bvh_nodes_count = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf(u32), STORAGE),
+            .bvh_nodes_parent = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf(u32), STORAGE),
+            .bvh_prim_indices = try vk_ctx.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE),
+            .bvh_morton_codes = try vk_ctx.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE),
+            .bvh_morton_temp = try vk_ctx.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE),
+            .bvh_sort_indices = try vk_ctx.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE),
+            .bvh_sort_temp = try vk_ctx.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE),
+            .bvh_tri_centroids = try vk_ctx.createBuffer(MAX_TRIANGLES * @sizeOf([3]f32), STORAGE),
+            .bvh_flags = try vk_ctx.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE),
+            .bvh_scene_bounds = try vk_ctx.createBuffer(2 * @sizeOf([3]f32), STORAGE),
 
             .s_vertices = try alloc.alloc(f32, MAX_VERTICES * 3),
             .s_colors = try alloc.alloc(f32, MAX_VERTICES * 3),
@@ -506,7 +537,14 @@ pub const Data = struct {
             self.geom_world_pos.size + self.geom_world_quat.size + self.geom_aabb_min.size + self.geom_aabb_max.size +
             self.contact_pos.size + self.contact_normal.size + self.contact_penetration.size +
             self.contact_geom_a.size + self.contact_geom_b.size +
-            self.collision_verts.size;
+            self.collision_verts.size +
+            self.bvh_nodes_min.size + self.bvh_nodes_max.size +
+            self.bvh_nodes_left.size + self.bvh_nodes_right.size +
+            self.bvh_nodes_count.size + self.bvh_nodes_parent.size +
+            self.bvh_prim_indices.size + self.bvh_morton_codes.size +
+            self.bvh_morton_temp.size + self.bvh_sort_indices.size +
+            self.bvh_sort_temp.size + self.bvh_tri_centroids.size +
+            self.bvh_flags.size + self.bvh_scene_bounds.size;
     }
 
     pub fn deinit(self: *Data) void {
@@ -519,6 +557,11 @@ pub const Data = struct {
             &self.geom_world_pos, &self.geom_world_quat, &self.geom_aabb_min, &self.geom_aabb_max,
             &self.contact_pos, &self.contact_normal, &self.contact_penetration,
             &self.contact_geom_a, &self.contact_geom_b, &self.collision_verts,
+            &self.bvh_nodes_min, &self.bvh_nodes_max, &self.bvh_nodes_left,
+            &self.bvh_nodes_right, &self.bvh_nodes_count, &self.bvh_nodes_parent,
+            &self.bvh_prim_indices, &self.bvh_morton_codes, &self.bvh_morton_temp,
+            &self.bvh_sort_indices, &self.bvh_sort_temp, &self.bvh_tri_centroids,
+            &self.bvh_flags, &self.bvh_scene_bounds,
         };
         for (bufs) |b| self.vk.destroyBuffer(b.*);
 

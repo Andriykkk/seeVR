@@ -416,6 +416,150 @@ pub const Vulkan = struct {
         return pool;
     }
 
+    // --- Compute pipeline ---
+
+    pub const ComputePipeline = struct {
+        pipeline: c.VkPipeline,
+        layout: c.VkPipelineLayout,
+        desc_set_layout: c.VkDescriptorSetLayout,
+        desc_pool: c.VkDescriptorPool,
+        desc_set: c.VkDescriptorSet,
+    };
+
+    /// Create a compute pipeline with N storage buffer bindings + push constants
+    pub fn createComputePipeline(
+        self: *Vulkan,
+        shader: c.VkShaderModule,
+        num_bindings: u32,
+        buffers: []const Buffer,
+        push_size: u32,
+    ) !ComputePipeline {
+        // Descriptor set layout
+        var bindings: [32]c.VkDescriptorSetLayoutBinding = undefined;
+        for (0..num_bindings) |i| {
+            bindings[i] = .{
+                .binding = @intCast(i),
+                .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
+                .pImmutableSamplers = null,
+            };
+        }
+
+        var desc_layout: c.VkDescriptorSetLayout = null;
+        if (c.vkCreateDescriptorSetLayout(self.device, &c.VkDescriptorSetLayoutCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .bindingCount = num_bindings,
+            .pBindings = &bindings,
+        }, null, &desc_layout) != c.VK_SUCCESS)
+            return error.DescLayoutFailed;
+
+        // Pipeline layout
+        const push_range = c.VkPushConstantRange{
+            .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0,
+            .size = push_size,
+        };
+        var pipe_layout: c.VkPipelineLayout = null;
+        if (c.vkCreatePipelineLayout(self.device, &c.VkPipelineLayoutCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &desc_layout,
+            .pushConstantRangeCount = if (push_size > 0) 1 else 0,
+            .pPushConstantRanges = if (push_size > 0) &push_range else null,
+        }, null, &pipe_layout) != c.VK_SUCCESS)
+            return error.PipeLayoutFailed;
+
+        // Pipeline
+        var pipeline: c.VkPipeline = null;
+        if (c.vkCreateComputePipelines(self.device, null, 1, &c.VkComputePipelineCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .stage = .{
+                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = null,
+                .flags = 0,
+                .stage = c.VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = shader,
+                .pName = "main",
+                .pSpecializationInfo = null,
+            },
+            .layout = pipe_layout,
+            .basePipelineHandle = null,
+            .basePipelineIndex = -1,
+        }, null, &pipeline) != c.VK_SUCCESS)
+            return error.ComputePipeFailed;
+
+        // Descriptor pool + set
+        const pool_size = c.VkDescriptorPoolSize{
+            .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = num_bindings,
+        };
+        var desc_pool: c.VkDescriptorPool = null;
+        if (c.vkCreateDescriptorPool(self.device, &c.VkDescriptorPoolCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        }, null, &desc_pool) != c.VK_SUCCESS)
+            return error.DescPoolFailed;
+
+        var desc_set: c.VkDescriptorSet = null;
+        _ = c.vkAllocateDescriptorSets(self.device, &c.VkDescriptorSetAllocateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &desc_layout,
+        }, &desc_set);
+
+        // Write buffer descriptors
+        var writes: [32]c.VkWriteDescriptorSet = undefined;
+        var buf_infos: [32]c.VkDescriptorBufferInfo = undefined;
+        for (0..num_bindings) |i| {
+            buf_infos[i] = .{
+                .buffer = buffers[i].handle,
+                .offset = 0,
+                .range = c.VK_WHOLE_SIZE,
+            };
+            writes[i] = .{
+                .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = null,
+                .dstSet = desc_set,
+                .dstBinding = @intCast(i),
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = null,
+                .pBufferInfo = &buf_infos[i],
+                .pTexelBufferView = null,
+            };
+        }
+        c.vkUpdateDescriptorSets(self.device, num_bindings, &writes, 0, null);
+
+        return .{
+            .pipeline = pipeline,
+            .layout = pipe_layout,
+            .desc_set_layout = desc_layout,
+            .desc_pool = desc_pool,
+            .desc_set = desc_set,
+        };
+    }
+
+    pub fn destroyComputePipeline(self: *Vulkan, cp: ComputePipeline) void {
+        c.vkDestroyPipeline(self.device, cp.pipeline, null);
+        c.vkDestroyPipelineLayout(self.device, cp.layout, null);
+        c.vkDestroyDescriptorPool(self.device, cp.desc_pool, null);
+        c.vkDestroyDescriptorSetLayout(self.device, cp.desc_set_layout, null);
+    }
+
     pub fn destroyBuffer(self: *Vulkan, buf: Buffer) void {
         c.vkDestroyBuffer(self.device, buf.handle, null);
         c.vkFreeMemory(self.device, buf.memory, null);
