@@ -26,6 +26,11 @@ pub const Scene = struct {
     swapchain_count: u32,
     extent: c.VkExtent2D,
 
+    // Depth buffer
+    depth_image: c.VkImage,
+    depth_memory: c.VkDeviceMemory,
+    depth_view: c.VkImageView,
+
     // Render pass + framebuffers
     render_pass: c.VkRenderPass,
     framebuffers: [8]c.VkFramebuffer,
@@ -57,6 +62,9 @@ pub const Scene = struct {
             .swapchain_format = c.VK_FORMAT_B8G8R8A8_SRGB,
             .swapchain_count = 0,
             .extent = .{ .width = width, .height = height },
+            .depth_image = null,
+            .depth_memory = null,
+            .depth_view = null,
             .render_pass = null,
             .framebuffers = undefined,
             .pipeline_layout = null,
@@ -147,13 +155,65 @@ pub const Scene = struct {
                 return error.ImageViewCreateFailed;
         }
 
-        // --- Render pass ---
-        if (c.vkCreateRenderPass(vk.device, &c.VkRenderPassCreateInfo{
-            .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        // --- Depth buffer ---
+        const depth_format = c.VK_FORMAT_D32_SFLOAT;
+
+        if (c.vkCreateImage(vk.device, &c.VkImageCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = null,
             .flags = 0,
-            .attachmentCount = 1,
-            .pAttachments = &c.VkAttachmentDescription{
+            .imageType = c.VK_IMAGE_TYPE_2D,
+            .format = depth_format,
+            .extent = .{ .width = self.extent.width, .height = self.extent.height, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = c.VK_SAMPLE_COUNT_1_BIT,
+            .tiling = c.VK_IMAGE_TILING_OPTIMAL,
+            .usage = c.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = null,
+            .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+        }, null, &self.depth_image) != c.VK_SUCCESS)
+            return error.DepthImageCreateFailed;
+
+        var depth_mem_reqs: c.VkMemoryRequirements = undefined;
+        c.vkGetImageMemoryRequirements(vk.device, self.depth_image, &depth_mem_reqs);
+        if (c.vkAllocateMemory(vk.device, &c.VkMemoryAllocateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = null,
+            .allocationSize = depth_mem_reqs.size,
+            .memoryTypeIndex = try vk.findMemoryType(depth_mem_reqs.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        }, null, &self.depth_memory) != c.VK_SUCCESS)
+            return error.DepthMemoryAllocFailed;
+        _ = c.vkBindImageMemory(vk.device, self.depth_image, self.depth_memory, 0);
+
+        if (c.vkCreateImageView(vk.device, &c.VkImageViewCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .image = self.depth_image,
+            .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+            .format = depth_format,
+            .components = .{
+                .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .b = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .a = c.VK_COMPONENT_SWIZZLE_IDENTITY,
+            },
+            .subresourceRange = .{
+                .aspectMask = c.VK_IMAGE_ASPECT_DEPTH_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        }, null, &self.depth_view) != c.VK_SUCCESS)
+            return error.DepthViewCreateFailed;
+
+        // --- Render pass (color + depth) ---
+        const attachments = [2]c.VkAttachmentDescription{
+            .{
                 .flags = 0,
                 .format = self.swapchain_format,
                 .samples = c.VK_SAMPLE_COUNT_1_BIT,
@@ -164,6 +224,29 @@ pub const Scene = struct {
                 .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
                 .finalLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             },
+            .{
+                .flags = 0,
+                .format = depth_format,
+                .samples = c.VK_SAMPLE_COUNT_1_BIT,
+                .loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                .stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .stencilStoreOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+                .finalLayout = c.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            },
+        };
+        const depth_ref = c.VkAttachmentReference{
+            .attachment = 1,
+            .layout = c.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
+
+        if (c.vkCreateRenderPass(vk.device, &c.VkRenderPassCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .attachmentCount = 2,
+            .pAttachments = &attachments,
             .subpassCount = 1,
             .pSubpasses = &c.VkSubpassDescription{
                 .flags = 0,
@@ -176,7 +259,7 @@ pub const Scene = struct {
                     .layout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 },
                 .pResolveAttachments = null,
-                .pDepthStencilAttachment = null,
+                .pDepthStencilAttachment = &depth_ref,
                 .preserveAttachmentCount = 0,
                 .pPreserveAttachments = null,
             },
@@ -185,15 +268,16 @@ pub const Scene = struct {
         }, null, &self.render_pass) != c.VK_SUCCESS)
             return error.RenderPassCreateFailed;
 
-        // --- Framebuffers ---
+        // --- Framebuffers (color + depth) ---
         for (0..self.swapchain_count) |i| {
+            const fb_attachments = [2]c.VkImageView{ self.swapchain_views[i], self.depth_view };
             if (c.vkCreateFramebuffer(vk.device, &c.VkFramebufferCreateInfo{
                 .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
                 .pNext = null,
                 .flags = 0,
                 .renderPass = self.render_pass,
-                .attachmentCount = 1,
-                .pAttachments = &self.swapchain_views[i],
+                .attachmentCount = 2,
+                .pAttachments = &fb_attachments,
                 .width = self.extent.width,
                 .height = self.extent.height,
                 .layers = 1,
@@ -353,7 +437,20 @@ pub const Scene = struct {
                 .pViewportState = &viewport_state,
                 .pRasterizationState = &rasterizer,
                 .pMultisampleState = &multisampling,
-                .pDepthStencilState = null,
+                .pDepthStencilState = &c.VkPipelineDepthStencilStateCreateInfo{
+                    .sType = c.VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                    .pNext = null,
+                    .flags = 0,
+                    .depthTestEnable = c.VK_TRUE,
+                    .depthWriteEnable = c.VK_TRUE,
+                    .depthCompareOp = c.VK_COMPARE_OP_LESS,
+                    .depthBoundsTestEnable = c.VK_FALSE,
+                    .stencilTestEnable = c.VK_FALSE,
+                    .front = std.mem.zeroes(c.VkStencilOpState),
+                    .back = std.mem.zeroes(c.VkStencilOpState),
+                    .minDepthBounds = 0,
+                    .maxDepthBounds = 1,
+                },
                 .pColorBlendState = &color_blend,
                 .pDynamicState = null,
                 .layout = self.pipeline_layout,
@@ -415,15 +512,18 @@ pub const Scene = struct {
             .pInheritanceInfo = null,
         });
 
-        const clear_color = c.VkClearValue{ .color = .{ .float32 = .{ 0.1, 0.1, 0.12, 1.0 } } };
+        const clear_values = [2]c.VkClearValue{
+            .{ .color = .{ .float32 = .{ 0.1, 0.1, 0.12, 1.0 } } },
+            .{ .depthStencil = .{ .depth = 1.0, .stencil = 0 } },
+        };
         c.vkCmdBeginRenderPass(self.cmd_buffers[f], &c.VkRenderPassBeginInfo{
             .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = null,
             .renderPass = self.render_pass,
             .framebuffer = self.framebuffers[self.current_image],
             .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent },
-            .clearValueCount = 1,
-            .pClearValues = &clear_color,
+            .clearValueCount = 2,
+            .pClearValues = &clear_values,
         }, c.VK_SUBPASS_CONTENTS_INLINE);
     }
 
@@ -504,6 +604,9 @@ pub const Scene = struct {
             c.vkDestroyImageView(dev, self.swapchain_views[i], null);
         }
 
+        if (self.depth_view != null) c.vkDestroyImageView(dev, self.depth_view, null);
+        if (self.depth_image != null) c.vkDestroyImage(dev, self.depth_image, null);
+        if (self.depth_memory != null) c.vkFreeMemory(dev, self.depth_memory, null);
         if (self.pipeline != null) c.vkDestroyPipeline(dev, self.pipeline, null);
         if (self.pipeline_layout != null) c.vkDestroyPipelineLayout(dev, self.pipeline_layout, null);
         if (self.render_pass != null) c.vkDestroyRenderPass(dev, self.render_pass, null);

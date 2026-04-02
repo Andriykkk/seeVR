@@ -284,7 +284,7 @@ pub const Vulkan = struct {
         size: usize,
     };
 
-    fn findMemoryType(self: *Vulkan, type_filter: u32, properties: c.VkMemoryPropertyFlags) !u32 {
+    pub fn findMemoryType(self: *Vulkan, type_filter: u32, properties: c.VkMemoryPropertyFlags) !u32 {
         var mem_props: c.VkPhysicalDeviceMemoryProperties = undefined;
         c.vkGetPhysicalDeviceMemoryProperties(self.physical_device, &mem_props);
         for (0..mem_props.memoryTypeCount) |i| {
