@@ -212,8 +212,8 @@ pub const Vulkan = struct {
         path_buf[path.len] = 0;
         const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-        // Try cached .spv
-        const spv_data: []u8 = if (fs.fileExists(spv_path))
+        // Try cached .spv (only if newer than source)
+        const spv_data: []u8 = if (fs.fileExists(spv_path) and !fs.isNewer(path_z, spv_path))
             try fs.readFile(spv_path, allocator)
         else blk: {
             // Compile from GLSL source

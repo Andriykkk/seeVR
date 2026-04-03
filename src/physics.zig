@@ -146,6 +146,9 @@ pub const Physics = struct {
         pushPhysics(cmd, self.physics_pipe.layout, .{ .step = 5, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz });
         c.vkCmdDispatch(cmd, body_groups, 1, 1);
 
+        // Barrier: compute writes → vertex reads
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &barrier, 0, null, 0, null);
+
         _ = c.vkEndCommandBuffer(cmd);
 
         const queue = if (vk.compute_queue != null) vk.compute_queue else vk.graphics_queue;
