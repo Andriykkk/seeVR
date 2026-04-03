@@ -1,0 +1,182 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform PC {
+    uint step;     // 0=init_lambdas, 1=solve
+    uint nc;       // number of contacts
+    float dt;
+};
+
+// Body state
+layout(set = 0, binding = 0)  buffer BodyPos       { float body_pos[]; };
+layout(set = 0, binding = 1)  buffer BodyQuat      { float body_quat[]; };
+layout(set = 0, binding = 2)  buffer BodyVel       { float body_vel[]; };
+layout(set = 0, binding = 3)  buffer BodyOmega     { float body_omega[]; };
+layout(set = 0, binding = 4)  buffer BodyInvMass   { float body_inv_mass[]; };
+layout(set = 0, binding = 5)  buffer BodyInertia   { float body_inertia[]; };
+layout(set = 0, binding = 6)  buffer BodyInvInertia{ float body_inv_inertia[]; };
+
+// Geom (for body_idx and friction)
+layout(set = 0, binding = 7)  buffer GeomBodyIdx   { uint  geom_body_idx[]; };
+layout(set = 0, binding = 8)  buffer GeomFriction  { float geom_friction[]; };
+
+// Contacts
+layout(set = 0, binding = 9)  buffer ContactPos    { float contact_pos[]; };
+layout(set = 0, binding = 10) buffer ContactNormal { float contact_normal[]; };
+layout(set = 0, binding = 11) buffer ContactPen    { float contact_pen[]; };
+layout(set = 0, binding = 12) buffer ContactGeomA  { uint  contact_geom_a[]; };
+layout(set = 0, binding = 13) buffer ContactGeomB  { uint  contact_geom_b[]; };
+layout(set = 0, binding = 14) buffer LambdaN       { float lambda_n[]; };
+layout(set = 0, binding = 15) buffer LambdaT1      { float lambda_t1[]; };
+layout(set = 0, binding = 16) buffer LambdaT2      { float lambda_t2[]; };
+
+// --- Helpers ---
+
+vec3 cross3(vec3 a, vec3 b) { return cross(a, b); }
+
+float compute_eff_mass(float inv_ma, float inv_mb, vec3 inv_ia, vec3 inv_ib,
+                       vec3 ra, vec3 rb, vec3 dir) {
+    vec3 ra_cross = cross3(ra, dir);
+    vec3 rb_cross = cross3(rb, dir);
+    vec3 ang_a = vec3(ra_cross.x * inv_ia.x, ra_cross.y * inv_ia.y, ra_cross.z * inv_ia.z);
+    vec3 ang_b = vec3(rb_cross.x * inv_ib.x, rb_cross.y * inv_ib.y, rb_cross.z * inv_ib.z);
+    return inv_ma + inv_mb + dot(cross3(ang_a, ra), dir) + dot(cross3(ang_b, rb), dir);
+}
+
+void apply_impulse(uint bi_a, uint bi_b, vec3 impulse, vec3 ra, vec3 rb,
+                   float inv_ma, float inv_mb, vec3 inv_ia, vec3 inv_ib) {
+    // Linear
+    body_vel[bi_a*3+0] += impulse.x * inv_ma;
+    body_vel[bi_a*3+1] += impulse.y * inv_ma;
+    body_vel[bi_a*3+2] += impulse.z * inv_ma;
+    body_vel[bi_b*3+0] -= impulse.x * inv_mb;
+    body_vel[bi_b*3+1] -= impulse.y * inv_mb;
+    body_vel[bi_b*3+2] -= impulse.z * inv_mb;
+
+    // Angular
+    vec3 ra_x = cross3(ra, impulse);
+    vec3 rb_x = cross3(rb, impulse);
+    body_omega[bi_a*3+0] += ra_x.x * inv_ia.x;
+    body_omega[bi_a*3+1] += ra_x.y * inv_ia.y;
+    body_omega[bi_a*3+2] += ra_x.z * inv_ia.z;
+    body_omega[bi_b*3+0] -= rb_x.x * inv_ib.x;
+    body_omega[bi_b*3+1] -= rb_x.y * inv_ib.y;
+    body_omega[bi_b*3+2] -= rb_x.z * inv_ib.z;
+}
+
+// --- Step 0: Init lambdas ---
+
+void step_init_lambdas() {
+    // Dispatch with nc threads
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= nc) return;
+    lambda_n[i] = 0.0;
+    lambda_t1[i] = 0.0;
+    lambda_t2[i] = 0.0;
+}
+
+// --- Step 1: PGS solver (serial, single thread) ---
+
+void step_solve() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    const float restitution = 0.3;
+    const float baumgarte = 0.2;
+    const float slop = 0.005;
+
+    for (int iter = 0; iter < 10; iter++) {
+        for (uint i = 0; i < nc; i++) {
+            uint ga = contact_geom_a[i];
+            uint gb = contact_geom_b[i];
+            uint bi_a = geom_body_idx[ga];
+            uint bi_b = geom_body_idx[gb];
+            float inv_ma = body_inv_mass[bi_a];
+            float inv_mb = body_inv_mass[bi_b];
+
+            if (inv_ma == 0.0 && inv_mb == 0.0) continue;
+
+            vec3 cpos = vec3(contact_pos[i*3], contact_pos[i*3+1], contact_pos[i*3+2]);
+            vec3 n = vec3(contact_normal[i*3], contact_normal[i*3+1], contact_normal[i*3+2]);
+            float pen = contact_pen[i];
+
+            vec3 pa = vec3(body_pos[bi_a*3], body_pos[bi_a*3+1], body_pos[bi_a*3+2]);
+            vec3 pb = vec3(body_pos[bi_b*3], body_pos[bi_b*3+1], body_pos[bi_b*3+2]);
+            vec3 ra = cpos - pa;
+            vec3 rb = cpos - pb;
+
+            vec3 inv_ia = vec3(body_inv_inertia[bi_a*3], body_inv_inertia[bi_a*3+1], body_inv_inertia[bi_a*3+2]);
+            vec3 inv_ib = vec3(body_inv_inertia[bi_b*3], body_inv_inertia[bi_b*3+1], body_inv_inertia[bi_b*3+2]);
+
+            // Relative velocity at contact
+            vec3 va = vec3(body_vel[bi_a*3], body_vel[bi_a*3+1], body_vel[bi_a*3+2])
+                    + cross3(vec3(body_omega[bi_a*3], body_omega[bi_a*3+1], body_omega[bi_a*3+2]), ra);
+            vec3 vb = vec3(body_vel[bi_b*3], body_vel[bi_b*3+1], body_vel[bi_b*3+2])
+                    + cross3(vec3(body_omega[bi_b*3], body_omega[bi_b*3+1], body_omega[bi_b*3+2]), rb);
+            vec3 v_rel = va - vb;
+
+            // --- Normal ---
+            float v_rel_n = dot(v_rel, n);
+            float eff_n = compute_eff_mass(inv_ma, inv_mb, inv_ia, inv_ib, ra, rb, n);
+            float bias = (baumgarte / dt) * max(pen - slop, 0.0);
+            float dlam_n = -(v_rel_n - bias) / eff_n;
+
+            if (iter == 0 && v_rel_n < -0.5)
+                dlam_n += (-restitution * v_rel_n) / eff_n;
+
+            float old_n = lambda_n[i];
+            lambda_n[i] = max(0.0, old_n + dlam_n);
+            float actual_n = lambda_n[i] - old_n;
+            apply_impulse(bi_a, bi_b, actual_n * n, ra, rb, inv_ma, inv_mb, inv_ia, inv_ib);
+
+            // --- Friction ---
+            float mu = 0.5 * (geom_friction[ga] + geom_friction[gb]);
+            float flimit = mu * lambda_n[i];
+
+            // Tangent basis
+            vec3 t1;
+            if (abs(n.y) < 0.9) t1 = normalize(cross3(vec3(0,1,0), n));
+            else                 t1 = normalize(cross3(vec3(1,0,0), n));
+            vec3 t2 = cross3(n, t1);
+
+            // Re-read velocity
+            va = vec3(body_vel[bi_a*3], body_vel[bi_a*3+1], body_vel[bi_a*3+2])
+               + cross3(vec3(body_omega[bi_a*3], body_omega[bi_a*3+1], body_omega[bi_a*3+2]), ra);
+            vb = vec3(body_vel[bi_b*3], body_vel[bi_b*3+1], body_vel[bi_b*3+2])
+               + cross3(vec3(body_omega[bi_b*3], body_omega[bi_b*3+1], body_omega[bi_b*3+2]), rb);
+            v_rel = va - vb;
+
+            // Tangent 1
+            float vt1 = dot(v_rel, t1);
+            float eff_t1 = compute_eff_mass(inv_ma, inv_mb, inv_ia, inv_ib, ra, rb, t1);
+            float dlam_t1 = -vt1 / eff_t1;
+            float old_t1 = lambda_t1[i];
+            lambda_t1[i] = clamp(old_t1 + dlam_t1, -flimit, flimit);
+            apply_impulse(bi_a, bi_b, (lambda_t1[i] - old_t1) * t1, ra, rb, inv_ma, inv_mb, inv_ia, inv_ib);
+
+            // Re-read velocity for t2
+            va = vec3(body_vel[bi_a*3], body_vel[bi_a*3+1], body_vel[bi_a*3+2])
+               + cross3(vec3(body_omega[bi_a*3], body_omega[bi_a*3+1], body_omega[bi_a*3+2]), ra);
+            vb = vec3(body_vel[bi_b*3], body_vel[bi_b*3+1], body_vel[bi_b*3+2])
+               + cross3(vec3(body_omega[bi_b*3], body_omega[bi_b*3+1], body_omega[bi_b*3+2]), rb);
+            v_rel = va - vb;
+
+            // Tangent 2
+            float vt2 = dot(v_rel, t2);
+            float eff_t2 = compute_eff_mass(inv_ma, inv_mb, inv_ia, inv_ib, ra, rb, t2);
+            float dlam_t2 = -vt2 / eff_t2;
+            float old_t2 = lambda_t2[i];
+            lambda_t2[i] = clamp(old_t2 + dlam_t2, -flimit, flimit);
+            apply_impulse(bi_a, bi_b, (lambda_t2[i] - old_t2) * t2, ra, rb, inv_ma, inv_mb, inv_ia, inv_ib);
+        }
+    }
+}
+
+// --- Main ---
+
+void main() {
+    switch (step) {
+        case 0: step_init_lambdas(); break;
+        case 1: step_solve();        break;
+    }
+}

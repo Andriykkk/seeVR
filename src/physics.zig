@@ -19,37 +19,53 @@ const NarrowPC = extern struct {
     sign1: f32,
 };
 
+const SolverPC = extern struct {
+    step: u32,
+    nc: u32,
+    dt: f32,
+};
+
 pub const Physics = struct {
     vk: *Vulkan,
     physics_pipe: Vulkan.ComputePipeline,
     narrow_pipe: Vulkan.ComputePipeline,
+    solver_pipe: Vulkan.ComputePipeline,
 
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator) !Physics {
         // Physics pipeline (transforms, AABBs, broad phase)
         const phys_shader = try vk.getShader("shaders/physics.comp", .compute, allocator);
         const phys_buffers = [22]Vulkan.Buffer{
-            data.body_pos, data.body_quat, data.body_vel, data.body_omega,
-            data.body_inv_mass, data.body_inertia, data.body_inv_inertia,
-            data.body_vert_start, data.body_vert_count,
-            data.geom_type, data.geom_body_idx, data.geom_local_pos, data.geom_local_quat,
-            data.geom_world_pos, data.geom_world_quat, data.geom_aabb_min, data.geom_aabb_max,
-            data.geom_data, data.vertices, data.collision_pairs, data.atomic_counters,
-            data.original_vertices,
+            data.body_pos,        data.body_quat,         data.body_vel,         data.body_omega,
+            data.body_inv_mass,   data.body_inertia,      data.body_inv_inertia, data.body_vert_start,
+            data.body_vert_count, data.geom_type,         data.geom_body_idx,    data.geom_local_pos,
+            data.geom_local_quat, data.geom_world_pos,    data.geom_world_quat,  data.geom_aabb_min,
+            data.geom_aabb_max,   data.geom_data,         data.vertices,         data.collision_pairs,
+            data.atomic_counters, data.original_vertices,
         };
         const physics_pipe = try vk.createComputePipeline(phys_shader, 22, &phys_buffers, @sizeOf(PhysicsPC));
 
         // Narrow phase pipeline (MPR)
         const narrow_shader = try vk.getShader("shaders/narrow_phase.comp", .compute, allocator);
         const narrow_buffers = [13]Vulkan.Buffer{
-            data.geom_type, data.geom_body_idx, data.geom_world_pos, data.geom_world_quat,
-            data.geom_data, data.collision_verts,
-            data.collision_pairs, data.atomic_counters,
-            data.contact_pos, data.contact_normal, data.contact_penetration,
-            data.contact_geom_a, data.contact_geom_b,
+            data.geom_type,      data.geom_body_idx,   data.geom_world_pos,      data.geom_world_quat,
+            data.geom_data,      data.collision_verts, data.collision_pairs,     data.atomic_counters,
+            data.contact_pos,    data.contact_normal,  data.contact_penetration, data.contact_geom_a,
+            data.contact_geom_b,
         };
         const narrow_pipe = try vk.createComputePipeline(narrow_shader, 13, &narrow_buffers, @sizeOf(NarrowPC));
 
-        return .{ .vk = vk, .physics_pipe = physics_pipe, .narrow_pipe = narrow_pipe };
+        // Solver pipeline (PGS)
+        const solver_shader = try vk.getShader("shaders/solver.comp", .compute, allocator);
+        const solver_buffers = [17]Vulkan.Buffer{
+            data.body_pos,          data.body_quat,      data.body_vel,         data.body_omega,
+            data.body_inv_mass,     data.body_inertia,   data.body_inv_inertia, data.geom_body_idx,
+            data.geom_friction,     data.contact_pos,    data.contact_normal,   data.contact_penetration,
+            data.contact_geom_a,    data.contact_geom_b, data.contact_lambda_n, data.contact_lambda_t1,
+            data.contact_lambda_t2,
+        };
+        const solver_pipe = try vk.createComputePipeline(solver_shader, 17, &solver_buffers, @sizeOf(SolverPC));
+
+        return .{ .vk = vk, .physics_pipe = physics_pipe, .narrow_pipe = narrow_pipe, .solver_pipe = solver_pipe };
     }
 
     /// Full physics step: transforms → AABBs → broad phase → narrow phase (MPR)
@@ -123,7 +139,7 @@ pub const Physics = struct {
         c.vkCmdDispatch(cmd, narrow_groups, 1, 1);
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 
-        // Step 1: perturbation (4 directions, dispatched with max_pairs as upper bound for contacts)
+        // Perturbation disabled for now
         const perturb_dirs = [4][2]f32{ .{ 1, 1 }, .{ -1, 1 }, .{ 1, -1 }, .{ -1, -1 } };
         for (perturb_dirs) |dir| {
             pushNarrow(cmd, self.narrow_pipe.layout, .{ .step = 1, .count = max_pairs, .sign0 = dir[0], .sign1 = dir[1] });
@@ -131,11 +147,25 @@ pub const Physics = struct {
             c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
         }
 
+        // --- Solver pipeline (PGS) ---
+        c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.solver_pipe.pipeline);
+        c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.solver_pipe.layout, 0, 1, &self.solver_pipe.desc_set, 0, null);
+
+        // Init lambdas (parallel)
+        const solver_pc_init = SolverPC{ .step = 0, .nc = max_pairs, .dt = dt };
+        c.vkCmdPushConstants(cmd, self.solver_pipe.layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(SolverPC), @ptrCast(&solver_pc_init));
+        c.vkCmdDispatch(cmd, @max((max_pairs + 255) / 256, 1), 1, 1);
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+
+        // Solve (serial, single thread)
+        const solver_pc_solve = SolverPC{ .step = 1, .nc = max_pairs, .dt = dt };
+        c.vkCmdPushConstants(cmd, self.solver_pipe.layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(SolverPC), @ptrCast(&solver_pc_solve));
+        c.vkCmdDispatch(cmd, 1, 1, 1);
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+
         // --- Back to physics pipeline for integration ---
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.physics_pipe.pipeline);
         c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.physics_pipe.layout, 0, 1, &self.physics_pipe.desc_set, 0, null);
-
-        // TODO: contact solver would go here (step between narrow phase and integration)
 
         // Step 4: integrate bodies (pos += vel*dt)
         pushPhysics(cmd, self.physics_pipe.layout, .{ .step = 4, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz });
@@ -179,5 +209,6 @@ pub const Physics = struct {
     pub fn deinit(self: *Physics) void {
         self.vk.destroyComputePipeline(self.physics_pipe);
         self.vk.destroyComputePipeline(self.narrow_pipe);
+        self.vk.destroyComputePipeline(self.solver_pipe);
     }
 };

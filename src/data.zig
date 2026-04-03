@@ -61,6 +61,9 @@ pub const Data = struct {
     contact_penetration: Buffer, // [MAX_CONTACTS] float — penetration depth
     contact_geom_a: Buffer, // [MAX_CONTACTS] uint — geom index A
     contact_geom_b: Buffer, // [MAX_CONTACTS] uint — geom index B
+    contact_lambda_n: Buffer, // [MAX_CONTACTS] float — accumulated normal impulse
+    contact_lambda_t1: Buffer, // [MAX_CONTACTS] float — accumulated tangent impulse 1
+    contact_lambda_t2: Buffer, // [MAX_CONTACTS] float — accumulated tangent impulse 2
 
     // Collision hull vertices (for mesh geoms, used by MPR/GJK support function)
     collision_verts: Buffer, // [MAX_COLLISION_VERTS] float3 — convex hull vertices
@@ -146,6 +149,9 @@ pub const Data = struct {
             .contact_penetration = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
             .contact_geom_a = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
             .contact_geom_b = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
+            .contact_lambda_n = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
+            .contact_lambda_t1 = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
+            .contact_lambda_t2 = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
             .collision_verts = try vk_ctx.createBuffer(MAX_COLLISION_VERTS * @sizeOf([3]f32), STORAGE),
 
             .bvh_nodes_min = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE),
@@ -562,6 +568,7 @@ pub const Data = struct {
             self.contact_pos.size + self.contact_normal.size + self.contact_penetration.size +
             self.collision_pairs.size + self.atomic_counters.size +
             self.contact_geom_a.size + self.contact_geom_b.size +
+            self.contact_lambda_n.size + self.contact_lambda_t1.size + self.contact_lambda_t2.size +
             self.collision_verts.size +
             self.bvh_nodes_min.size + self.bvh_nodes_max.size +
             self.bvh_nodes_left.size + self.bvh_nodes_right.size +
@@ -583,7 +590,9 @@ pub const Data = struct {
             &self.geom_world_pos, &self.geom_world_quat, &self.geom_aabb_min, &self.geom_aabb_max,
             &self.contact_pos, &self.contact_normal, &self.contact_penetration,
             &self.collision_pairs, &self.atomic_counters,
-            &self.contact_geom_a, &self.contact_geom_b, &self.collision_verts,
+            &self.contact_geom_a, &self.contact_geom_b,
+            &self.contact_lambda_n, &self.contact_lambda_t1, &self.contact_lambda_t2,
+            &self.collision_verts,
             &self.bvh_nodes_min, &self.bvh_nodes_max, &self.bvh_nodes_left,
             &self.bvh_nodes_right, &self.bvh_nodes_count, &self.bvh_nodes_parent,
             &self.bvh_prim_indices, &self.bvh_morton_codes, &self.bvh_morton_temp,
