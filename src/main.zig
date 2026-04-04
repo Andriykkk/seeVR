@@ -8,6 +8,7 @@ const Camera = @import("camera.zig").Camera;
 const imgui = @import("imgui.zig");
 const BVH = @import("bvh.zig").BVH;
 const Physics = @import("physics.zig").Physics;
+const Debug = @import("debug.zig").Debug;
 
 const WIDTH = 800;
 const HEIGHT = 600;
@@ -77,6 +78,9 @@ pub fn main() !void {
     var physics = try Physics.init(&vk_ctx, &d, allocator);
     defer physics.deinit();
 
+    var dbg = try Debug.init(&vk_ctx, &d, allocator);
+    defer dbg.deinit();
+
     std.debug.print("Scene: {} vertices, {} triangles, {} bodies\n", .{ d.num_vertices, d.num_triangles, d.num_bodies });
 
     var camera = Camera.init(0, 5, 15, -90, -15);
@@ -114,6 +118,10 @@ pub fn main() !void {
             try scene.beginFrame();
             scene.draw(&d, &mvp);
 
+            // Debug lines
+            try dbg.buildLines(&d);
+            scene.drawDebugLines(dbg.line_verts.handle, dbg.line_colors.handle, dbg.num_lines, &mvp);
+
             // ImGui overlay
             imgui.newFrame();
             if (imgui.begin("Debug")) {
@@ -136,6 +144,7 @@ pub fn main() !void {
 
                 imgui.end();
             }
+            dbg.drawGui();
             imgui.render();
             imgui.renderDrawData(scene.cmd_buffers[scene.current_frame]);
 

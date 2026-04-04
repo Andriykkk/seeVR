@@ -38,6 +38,7 @@ pub const Scene = struct {
     // Raster pipeline
     pipeline_layout: c.VkPipelineLayout,
     pipeline: c.VkPipeline,
+    debug_pipeline: c.VkPipeline, // LINE_LIST, no depth test
 
     // Command buffers
     cmd_buffers: [MAX_FRAMES_IN_FLIGHT]c.VkCommandBuffer,
@@ -69,6 +70,7 @@ pub const Scene = struct {
             .framebuffers = undefined,
             .pipeline_layout = null,
             .pipeline = null,
+            .debug_pipeline = null,
             .cmd_buffers = undefined,
             .image_available = undefined,
             .render_finished = undefined,
@@ -460,6 +462,63 @@ pub const Scene = struct {
                 .basePipelineIndex = -1,
             }, null, &self.pipeline) != c.VK_SUCCESS)
                 return error.PipelineCreateFailed;
+
+            // Debug line pipeline: LINE_LIST, no depth test, no cull
+            if (c.vkCreateGraphicsPipelines(vk.device, null, 1, &c.VkGraphicsPipelineCreateInfo{
+                .sType = c.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                .pNext = null,
+                .flags = 0,
+                .stageCount = 2,
+                .pStages = &shader_stages,
+                .pVertexInputState = &vertex_input,
+                .pInputAssemblyState = &c.VkPipelineInputAssemblyStateCreateInfo{
+                    .sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                    .pNext = null,
+                    .flags = 0,
+                    .topology = c.VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+                    .primitiveRestartEnable = c.VK_FALSE,
+                },
+                .pTessellationState = null,
+                .pViewportState = &viewport_state,
+                .pRasterizationState = &c.VkPipelineRasterizationStateCreateInfo{
+                    .sType = c.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                    .pNext = null,
+                    .flags = 0,
+                    .depthClampEnable = c.VK_FALSE,
+                    .rasterizerDiscardEnable = c.VK_FALSE,
+                    .polygonMode = c.VK_POLYGON_MODE_FILL,
+                    .cullMode = c.VK_CULL_MODE_NONE,
+                    .frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE,
+                    .depthBiasEnable = c.VK_FALSE,
+                    .depthBiasConstantFactor = 0,
+                    .depthBiasClamp = 0,
+                    .depthBiasSlopeFactor = 0,
+                    .lineWidth = 2.0,
+                },
+                .pMultisampleState = &multisampling,
+                .pDepthStencilState = &c.VkPipelineDepthStencilStateCreateInfo{
+                    .sType = c.VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                    .pNext = null,
+                    .flags = 0,
+                    .depthTestEnable = c.VK_FALSE,
+                    .depthWriteEnable = c.VK_FALSE,
+                    .depthCompareOp = c.VK_COMPARE_OP_ALWAYS,
+                    .depthBoundsTestEnable = c.VK_FALSE,
+                    .stencilTestEnable = c.VK_FALSE,
+                    .front = std.mem.zeroes(c.VkStencilOpState),
+                    .back = std.mem.zeroes(c.VkStencilOpState),
+                    .minDepthBounds = 0,
+                    .maxDepthBounds = 1,
+                },
+                .pColorBlendState = &color_blend,
+                .pDynamicState = null,
+                .layout = self.pipeline_layout,
+                .renderPass = self.render_pass,
+                .subpass = 0,
+                .basePipelineHandle = null,
+                .basePipelineIndex = -1,
+            }, null, &self.debug_pipeline) != c.VK_SUCCESS)
+                return error.PipelineCreateFailed;
         }
 
         // --- Command buffers ---
@@ -547,6 +606,20 @@ pub const Scene = struct {
         c.vkCmdDrawIndexed(cmd, d.num_triangles * 3, 1, 0, 0, 0);
     }
 
+    /// Draw debug lines (no depth test, on top of everything)
+    pub fn drawDebugLines(self: *Scene, line_verts: c.VkBuffer, line_colors: c.VkBuffer, num_lines: u32, mvp: *const [16]f32) void {
+        if (num_lines == 0) return;
+        const cmd = self.cmd_buffers[self.current_frame];
+
+        c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.debug_pipeline);
+        c.vkCmdPushConstants(cmd, self.pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, 64, @ptrCast(mvp));
+
+        const bufs = [2]c.VkBuffer{ line_verts, line_colors };
+        const offs = [2]c.VkDeviceSize{ 0, 0 };
+        c.vkCmdBindVertexBuffers(cmd, 0, 2, &bufs, &offs);
+        c.vkCmdDraw(cmd, num_lines * 2, 1, 0, 0); // 2 vertices per line
+    }
+
     pub fn endFrame(self: *Scene) !void {
         const cmd = self.cmd_buffers[self.current_frame];
 
@@ -607,6 +680,7 @@ pub const Scene = struct {
         if (self.depth_view != null) c.vkDestroyImageView(dev, self.depth_view, null);
         if (self.depth_image != null) c.vkDestroyImage(dev, self.depth_image, null);
         if (self.depth_memory != null) c.vkFreeMemory(dev, self.depth_memory, null);
+        if (self.debug_pipeline != null) c.vkDestroyPipeline(dev, self.debug_pipeline, null);
         if (self.pipeline != null) c.vkDestroyPipeline(dev, self.pipeline, null);
         if (self.pipeline_layout != null) c.vkDestroyPipelineLayout(dev, self.pipeline_layout, null);
         if (self.render_pass != null) c.vkDestroyRenderPass(dev, self.render_pass, null);
