@@ -186,18 +186,18 @@ pub const Data = struct {
             .body_inv_inertia_world = try vk_ctx.createBuffer(MAX_BODIES * 9 * @sizeOf(f32), STORAGE),
             .solver_qacc = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
             .solver_Ma = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
-            .solver_jacobian = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * 12 * @sizeOf(f32), STORAGE),
-            .solver_efc_D = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * @sizeOf(f32), STORAGE),
-            .solver_efc_force = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * @sizeOf(f32), STORAGE),
-            .solver_aref = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * @sizeOf(f32), STORAGE),
-            .solver_Jaref = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * @sizeOf(f32), STORAGE),
+            .solver_jacobian = try vk_ctx.createBuffer(MAX_CONTACTS * 4 * 12 * @sizeOf(f32), STORAGE),
+            .solver_efc_D = try vk_ctx.createBuffer(MAX_CONTACTS * 4 * @sizeOf(f32), STORAGE),
+            .solver_efc_force = try vk_ctx.createBuffer(MAX_CONTACTS * 4 * @sizeOf(f32), STORAGE),
+            .solver_aref = try vk_ctx.createBuffer(MAX_CONTACTS * 4 * @sizeOf(f32), STORAGE),
+            .solver_Jaref = try vk_ctx.createBuffer(MAX_CONTACTS * 4 * @sizeOf(f32), STORAGE),
             .solver_hessian = try vk_ctx.createBuffer(MAX_BODIES * 36 * @sizeOf(f32), STORAGE),
             .solver_cholesky = try vk_ctx.createBuffer(MAX_BODIES * 36 * @sizeOf(f32), STORAGE),
             .solver_gradient = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
             .solver_search = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
             .solver_qfrc = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
             .solver_mv = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
-            .solver_jv = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
+            .solver_jv = try vk_ctx.createBuffer(MAX_CONTACTS * 4 * @sizeOf(f32), STORAGE),
             .collision_verts = try vk_ctx.createBuffer(MAX_COLLISION_VERTS * @sizeOf([3]f32), STORAGE),
 
             .bvh_nodes_min = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE),
@@ -602,82 +602,30 @@ pub const Data = struct {
             try v.uploadSlice(self.collision_verts, f32, self.s_collision_verts[0 .. self.num_collision_verts * 3]);
     }
 
-    /// Total GPU memory allocated by all buffers
     pub fn gpuMemoryBytes(self: *const Data) usize {
-        return self.vertices.size + self.colors.size + self.indices.size + self.original_vertices.size +
-            self.body_pos.size + self.body_quat.size + self.body_vel.size + self.body_omega.size +
-            self.body_inv_mass.size + self.body_inertia.size + self.body_inv_inertia.size +
-            self.body_vert_start.size + self.body_vert_count.size +
-            self.geom_type.size + self.geom_body_idx.size + self.geom_local_pos.size + self.geom_local_quat.size +
-            self.geom_data.size + self.geom_friction.size +
-            self.geom_world_pos.size + self.geom_world_quat.size + self.geom_aabb_min.size + self.geom_aabb_max.size +
-            self.contact_pos.size + self.contact_normal.size + self.contact_penetration.size +
-            self.collision_pairs.size + self.atomic_counters.size +
-            self.contact_geom_a.size + self.contact_geom_b.size +
-            self.contact_lambda_n.size + self.contact_lambda_t1.size + self.contact_lambda_t2.size +
-            self.body_inv_inertia_world.size +
-            self.solver_qacc.size + self.solver_Ma.size + self.solver_jacobian.size +
-            self.solver_efc_D.size + self.solver_efc_force.size + self.solver_aref.size +
-            self.solver_Jaref.size + self.solver_hessian.size + self.solver_cholesky.size +
-            self.solver_gradient.size + self.solver_search.size + self.solver_qfrc.size +
-            self.solver_mv.size + self.solver_jv.size +
-            self.collision_verts.size +
-            self.bvh_nodes_min.size + self.bvh_nodes_max.size +
-            self.bvh_nodes_left.size + self.bvh_nodes_right.size +
-            self.bvh_nodes_count.size + self.bvh_nodes_parent.size +
-            self.bvh_prim_indices.size + self.bvh_morton_codes.size +
-            self.bvh_morton_temp.size + self.bvh_sort_indices.size +
-            self.bvh_sort_temp.size + self.bvh_tri_centroids.size +
-            self.bvh_flags.size + self.bvh_scene_bounds.size;
+        var total: usize = 0;
+        inline for (@typeInfo(Data).@"struct".fields) |field| {
+            if (field.type == Buffer) {
+                total += @field(self, field.name).size;
+            }
+        }
+        return total;
     }
 
     pub fn deinit(self: *Data) void {
-        const bufs = &[_]*Buffer{
-            &self.vertices, &self.colors, &self.indices, &self.original_vertices,
-            &self.body_pos, &self.body_quat, &self.body_vel, &self.body_omega,
-            &self.body_inv_mass, &self.body_inertia, &self.body_inv_inertia,
-            &self.body_vert_start, &self.body_vert_count,
-            &self.geom_type, &self.geom_body_idx, &self.geom_local_pos, &self.geom_local_quat,
-            &self.geom_data, &self.geom_friction,
-            &self.geom_world_pos, &self.geom_world_quat, &self.geom_aabb_min, &self.geom_aabb_max,
-            &self.contact_pos, &self.contact_normal, &self.contact_penetration,
-            &self.collision_pairs, &self.atomic_counters,
-            &self.contact_geom_a, &self.contact_geom_b,
-            &self.contact_lambda_n, &self.contact_lambda_t1, &self.contact_lambda_t2,
-            &self.body_inv_inertia_world,
-            &self.solver_qacc, &self.solver_Ma, &self.solver_jacobian,
-            &self.solver_efc_D, &self.solver_efc_force, &self.solver_aref,
-            &self.solver_Jaref, &self.solver_hessian, &self.solver_cholesky,
-            &self.solver_gradient, &self.solver_search, &self.solver_qfrc,
-            &self.solver_mv, &self.solver_jv,
-            &self.collision_verts,
-            &self.bvh_nodes_min, &self.bvh_nodes_max, &self.bvh_nodes_left,
-            &self.bvh_nodes_right, &self.bvh_nodes_count, &self.bvh_nodes_parent,
-            &self.bvh_prim_indices, &self.bvh_morton_codes, &self.bvh_morton_temp,
-            &self.bvh_sort_indices, &self.bvh_sort_temp, &self.bvh_tri_centroids,
-            &self.bvh_flags, &self.bvh_scene_bounds,
-        };
-        for (bufs) |b| self.vk.destroyBuffer(b.*);
+        inline for (@typeInfo(Data).@"struct".fields) |field| {
+            if (field.type == Buffer) {
+                self.vk.destroyBuffer(@field(self, field.name));
+            } else if (comptime isSlice(field.type)) {
+                self.alloc.free(@field(self, field.name));
+            }
+        }
+    }
 
-        self.alloc.free(self.s_vertices);
-        self.alloc.free(self.s_colors);
-        self.alloc.free(self.s_indices);
-        self.alloc.free(self.s_orig_verts);
-        self.alloc.free(self.s_body_pos);
-        self.alloc.free(self.s_body_quat);
-        self.alloc.free(self.s_body_vel);
-        self.alloc.free(self.s_body_omega);
-        self.alloc.free(self.s_body_inv_mass);
-        self.alloc.free(self.s_body_inertia);
-        self.alloc.free(self.s_body_inv_inertia);
-        self.alloc.free(self.s_body_vert_start);
-        self.alloc.free(self.s_body_vert_count);
-        self.alloc.free(self.s_geom_type);
-        self.alloc.free(self.s_geom_body_idx);
-        self.alloc.free(self.s_geom_local_pos);
-        self.alloc.free(self.s_geom_local_quat);
-        self.alloc.free(self.s_geom_data);
-        self.alloc.free(self.s_geom_friction);
-        self.alloc.free(self.s_collision_verts);
+    fn isSlice(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .pointer => |p| p.size == .slice,
+            else => false,
+        };
     }
 };

@@ -18,7 +18,7 @@ cost(qacc) = 0.5 * (qacc - qacc_smooth)^T * M * (qacc - qacc_smooth)
 
 ---
 
-## Step 0: Collision Detection (before solver)
+<!-- ## Step 0: Collision Detection (before solver)
 
 Broad phase + narrow phase produces contacts, each with:
 `pos`, `normal`, `penetration`, `link_a`, `link_b`, `friction`, `sol_params`
@@ -29,7 +29,7 @@ Collision code: `Genesis/genesis/engine/solvers/rigid/collider/`
 - `epa.py` — EPA for penetration depth
 - `mpr.py` — Minkowski Portal Refinement
 
----
+--- -->
 
 ## Step 1: Build Constraints
 

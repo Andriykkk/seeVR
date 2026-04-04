@@ -12,6 +12,11 @@ const PhysicsPC = extern struct {
     gravity_z: f32,
 };
 
+const ConstraintPC = extern struct {
+    num_contacts: u32,
+    dt: f32,
+};
+
 const NarrowPC = extern struct {
     step: u32,
     count: u32,
@@ -29,6 +34,7 @@ pub const Physics = struct {
     vk: *Vulkan,
     physics_pipe: Vulkan.ComputePipeline,
     narrow_pipe: Vulkan.ComputePipeline,
+    constraint_pipe: Vulkan.ComputePipeline,
     solver_pipe: Vulkan.ComputePipeline,
 
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator) !Physics {
@@ -53,6 +59,29 @@ pub const Physics = struct {
             data.contact_geom_b,
         };
         const narrow_pipe = try vk.createComputePipeline(narrow_shader, 13, &narrow_buffers, @sizeOf(NarrowPC));
+
+        // Constraint building pipeline (16 bindings matching constraints.comp)
+        const constraint_shader = try vk.getShader("shaders/constraints.comp", .compute, allocator);
+        const constraint_buffers = [17]Vulkan.Buffer{
+            data.contact_pos,           // 0
+            data.contact_normal,        // 1
+            data.contact_penetration,   // 2
+            data.contact_geom_a,        // 3
+            data.contact_geom_b,        // 4
+            data.body_pos,              // 5
+            data.body_vel,              // 6
+            data.body_omega,            // 7
+            data.body_inv_mass,         // 8
+            data.body_inv_inertia_world, // 9
+            data.geom_body_idx,         // 10
+            data.geom_friction,         // 11
+            data.solver_jacobian,       // 12
+            data.solver_aref,           // 13
+            data.solver_efc_D,          // 14
+            data.solver_efc_force,      // 15
+            data.atomic_counters,       // 16
+        };
+        const constraint_pipe = try vk.createComputePipeline(constraint_shader, 17, &constraint_buffers, @sizeOf(ConstraintPC));
 
         // Newton solver pipeline (29 bindings matching solver.comp)
         const solver_shader = try vk.getShader("shaders/solver.comp", .compute, allocator);
@@ -89,7 +118,7 @@ pub const Physics = struct {
         };
         const solver_pipe = try vk.createComputePipeline(solver_shader, 29, &solver_buffers, @sizeOf(SolverPC));
 
-        return .{ .vk = vk, .physics_pipe = physics_pipe, .narrow_pipe = narrow_pipe, .solver_pipe = solver_pipe };
+        return .{ .vk = vk, .physics_pipe = physics_pipe, .narrow_pipe = narrow_pipe, .constraint_pipe = constraint_pipe, .solver_pipe = solver_pipe };
     }
 
     /// Full physics step: transforms → AABBs → broad phase → narrow phase (MPR)
@@ -166,6 +195,15 @@ pub const Physics = struct {
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 
         // Perturbation disabled for now
+
+        // --- Build constraints (friction pyramid, Jacobian, aref, efc_D) ---
+        c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.constraint_pipe.pipeline);
+        c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.constraint_pipe.layout, 0, 1, &self.constraint_pipe.desc_set, 0, null);
+
+        const constraint_pc = ConstraintPC{ .num_contacts = max_pairs, .dt = dt };
+        c.vkCmdPushConstants(cmd, self.constraint_pipe.layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ConstraintPC), @ptrCast(&constraint_pc));
+        c.vkCmdDispatch(cmd, @max((max_pairs + 255) / 256, 1), 1, 1);
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 
         // --- Newton solver pipeline ---
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.solver_pipe.pipeline);
@@ -267,6 +305,7 @@ pub const Physics = struct {
     pub fn deinit(self: *Physics) void {
         self.vk.destroyComputePipeline(self.physics_pipe);
         self.vk.destroyComputePipeline(self.narrow_pipe);
+        self.vk.destroyComputePipeline(self.constraint_pipe);
         self.vk.destroyComputePipeline(self.solver_pipe);
     }
 };

@@ -146,11 +146,6 @@ void step_broad_phase() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= count) return;
 
-    // Thread 0 clears counter
-    if (i == 0) counters[0] = 0;
-    barrier();
-    memoryBarrierBuffer();
-
     vec3 min_a, max_a;
     get_world_aabb(i, min_a, max_a);
 
@@ -175,6 +170,16 @@ void step_apply_gravity() {
     if (i >= count) return;
     if (body_inv_mass[i] <= 0.0) return;
 
+    // Velocity damping (kills micro-oscillations)
+    const float damping = 0.998;
+    body_vel[i*3+0] *= damping;
+    body_vel[i*3+1] *= damping;
+    body_vel[i*3+2] *= damping;
+    body_omega[i*3+0] *= damping;
+    body_omega[i*3+1] *= damping;
+    body_omega[i*3+2] *= damping;
+
+    // Gravity
     body_vel[i*3+0] += gravity_x * dt;
     body_vel[i*3+1] += gravity_y * dt;
     body_vel[i*3+2] += gravity_z * dt;
@@ -228,6 +233,14 @@ void step_update_render_vertices() {
     }
 }
 
+// --- Step 6: Clear counters ---
+
+void step_clear_counters() {
+    if (gl_GlobalInvocationID.x != 0) return;
+    counters[0] = 0; // num_pairs
+    counters[1] = 0; // num_contacts
+}
+
 // --- Main ---
 
 void main() {
@@ -238,5 +251,6 @@ void main() {
         case 3: step_apply_gravity();          break;
         case 4: step_integrate();              break;
         case 5: step_update_render_vertices(); break;
+        case 6: step_clear_counters();         break;
     }
 }
