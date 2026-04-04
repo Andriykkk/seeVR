@@ -59,7 +59,9 @@ vec4 get_world_quat(uint gi) {
 vec3 support_sphere(uint gi, vec3 dir) {
     vec3 pos = get_world_pos(gi);
     float r = geom_data[gi*7];
-    return pos + normalize(dir) * r;
+    float l = length(dir);
+    if (l < 1e-10) return pos;
+    return pos + (dir / l) * r;
 }
 
 vec3 support_box(uint gi, vec3 dir) {
@@ -67,9 +69,9 @@ vec3 support_box(uint gi, vec3 dir) {
     vec4 q = get_world_quat(gi);
     vec3 d_local = quat_rotate(quat_conj(q), dir);
     vec3 corner = vec3(
-        sign(d_local.x) * geom_data[gi*7+0],
-        sign(d_local.y) * geom_data[gi*7+1],
-        sign(d_local.z) * geom_data[gi*7+2]);
+        (d_local.x >= 0.0 ? 1.0 : -1.0) * geom_data[gi*7+0],
+        (d_local.y >= 0.0 ? 1.0 : -1.0) * geom_data[gi*7+1],
+        (d_local.z >= 0.0 ? 1.0 : -1.0) * geom_data[gi*7+2]);
     return pos + quat_rotate(q, corner);
 }
 
@@ -103,6 +105,55 @@ void compute_support(vec3 dir, uint ga, uint gb,
     va = support(ga, dir);
     vb = support(gb, -dir);
     v = va - vb;
+}
+
+// --- Point-to-triangle closest distance (for penetration depth) ---
+
+float point_segment_dist2(vec3 P, vec3 A, vec3 B, out vec3 closest) {
+    vec3 AB = B - A;
+    vec3 AP = P - A;
+    float AB_AB = dot(AB, AB);
+    float t = dot(AP, AB) / AB_AB;
+    t = clamp(t, 0.0, 1.0);
+    closest = A + AB * t;
+    vec3 d = P - closest;
+    return dot(d, d);
+}
+
+float point_tri_depth(vec3 P, vec3 x0, vec3 B, vec3 C, out vec3 pdir) {
+    vec3 d1 = B - x0;
+    vec3 d2 = C - x0;
+    vec3 a = x0 - P;
+    float v = dot(d1, d1);
+    float w = dot(d2, d2);
+    float p = dot(a, d1);
+    float q = dot(a, d2);
+    float r = dot(d1, d2);
+
+    float det = w * v - r * r;
+    float s, t;
+    if (abs(det) < MPR_EPS) {
+        s = -1.0; t = -1.0;
+    } else {
+        s = (q * r - w * p) / det;
+        t = (-s * r - q) / w;
+    }
+
+    float dist;
+    if (s > -MPR_EPS && s < 1.0 + MPR_EPS &&
+        t > -MPR_EPS && t < 1.0 + MPR_EPS &&
+        t + s < 1.0 + MPR_EPS) {
+        pdir = x0 + d1 * s + d2 * t;
+        dist = dot(P - pdir, P - pdir);
+    } else {
+        dist = point_segment_dist2(P, x0, B, pdir);
+        vec3 pdir2;
+        float dist2 = point_segment_dist2(P, x0, C, pdir2);
+        if (dist2 < dist) { dist = dist2; pdir = pdir2; }
+        dist2 = point_segment_dist2(P, B, C, pdir2);
+        if (dist2 < dist) { dist = dist2; pdir = pdir2; }
+    }
+    return sqrt(dist);
 }
 
 // --- MPR portal helpers ---
@@ -232,8 +283,9 @@ void mpr_collide(uint ga, uint gb,
         vec3 v4, v4a, v4b; compute_support(dir, ga, gb, v4, v4a, v4b);
         if (portal_reach_tol(v1,v2,v3,v4,dir) || i == MPR_MAX_ITER-1) {
             is_col = 1;
-            pen = dot(dir, v1);
-            normal = -dir;
+            vec3 pdir;
+            pen = point_tri_depth(vec3(0), v1, v2, v3, pdir);
+            normal = -normalize(pdir);
             pos = mpr_find_pos(v0,v1,v2,v3, v0a,v1a,v2a,v3a, v0b,v1b,v2b,v3b);
             return;
         }
@@ -281,11 +333,8 @@ void add_contact(vec3 pos, vec3 normal, float pen, uint ga, uint gb) {
 
 void step_narrow_phase() {
     uint i = gl_GlobalInvocationID.x;
-    if (i == 0) counters[1] = 0;
-    barrier();
-    memoryBarrierBuffer();
-
-    if (i >= count) return;
+    uint actual_pairs = counters[0];
+    if (i >= actual_pairs) return;
 
     uint ga = pairs[i*2];
     uint gb = pairs[i*2+1];

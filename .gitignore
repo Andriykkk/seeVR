@@ -10,6 +10,8 @@ CoACD/
 /models
 src/models/*
 
+imgui.ini
+
 # Python
 __pycache__/
 *.py[cod]

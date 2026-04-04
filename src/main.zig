@@ -94,9 +94,21 @@ pub fn main() !void {
         if (window) |w| camera.update(w, dt);
         const mvp = camera.mvp(aspect);
 
-        // Physics: update transforms → compute AABBs → broad phase
-        try physics.step(d.num_bodies, d.num_geoms, dt, .{ 0, -9.81, 0 });
+        // Physics
+        const phys_dt: f32 = 1.0 / 60.0; // fixed timestep for stability
+        try physics.step(d.num_bodies, d.num_geoms, phys_dt, .{ 0, -9.81, 0 });
         try bvh.build(d.num_triangles);
+
+        // Debug: print counters every 60 frames
+        if (@as(u32, @intFromFloat(fps_smooth)) > 0 and @mod(@as(u32, @intFromFloat(c.glfwGetTime() * 2)), 2) == 0) {
+            const counters = physics.readCounters(&d) catch .{ 0, 0 };
+            if (counters[1] > 0) {
+                const ct = physics.readFirstContact(&d) catch continue;
+                std.debug.print("pairs={} contacts={} n=({d:.3},{d:.3},{d:.3}) pen={d:.4} ga={} gb={}\n", .{
+                    counters[0], counters[1], ct.normal[0], ct.normal[1], ct.normal[2], ct.pen, ct.ga, ct.gb,
+                });
+            }
+        }
 
         if (mode == .raster) {
             try scene.beginFrame();

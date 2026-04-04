@@ -21,7 +21,7 @@ const NarrowPC = extern struct {
 
 const SolverPC = extern struct {
     step: u32,
-    nc: u32,
+    count: u32,
     dt: f32,
 };
 
@@ -54,16 +54,40 @@ pub const Physics = struct {
         };
         const narrow_pipe = try vk.createComputePipeline(narrow_shader, 13, &narrow_buffers, @sizeOf(NarrowPC));
 
-        // Solver pipeline (PGS)
+        // Newton solver pipeline (29 bindings matching solver.comp)
         const solver_shader = try vk.getShader("shaders/solver.comp", .compute, allocator);
-        const solver_buffers = [17]Vulkan.Buffer{
-            data.body_pos,          data.body_quat,      data.body_vel,         data.body_omega,
-            data.body_inv_mass,     data.body_inertia,   data.body_inv_inertia, data.geom_body_idx,
-            data.geom_friction,     data.contact_pos,    data.contact_normal,   data.contact_penetration,
-            data.contact_geom_a,    data.contact_geom_b, data.contact_lambda_n, data.contact_lambda_t1,
-            data.contact_lambda_t2,
+        const solver_buffers = [29]Vulkan.Buffer{
+            data.body_pos,              // 0
+            data.body_quat,             // 1
+            data.body_vel,              // 2
+            data.body_omega,            // 3
+            data.body_inv_mass,         // 4
+            data.body_inv_inertia,      // 5
+            data.body_inv_inertia_world, // 6
+            data.geom_body_idx,         // 7
+            data.geom_friction,         // 8
+            data.contact_pos,           // 9
+            data.contact_normal,        // 10
+            data.contact_penetration,   // 11
+            data.contact_geom_a,        // 12
+            data.contact_geom_b,        // 13
+            data.solver_qacc,           // 14
+            data.solver_jacobian,       // 15
+            data.solver_efc_D,          // 16
+            data.solver_efc_force,      // 17
+            data.solver_aref,           // 18
+            data.solver_Jaref,          // 19
+            data.solver_hessian,        // 20
+            data.solver_cholesky,       // 21
+            data.solver_gradient,       // 22
+            data.solver_search,         // 23
+            data.solver_qfrc,           // 24
+            data.atomic_counters,       // 25
+            data.solver_mv,             // 26
+            data.solver_jv,             // 27
+            data.solver_Ma,             // 28
         };
-        const solver_pipe = try vk.createComputePipeline(solver_shader, 17, &solver_buffers, @sizeOf(SolverPC));
+        const solver_pipe = try vk.createComputePipeline(solver_shader, 29, &solver_buffers, @sizeOf(SolverPC));
 
         return .{ .vk = vk, .physics_pipe = physics_pipe, .narrow_pipe = narrow_pipe, .solver_pipe = solver_pipe };
     }
@@ -107,10 +131,12 @@ pub const Physics = struct {
         const gz = gravity[2];
         const body_groups = @max((num_bodies + 255) / 256, 1);
 
-        // Step 3: apply gravity (before collision detection so solver sees gravity velocity)
-        pushPhysics(cmd, self.physics_pipe.layout, .{ .step = 3, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz });
-        c.vkCmdDispatch(cmd, body_groups, 1, 1);
+        // Step 6: clear counters
+        pushPhysics(cmd, self.physics_pipe.layout, .{ .step = 6, .count = 1, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz });
+        c.vkCmdDispatch(cmd, 1, 1, 1);
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+
+        // Gravity removed — now part of solver qacc init (step 2)
 
         // Step 0: update geom transforms
         pushPhysics(cmd, self.physics_pipe.layout, .{ .step = 0, .count = num_geoms, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz });
@@ -140,27 +166,35 @@ pub const Physics = struct {
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 
         // Perturbation disabled for now
-        const perturb_dirs = [4][2]f32{ .{ 1, 1 }, .{ -1, 1 }, .{ 1, -1 }, .{ -1, -1 } };
-        for (perturb_dirs) |dir| {
-            pushNarrow(cmd, self.narrow_pipe.layout, .{ .step = 1, .count = max_pairs, .sign0 = dir[0], .sign1 = dir[1] });
-            c.vkCmdDispatch(cmd, narrow_groups, 1, 1);
-            c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
-        }
 
-        // --- Solver pipeline (PGS) ---
+        // --- Newton solver pipeline ---
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.solver_pipe.pipeline);
         c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.solver_pipe.layout, 0, 1, &self.solver_pipe.desc_set, 0, null);
 
-        // Init lambdas (parallel)
-        const solver_pc_init = SolverPC{ .step = 0, .nc = max_pairs, .dt = dt };
-        c.vkCmdPushConstants(cmd, self.solver_pipe.layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(SolverPC), @ptrCast(&solver_pc_init));
+        // Step 0: compute world-space inertia (parallel, per body)
+        pushSolver(cmd, self.solver_pipe.layout, .{ .step = 0, .count = num_bodies, .dt = dt });
+        c.vkCmdDispatch(cmd, body_groups, 1, 1);
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+
+        // Step 1: build jacobian + aref + efc_D (parallel, per contact)
+        // Use max_pairs as upper bound; shader reads actual count from counters[1]
+        pushSolver(cmd, self.solver_pipe.layout, .{ .step = 1, .count = max_pairs, .dt = dt });
         c.vkCmdDispatch(cmd, @max((max_pairs + 255) / 256, 1), 1, 1);
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 
-        // Solve (serial, single thread)
-        const solver_pc_solve = SolverPC{ .step = 1, .nc = max_pairs, .dt = dt };
-        c.vkCmdPushConstants(cmd, self.solver_pipe.layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(SolverPC), @ptrCast(&solver_pc_solve));
+        // Step 2: init qacc to zero (parallel, per body)
+        pushSolver(cmd, self.solver_pipe.layout, .{ .step = 2, .count = num_bodies, .dt = dt });
+        c.vkCmdDispatch(cmd, body_groups, 1, 1);
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+
+        // Step 3: newton iterations (serial, 1 thread — iterates internally)
+        pushSolver(cmd, self.solver_pipe.layout, .{ .step = 3, .count = num_bodies, .dt = dt });
         c.vkCmdDispatch(cmd, 1, 1, 1);
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
+
+        // Step 4: apply qacc to vel/omega (parallel, per body)
+        pushSolver(cmd, self.solver_pipe.layout, .{ .step = 4, .count = num_bodies, .dt = dt });
+        c.vkCmdDispatch(cmd, body_groups, 1, 1);
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null);
 
         // --- Back to physics pipeline for integration ---
@@ -202,8 +236,32 @@ pub const Physics = struct {
         c.vkCmdPushConstants(cmd, layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PhysicsPC), @ptrCast(&pc));
     }
 
+    fn pushSolver(cmd: c.VkCommandBuffer, layout: c.VkPipelineLayout, pc: SolverPC) void {
+        c.vkCmdPushConstants(cmd, layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(SolverPC), @ptrCast(&pc));
+    }
+
     fn pushNarrow(cmd: c.VkCommandBuffer, layout: c.VkPipelineLayout, pc: NarrowPC) void {
         c.vkCmdPushConstants(cmd, layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(NarrowPC), @ptrCast(&pc));
+    }
+
+    /// Read back counters from GPU for debugging: [0]=num_pairs, [1]=num_contacts
+    pub fn readCounters(self: *Physics, data: *const Data) ![2]u32 {
+        var result: [2]u32 = undefined;
+        try self.vk.readBuffer(data.atomic_counters, @ptrCast(&result), @sizeOf([2]u32));
+        return result;
+    }
+
+    /// Read back first contact for debugging
+    pub fn readFirstContact(self: *Physics, data: *const Data) !struct { normal: [3]f32, pen: f32, ga: u32, gb: u32 } {
+        var n: [3]f32 = undefined;
+        var pen: [1]f32 = undefined;
+        var ga: [1]u32 = undefined;
+        var gb: [1]u32 = undefined;
+        try self.vk.readBuffer(data.contact_normal, @ptrCast(&n), 12);
+        try self.vk.readBuffer(data.contact_penetration, @ptrCast(&pen), 4);
+        try self.vk.readBuffer(data.contact_geom_a, @ptrCast(&ga), 4);
+        try self.vk.readBuffer(data.contact_geom_b, @ptrCast(&gb), 4);
+        return .{ .normal = n, .pen = pen[0], .ga = ga[0], .gb = gb[0] };
     }
 
     pub fn deinit(self: *Physics) void {

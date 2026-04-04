@@ -352,6 +352,24 @@ pub const Vulkan = struct {
         try self.copyBuffer(staging.handle, buf.handle, size);
     }
 
+    /// Read GPU buffer back to CPU via staging
+    pub fn readBuffer(self: *Vulkan, buf: Buffer, dst: *anyopaque, size: usize) !void {
+        if (size == 0) return;
+        const staging = try self.allocBuffer(
+            size,
+            c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        );
+        defer self.destroyBuffer(staging);
+
+        try self.copyBuffer(buf.handle, staging.handle, size);
+
+        var mapped: ?*anyopaque = null;
+        _ = c.vkMapMemory(self.device, staging.memory, 0, @intCast(size), 0, &mapped);
+        @memcpy(@as([*]u8, @ptrCast(dst))[0..size], @as([*]const u8, @ptrCast(mapped.?))[0..size]);
+        c.vkUnmapMemory(self.device, staging.memory);
+    }
+
     pub fn uploadSlice(self: *Vulkan, buf: Buffer, comptime T: type, slice: []const T) !void {
         try self.upload(buf, @as([*]const u8, @ptrCast(slice.ptr)), slice.len * @sizeOf(T));
     }

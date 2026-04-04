@@ -65,6 +65,37 @@ pub const Data = struct {
     contact_lambda_t1: Buffer, // [MAX_CONTACTS] float — accumulated tangent impulse 1
     contact_lambda_t2: Buffer, // [MAX_CONTACTS] float — accumulated tangent impulse 2
 
+    // Newton constraint solver
+    // Per-body: world-space inverse inertia (3x3 matrix = 9 floats), computed each frame from quat + local inertia
+    body_inv_inertia_world: Buffer, // [MAX_BODIES*9] float — world-space 3x3 inverse inertia tensor
+    // Per-body: generalized acceleration (6 DOFs: 3 linear + 3 angular), solver working state
+    solver_qacc: Buffer, // [MAX_BODIES*6] float — DOF accelerations being solved for
+    // Per-body: M*qacc product, cached to avoid recomputation
+    solver_Ma: Buffer, // [MAX_BODIES*6] float — mass matrix times qacc
+    // Per-constraint (4 per contact: 1 normal + 2 friction + 1 spare):
+    // Jacobian: how constraint velocity relates to body DOFs. Each row is 12 floats (6 DOFs × 2 bodies)
+    solver_jacobian: Buffer, // [MAX_CONTACTS*3*12] float — J[constraint, dof] (normal + 2 friction per contact)
+    // Effective mass diagonal: D = 1/(J * M⁻¹ * Jᵀ), controls how much each constraint can push
+    solver_efc_D: Buffer, // [MAX_CONTACTS*3] float — inverse effective mass per constraint
+    // Constraint force: the impulse magnitude per constraint, output of the solver
+    solver_efc_force: Buffer, // [MAX_CONTACTS*3] float — constraint force/impulse
+    // Target constraint acceleration: Baumgarte position correction + restitution + damping
+    solver_aref: Buffer, // [MAX_CONTACTS*3] float — reference acceleration per constraint
+    // Constraint residual: Jaref = -aref + J*qacc, measures how violated each constraint is
+    solver_Jaref: Buffer, // [MAX_CONTACTS*3] float — constraint violation
+    // Per-body Hessian: H = M + Jᵀ*D*J (6x6 symmetric, stored as 36 floats)
+    solver_hessian: Buffer, // [MAX_BODIES*36] float — 6x6 Hessian per body
+    // Cholesky factor of Hessian (lower triangle, 6x6 = 21 unique + 36 stored)
+    solver_cholesky: Buffer, // [MAX_BODIES*36] float — Cholesky L of Hessian
+    // Gradient of cost function: g = M*qacc - qfrc (6 DOFs per body)
+    solver_gradient: Buffer, // [MAX_BODIES*6] float — cost gradient
+    // Search direction: descent = -H⁻¹ * gradient (solved via Cholesky)
+    solver_search: Buffer, // [MAX_BODIES*6] float — Newton descent direction
+    // Constraint force projected back to DOFs: qfrc = Jᵀ * efc_force
+    solver_qfrc: Buffer, // [MAX_BODIES*6] float — constraint force in DOF space
+    solver_mv: Buffer, // [MAX_BODIES*6] float — M * search (for line search)
+    solver_jv: Buffer, // [MAX_CONTACTS] float — J * search (for line search)
+
     // Collision hull vertices (for mesh geoms, used by MPR/GJK support function)
     collision_verts: Buffer, // [MAX_COLLISION_VERTS] float3 — convex hull vertices
 
@@ -152,6 +183,21 @@ pub const Data = struct {
             .contact_lambda_n = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
             .contact_lambda_t1 = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
             .contact_lambda_t2 = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
+            .body_inv_inertia_world = try vk_ctx.createBuffer(MAX_BODIES * 9 * @sizeOf(f32), STORAGE),
+            .solver_qacc = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
+            .solver_Ma = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
+            .solver_jacobian = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * 12 * @sizeOf(f32), STORAGE),
+            .solver_efc_D = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * @sizeOf(f32), STORAGE),
+            .solver_efc_force = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * @sizeOf(f32), STORAGE),
+            .solver_aref = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * @sizeOf(f32), STORAGE),
+            .solver_Jaref = try vk_ctx.createBuffer(MAX_CONTACTS * 3 * @sizeOf(f32), STORAGE),
+            .solver_hessian = try vk_ctx.createBuffer(MAX_BODIES * 36 * @sizeOf(f32), STORAGE),
+            .solver_cholesky = try vk_ctx.createBuffer(MAX_BODIES * 36 * @sizeOf(f32), STORAGE),
+            .solver_gradient = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
+            .solver_search = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
+            .solver_qfrc = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
+            .solver_mv = try vk_ctx.createBuffer(MAX_BODIES * 6 * @sizeOf(f32), STORAGE),
+            .solver_jv = try vk_ctx.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
             .collision_verts = try vk_ctx.createBuffer(MAX_COLLISION_VERTS * @sizeOf([3]f32), STORAGE),
 
             .bvh_nodes_min = try vk_ctx.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE),
@@ -569,6 +615,12 @@ pub const Data = struct {
             self.collision_pairs.size + self.atomic_counters.size +
             self.contact_geom_a.size + self.contact_geom_b.size +
             self.contact_lambda_n.size + self.contact_lambda_t1.size + self.contact_lambda_t2.size +
+            self.body_inv_inertia_world.size +
+            self.solver_qacc.size + self.solver_Ma.size + self.solver_jacobian.size +
+            self.solver_efc_D.size + self.solver_efc_force.size + self.solver_aref.size +
+            self.solver_Jaref.size + self.solver_hessian.size + self.solver_cholesky.size +
+            self.solver_gradient.size + self.solver_search.size + self.solver_qfrc.size +
+            self.solver_mv.size + self.solver_jv.size +
             self.collision_verts.size +
             self.bvh_nodes_min.size + self.bvh_nodes_max.size +
             self.bvh_nodes_left.size + self.bvh_nodes_right.size +
@@ -592,6 +644,12 @@ pub const Data = struct {
             &self.collision_pairs, &self.atomic_counters,
             &self.contact_geom_a, &self.contact_geom_b,
             &self.contact_lambda_n, &self.contact_lambda_t1, &self.contact_lambda_t2,
+            &self.body_inv_inertia_world,
+            &self.solver_qacc, &self.solver_Ma, &self.solver_jacobian,
+            &self.solver_efc_D, &self.solver_efc_force, &self.solver_aref,
+            &self.solver_Jaref, &self.solver_hessian, &self.solver_cholesky,
+            &self.solver_gradient, &self.solver_search, &self.solver_qfrc,
+            &self.solver_mv, &self.solver_jv,
             &self.collision_verts,
             &self.bvh_nodes_min, &self.bvh_nodes_max, &self.bvh_nodes_left,
             &self.bvh_nodes_right, &self.bvh_nodes_count, &self.bvh_nodes_parent,
