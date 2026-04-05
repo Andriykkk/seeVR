@@ -1,0 +1,442 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint step;      // 0=gravity, 1=detect, 2=clear, 3=solve, 4=integrate, 5=update_verts, 6=clear_counters
+    uint count;     // num_bodies or num_geoms depending on step
+    float dt;
+    float gravity_x;
+    float gravity_y;
+    float gravity_z;
+};
+
+// Body state
+layout(set=0, binding=0)  buffer BPos       { float body_pos[]; };
+layout(set=0, binding=1)  buffer BQuat      { float body_quat[]; };
+layout(set=0, binding=2)  buffer BVel       { float body_vel[]; };
+layout(set=0, binding=3)  buffer BOmega     { float body_omega[]; };
+layout(set=0, binding=4)  buffer BInvMass   { float body_inv_mass[]; };
+layout(set=0, binding=5)  buffer BInvInertia{ float body_inv_inertia[]; };
+layout(set=0, binding=6)  buffer BHalf      { float body_half[]; };  // half_size per body (float3)
+layout(set=0, binding=7)  buffer BVertStart { uint  body_vert_start[]; };
+layout(set=0, binding=8)  buffer BVertCount { uint  body_vert_count[]; };
+
+// Vertices
+layout(set=0, binding=9)  buffer Vertices   { float verts[]; };
+layout(set=0, binding=10) buffer OrigVerts   { float orig_verts[]; };
+
+// Contacts
+layout(set=0, binding=11) buffer CPos       { float contact_pos[]; };
+layout(set=0, binding=12) buffer CNormal    { float contact_normal[]; };
+layout(set=0, binding=13) buffer CPen       { float contact_pen[]; };
+layout(set=0, binding=14) buffer CBodyA     { uint  contact_body_a[]; };
+layout(set=0, binding=15) buffer CBodyB     { uint  contact_body_b[]; };
+layout(set=0, binding=16) buffer CLambdaN   { float lambda_n[]; };
+
+// Counters: [0] = num_contacts
+layout(set=0, binding=17) buffer Counters   { uint  counters[]; };
+
+const float FRICTION = 0.5;
+const float BAUMGARTE = 0.2;
+const float SLOP = 0.005;
+const int PGS_ITERATIONS = 30;
+const int MAX_CONTACTS = 4000;
+
+// ======================== Quaternion helpers ========================
+
+// Quat layout: body_quat[i*4+0..3] = (x, y, z, w) matching pgs_boxes.py
+
+mat3 quat_to_mat(uint bi) {
+    float x = body_quat[bi*4+0];
+    float y = body_quat[bi*4+1];
+    float z = body_quat[bi*4+2];
+    float w = body_quat[bi*4+3];
+    return mat3(
+        1.0-2.0*(y*y+z*z), 2.0*(x*y+w*z),     2.0*(x*z-w*y),
+        2.0*(x*y-w*z),     1.0-2.0*(x*x+z*z), 2.0*(y*z+w*x),
+        2.0*(x*z+w*y),     2.0*(y*z-w*x),     1.0-2.0*(x*x+y*y)
+    );
+}
+
+vec3 get_pos(uint bi)  { return vec3(body_pos[bi*3], body_pos[bi*3+1], body_pos[bi*3+2]); }
+vec3 get_vel(uint bi)  { return vec3(body_vel[bi*3], body_vel[bi*3+1], body_vel[bi*3+2]); }
+vec3 get_omega(uint bi){ return vec3(body_omega[bi*3], body_omega[bi*3+1], body_omega[bi*3+2]); }
+vec3 get_half(uint bi) { return vec3(body_half[bi*3], body_half[bi*3+1], body_half[bi*3+2]); }
+vec3 get_inv_i(uint bi){ return vec3(body_inv_inertia[bi*3], body_inv_inertia[bi*3+1], body_inv_inertia[bi*3+2]); }
+
+void set_vel(uint bi, vec3 v)  { body_vel[bi*3]=v.x; body_vel[bi*3+1]=v.y; body_vel[bi*3+2]=v.z; }
+void set_omega(uint bi, vec3 w){ body_omega[bi*3]=w.x; body_omega[bi*3+1]=w.y; body_omega[bi*3+2]=w.z; }
+
+vec3 col3(mat3 M, int c) { return vec3(M[c][0], M[c][1], M[c][2]); }
+
+// apply_inv_I: R @ (inv_I_local * (R^T @ v))
+vec3 apply_inv_I(uint bi, vec3 v) {
+    mat3 R = quat_to_mat(bi);
+    vec3 inv_i = get_inv_i(bi);
+    vec3 local = transpose(R) * v;
+    return R * (inv_i * local);
+}
+
+// ======================== SAT ========================
+
+void sat_test(uint a, uint b,
+              out int overlap, out int ref_is_a, out int best_face,
+              out float min_pen, out vec3 best_n)
+{
+    mat3 Ra = quat_to_mat(a);
+    mat3 Rb = quat_to_mat(b);
+    vec3 ha = get_half(a);
+    vec3 hb = get_half(b);
+    vec3 d = get_pos(b) - get_pos(a);
+    mat3 C = transpose(Ra) * Rb;
+    vec3 t = transpose(Ra) * d;
+
+    mat3 absC;
+    for (int r = 0; r < 3; r++)
+        for (int cc = 0; cc < 3; cc++)
+            absC[cc][r] = abs(C[cc][r]) + 1e-6;
+
+    min_pen = 1e10;
+    ref_is_a = 1;
+    best_face = 0;
+    best_n = vec3(0, 1, 0);
+    int sep = 0;
+
+    // A's 3 face normals
+    for (int i = 0; i < 3; i++) {
+        float ra_ = ha[i];
+        float rb_ = hb[0]*absC[0][i] + hb[1]*absC[1][i] + hb[2]*absC[2][i];
+        float pen = ra_ + rb_ - abs(t[i]);
+        if (pen < 0.0) sep = 1;
+        if (pen < min_pen && sep == 0) {
+            min_pen = pen; ref_is_a = 1; best_face = i;
+            best_n = col3(Ra, i) * ((t[i] >= 0.0) ? 1.0 : -1.0);
+        }
+    }
+
+    // B's 3 face normals
+    for (int i = 0; i < 3; i++) {
+        float tp = t[0]*C[i][0] + t[1]*C[i][1] + t[2]*C[i][2];
+        float ra_ = ha[0]*absC[i][0] + ha[1]*absC[i][1] + ha[2]*absC[i][2];
+        float rb_ = hb[i];
+        float pen = ra_ + rb_ - abs(tp);
+        if (pen < 0.0) sep = 1;
+        if (pen < min_pen && sep == 0) {
+            min_pen = pen; ref_is_a = 0; best_face = i;
+            best_n = col3(Rb, i) * ((tp >= 0.0) ? 1.0 : -1.0);
+        }
+    }
+
+    // 9 edge-cross axes
+    for (int i = 0; i < 3; i++) {
+        int i0 = (i+1)%3, i1 = (i+2)%3;
+        for (int j = 0; j < 3; j++) {
+            int j0 = (j+1)%3, j1 = (j+2)%3;
+            float tp = t[i1]*C[j][i0] - t[i0]*C[j][i1];
+            float ra_ = ha[i0]*absC[j][i1] + ha[i1]*absC[j][i0];
+            float rb_ = hb[j0]*absC[j1][i] + hb[j1]*absC[j0][i];
+            float pen = ra_ + rb_ - abs(tp);
+            if (pen < 0.0) sep = 1;
+            if (sep == 0) {
+                vec3 axis = cross(col3(Ra, i), col3(Rb, j));
+                float axis_len = length(axis);
+                if (axis_len > 1e-4) {
+                    float pen_norm = pen / axis_len;
+                    if (pen_norm < min_pen) {
+                        min_pen = pen_norm; ref_is_a = -1; best_face = i*3+j;
+                        best_n = axis / axis_len * ((dot(d, axis) >= 0.0) ? 1.0 : -1.0);
+                    }
+                }
+            }
+        }
+    }
+    overlap = 1 - sep;
+}
+
+// ======================== Contact generation ========================
+
+void add_contact(vec3 cp, vec3 n, float pen, uint ba, uint bb) {
+    uint idx = atomicAdd(counters[0], 1);
+    if (idx < MAX_CONTACTS) {
+        contact_pos[idx*3]   = cp.x;
+        contact_pos[idx*3+1] = cp.y;
+        contact_pos[idx*3+2] = cp.z;
+        contact_normal[idx*3]   = n.x;
+        contact_normal[idx*3+1] = n.y;
+        contact_normal[idx*3+2] = n.z;
+        contact_pen[idx] = pen;
+        contact_body_a[idx] = ba;
+        contact_body_b[idx] = bb;
+    }
+}
+
+void add_face_contacts(uint ref, uint inc, int ref_face, vec3 normal) {
+    mat3 R_ref = quat_to_mat(ref);
+    mat3 R_inc = quat_to_mat(inc);
+    vec3 h_ref = get_half(ref);
+    vec3 h_inc = get_half(inc);
+
+    vec3 ref_center = get_pos(ref) + normal * h_ref[ref_face];
+    int rt1 = (ref_face+1)%3, rt2 = (ref_face+2)%3;
+    vec3 tan1 = col3(R_ref, rt1);
+    vec3 tan2 = col3(R_ref, rt2);
+
+    // Find incident face
+    float min_d = 1e10;
+    int inc_ax = 0; float inc_sg = 1.0;
+    for (int k = 0; k < 3; k++) {
+        vec3 ck = col3(R_inc, k);
+        float dp = dot(ck, normal);
+        if (dp < min_d) { min_d = dp; inc_ax = k; inc_sg = 1.0; }
+        if (-dp < min_d) { min_d = -dp; inc_ax = k; inc_sg = -1.0; }
+    }
+
+    vec3 inc_n = col3(R_inc, inc_ax) * inc_sg;
+    vec3 inc_c = get_pos(inc) + inc_n * h_inc[inc_ax];
+    int i1 = (inc_ax+1)%3, i2 = (inc_ax+2)%3;
+    vec3 it1 = col3(R_inc, i1);
+    vec3 it2 = col3(R_inc, i2);
+
+    for (int k = 0; k < 4; k++) {
+        float s1 = ((k & 1) != 0) ? 1.0 : -1.0;
+        float s2 = ((k & 2) != 0) ? 1.0 : -1.0;
+        vec3 v = inc_c + it1 * (s1 * h_inc[i1]) + it2 * (s2 * h_inc[i2]);
+
+        float d = dot(v - ref_center, normal);
+        if (d < 0.01) {
+            vec3 rel = v - ref_center;
+            float u = dot(rel, tan1);
+            float w = dot(rel, tan2);
+            if (abs(u) <= h_ref[rt1] + 0.01 && abs(w) <= h_ref[rt2] + 0.01) {
+                float depth = max(-d, 0.0);
+                add_contact(v - d * normal, normal, depth, ref, inc);
+            }
+        }
+    }
+}
+
+void add_edge_contact(uint a, uint b, int ei, int ej, vec3 normal, float pen) {
+    mat3 Ra = quat_to_mat(a);
+    mat3 Rb = quat_to_mat(b);
+    vec3 ha = get_half(a);
+    vec3 hb = get_half(b);
+
+    vec3 da = col3(Ra, ei);
+    vec3 db = col3(Rb, ej);
+
+    vec3 pa = get_pos(a);
+    for (int k = 0; k < 3; k++) {
+        if (k != ei) {
+            vec3 ck = col3(Ra, k);
+            float s = (dot(normal, ck) > 0.0) ? 1.0 : -1.0;
+            pa += s * ha[k] * ck;
+        }
+    }
+    vec3 pb = get_pos(b);
+    for (int k = 0; k < 3; k++) {
+        if (k != ej) {
+            vec3 ck = col3(Rb, k);
+            float s = (dot(normal, ck) > 0.0) ? -1.0 : 1.0;
+            pb += s * hb[k] * ck;
+        }
+    }
+
+    vec3 r = pa - pb;
+    float a12 = dot(da, db);
+    float b1 = dot(r, da);
+    float b2 = dot(r, db);
+    float denom = 1.0 - a12*a12;
+    float sa = 0.0, tb = 0.0;
+    if (abs(denom) > 1e-8) {
+        sa = (a12*b2 - b1) / denom;
+        tb = (b2 - a12*b1) / denom;
+    }
+    sa = max(-ha[ei], min(sa, ha[ei]));
+    tb = max(-hb[ej], min(tb, hb[ej]));
+
+    vec3 pt = (pa + sa*da + pb + tb*db) * 0.5;
+    add_contact(pt, normal, pen, a, b);
+}
+
+// ======================== Steps ========================
+
+// Step 0: apply gravity (parallel per body)
+void step_gravity() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    if (body_inv_mass[i] <= 0.0) return;
+
+    body_vel[i*3+0] = body_vel[i*3+0] * 0.999 + gravity_x * dt;
+    body_vel[i*3+1] = body_vel[i*3+1] * 0.999 + gravity_y * dt;
+    body_vel[i*3+2] = body_vel[i*3+2] * 0.999 + gravity_z * dt;
+    body_omega[i*3+0] *= 0.998;
+    body_omega[i*3+1] *= 0.998;
+    body_omega[i*3+2] *= 0.998;
+}
+
+// Step 1: detect contacts (N² SAT, parallel per pair-row)
+void step_detect() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+
+    for (uint j = i + 1; j < count; j++) {
+        if (body_inv_mass[i] <= 0.0 && body_inv_mass[j] <= 0.0) continue;
+
+        int overlap, ref_is_a, best_face;
+        float pen; vec3 normal;
+        sat_test(i, j, overlap, ref_is_a, best_face, pen, normal);
+
+        if (overlap == 1) {
+            if (ref_is_a == 1) {
+                add_face_contacts(i, j, best_face, normal);
+            } else if (ref_is_a == 0) {
+                add_face_contacts(j, i, best_face, -normal);
+            } else {
+                add_edge_contact(i, j, best_face / 3, best_face % 3, normal, pen);
+            }
+        }
+    }
+}
+
+// Step 2: clear impulses
+void step_clear() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < MAX_CONTACTS) lambda_n[i] = 0.0;
+}
+
+// Step 3: PGS solve (serial, single thread)
+void step_solve() {
+    if (gl_GlobalInvocationID.x != 0) return;
+
+    uint nc = min(counters[0], MAX_CONTACTS);
+
+    for (int iter = 0; iter < PGS_ITERATIONS; iter++) {
+        for (uint ci = 0; ci < nc; ci++) {
+            uint a = contact_body_a[ci];
+            uint b = contact_body_b[ci];
+            float inv_ma = body_inv_mass[a];
+            float inv_mb = body_inv_mass[b];
+            if (inv_ma == 0.0 && inv_mb == 0.0) continue;
+
+            vec3 n = vec3(contact_normal[ci*3], contact_normal[ci*3+1], contact_normal[ci*3+2]);
+            vec3 cp = vec3(contact_pos[ci*3], contact_pos[ci*3+1], contact_pos[ci*3+2]);
+            float pen = contact_pen[ci];
+
+            vec3 ra = cp - get_pos(a);
+            vec3 rb = cp - get_pos(b);
+
+            vec3 va = get_vel(a) + cross(get_omega(a), ra);
+            vec3 vb = get_vel(b) + cross(get_omega(b), rb);
+            float vn = dot(vb - va, n);
+
+            vec3 ra_x_n = cross(ra, n);
+            vec3 rb_x_n = cross(rb, n);
+            float k = inv_ma + inv_mb
+                     + dot(ra_x_n, apply_inv_I(a, ra_x_n))
+                     + dot(rb_x_n, apply_inv_I(b, rb_x_n));
+
+            float bias = BAUMGARTE * max(pen - SLOP, 0.0) / dt;
+            float d_ln = (-vn + bias) / k;
+            float old_ln = lambda_n[ci];
+            float new_ln = max(old_ln + d_ln, 0.0);
+            d_ln = new_ln - old_ln;
+            lambda_n[ci] = new_ln;
+
+            vec3 imp = d_ln * n;
+            set_vel(a, get_vel(a) - inv_ma * imp);
+            set_vel(b, get_vel(b) + inv_mb * imp);
+            set_omega(a, get_omega(a) - apply_inv_I(a, cross(ra, imp)));
+            set_omega(b, get_omega(b) + apply_inv_I(b, cross(rb, imp)));
+
+            // Coulomb friction
+            va = get_vel(a) + cross(get_omega(a), ra);
+            vb = get_vel(b) + cross(get_omega(b), rb);
+            vec3 dv = vb - va;
+            vec3 vt = dv - dot(dv, n) * n;
+            float vt_len = length(vt);
+            if (vt_len > 1e-6) {
+                vec3 td = vt / vt_len;
+                vec3 ra_x_t = cross(ra, td);
+                vec3 rb_x_t = cross(rb, td);
+                float kt = inv_ma + inv_mb
+                          + dot(ra_x_t, apply_inv_I(a, ra_x_t))
+                          + dot(rb_x_t, apply_inv_I(b, rb_x_t));
+                float d_lt = min(vt_len / kt, FRICTION * lambda_n[ci]);
+                vec3 imp_t = d_lt * td;
+                set_vel(a, get_vel(a) + inv_ma * imp_t);
+                set_vel(b, get_vel(b) - inv_mb * imp_t);
+                set_omega(a, get_omega(a) + apply_inv_I(a, cross(ra, imp_t)));
+                set_omega(b, get_omega(b) - apply_inv_I(b, cross(rb, imp_t)));
+            }
+        }
+    }
+}
+
+// Step 4: integrate (parallel per body)
+void step_integrate() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    if (body_inv_mass[i] <= 0.0) return;
+
+    // Position
+    body_pos[i*3+0] += body_vel[i*3+0] * dt;
+    body_pos[i*3+1] += body_vel[i*3+1] * dt;
+    body_pos[i*3+2] += body_vel[i*3+2] * dt;
+
+    // Quaternion: q += 0.5 * (omega, 0) * q * dt
+    float ox = body_omega[i*3], oy = body_omega[i*3+1], oz = body_omega[i*3+2];
+    float qx = body_quat[i*4], qy = body_quat[i*4+1], qz = body_quat[i*4+2], qw = body_quat[i*4+3];
+    // quat_mul((ox,oy,oz,0), (qx,qy,qz,qw))
+    float dx = 0.0*qx + ox*qw + oy*qz - oz*qy;
+    float dy = 0.0*qy - ox*qz + oy*qw + oz*qx;
+    float dz = 0.0*qz + ox*qy - oy*qx + oz*qw;
+    float dw = 0.0*qw - ox*qx - oy*qy - oz*qz;
+
+    qx += 0.5 * dx * dt;
+    qy += 0.5 * dy * dt;
+    qz += 0.5 * dz * dt;
+    qw += 0.5 * dw * dt;
+    float l = sqrt(qx*qx + qy*qy + qz*qz + qw*qw);
+    if (l > 1e-8) { qx/=l; qy/=l; qz/=l; qw/=l; }
+    body_quat[i*4]=qx; body_quat[i*4+1]=qy; body_quat[i*4+2]=qz; body_quat[i*4+3]=qw;
+}
+
+// Step 5: update render vertices (parallel per body)
+void step_update_verts() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= count) return;
+
+    vec3 bp = get_pos(b);
+    mat3 R = quat_to_mat(b);
+    uint start = body_vert_start[b];
+    uint vc = body_vert_count[b];
+
+    for (uint v = start; v < start + vc; v++) {
+        vec3 lp = vec3(orig_verts[v*3], orig_verts[v*3+1], orig_verts[v*3+2]);
+        vec3 wp = bp + R * lp;
+        verts[v*3]   = wp.x;
+        verts[v*3+1] = wp.y;
+        verts[v*3+2] = wp.z;
+    }
+}
+
+// Step 6: clear counters
+void step_clear_counters() {
+    if (gl_GlobalInvocationID.x != 0) return;
+    counters[0] = 0;
+}
+
+// ======================== Main ========================
+
+void main() {
+    switch (step) {
+        case 0: step_gravity();        break;
+        case 1: step_detect();         break;
+        case 2: step_clear();          break;
+        case 3: step_solve();          break;
+        case 4: step_integrate();      break;
+        case 5: step_update_verts();   break;
+        case 6: step_clear_counters(); break;
+    }
+}

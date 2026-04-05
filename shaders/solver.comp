@@ -4,7 +4,7 @@ layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
     uint step;
-    uint count;
+    uint count;  // num_bodies
     float dt;
 };
 
@@ -28,82 +28,36 @@ layout(set = 0, binding = 11) buffer ContactPen     { float contact_pen[]; };
 layout(set = 0, binding = 12) buffer ContactGeomA   { uint  contact_geom_a[]; };
 layout(set = 0, binding = 13) buffer ContactGeomB   { uint  contact_geom_b[]; };
 
-// Solver state
-layout(set = 0, binding = 14) buffer SolverQacc     { float qacc[]; };
-layout(set = 0, binding = 15) buffer SolverJacobian { float jac[]; };
-layout(set = 0, binding = 16) buffer SolverEfcD     { float efc_D[]; };
-layout(set = 0, binding = 17) buffer SolverEfcForce { float efc_force[]; };
-layout(set = 0, binding = 18) buffer SolverAref     { float aref[]; };
-layout(set = 0, binding = 19) buffer SolverJaref    { float Jaref[]; };
-layout(set = 0, binding = 20) buffer SolverHessian  { float H[]; };
-layout(set = 0, binding = 21) buffer SolverCholesky { float L[]; };
-layout(set = 0, binding = 22) buffer SolverGradient { float grad[]; };
-layout(set = 0, binding = 23) buffer SolverSearch   { float search[]; };
-layout(set = 0, binding = 24) buffer SolverQfrc     { float qfrc[]; };
-layout(set = 0, binding = 25) buffer Counters       { uint  counters[]; };
-layout(set = 0, binding = 26) buffer SolverMv       { float mv[]; };     // M * search
-layout(set = 0, binding = 27) buffer SolverJv       { float jv[]; };     // J * search
-layout(set = 0, binding = 28) buffer SolverMa       { float Ma[]; };     // M * qacc
+// PGS accumulated impulses
+layout(set = 0, binding = 14) buffer LambdaN        { float lambda_n[]; };
 
-const float EPS = 1e-10;
-const vec3 GRAVITY = vec3(0.0, -9.81, 0.0);
+// Counters
+layout(set = 0, binding = 15) buffer Counters       { uint  counters[]; };
 
-// --- Helpers ---
+const float FRICTION = 0.5;
+const float BAUMGARTE = 0.2;
+const float SLOP = 0.005;
+const int PGS_ITERATIONS = 30;
 
-mat3 read_inv_inertia_world(uint bi) {
-    uint b = bi * 9;
-    return mat3(
-        body_inv_i_world[b+0], body_inv_i_world[b+1], body_inv_i_world[b+2],
-        body_inv_i_world[b+3], body_inv_i_world[b+4], body_inv_i_world[b+5],
-        body_inv_i_world[b+6], body_inv_i_world[b+7], body_inv_i_world[b+8]
+// --- Quaternion helpers ---
+
+vec3 quat_rotate(vec4 q, vec3 v) {
+    float w = q.x, x = q.y, y = q.z, z = q.w;
+    vec3 t = 2.0 * vec3(y*v.z - z*v.y, z*v.x - x*v.z, x*v.y - y*v.x);
+    return v + w * t + vec3(y*t.z - z*t.y, z*t.x - x*t.z, x*t.y - y*t.x);
+}
+
+// Apply world-space inverse inertia to vector: R * (inv_I_local * (R^T * v))
+vec3 apply_inv_I(uint bi, vec3 v) {
+    mat3 Iinv = mat3(
+        body_inv_i_world[bi*9+0], body_inv_i_world[bi*9+1], body_inv_i_world[bi*9+2],
+        body_inv_i_world[bi*9+3], body_inv_i_world[bi*9+4], body_inv_i_world[bi*9+5],
+        body_inv_i_world[bi*9+6], body_inv_i_world[bi*9+7], body_inv_i_world[bi*9+8]
     );
+    return Iinv * v;
 }
 
-// Read/write 6x6 Hessian for body bi (stored in H buffer, lower triangle)
-float H_get(uint bi, int r, int c_) {
-    // Lower triangle: r >= c_
-    if (r < c_) { int t = r; r = c_; c_ = t; } // swap to access lower triangle
-    return H[bi * 36 + r * 6 + c_];
-}
-void H_set(uint bi, int r, int c_, float v) {
-    H[bi * 36 + r * 6 + c_] = v;
-}
-float L_get(uint bi, int r, int c_) {
-    return H[bi * 36 + r * 6 + c_]; // L stored in same buffer as H (Genesis style)
-}
-
-// Mass matrix for body: M = diag(m,m,m, I_world)
-// We need M[i,j] for 6x6. For free rigid body:
-// M[0..2, 0..2] = mass * I3
-// M[3..5, 3..5] = I_world (NOT inv!)
-// Off-diagonal = 0
-// But we only have inv_mass and inv_inertia_world.
-// We need M for Hessian. Compute M[i,j] on the fly.
-float mass_mat(uint bi, int r, int c_) {
-    if (r != c_) {
-        // Off-diagonal: only I_world has off-diag in angular block
-        if (r >= 3 && c_ >= 3) {
-            // I_world[r-3, c_-3] — we need I, not I_inv
-            // I = inverse(I_inv). For 3x3 symmetric, compute inline.
-            // EXPENSIVE but only done once per body per iteration.
-            // For now, approximate: if body is axis-aligned, I_world is diagonal → off-diag ≈ 0
-            // TODO: compute full inverse
-            return 0.0;
-        }
-        return 0.0;
-    }
-    if (r < 3) {
-        float inv_m = body_inv_mass[bi];
-        return (inv_m > 0.0) ? (1.0 / inv_m) : 1e10;
-    }
-    // Diagonal of I_world: need I, not I_inv
-    // For diagonal inertia rotated to world: I_world_diag ≈ 1/I_inv_world_diag
-    // This is an approximation (exact only when I_world is diagonal)
-    float inv_val = body_inv_i_world[bi * 9 + (r-3) * 4]; // diagonal: [0,0], [1,1], [2,2] = indices 0,4,8
-    return (inv_val > EPS) ? (1.0 / inv_val) : 1e10;
-}
-
-// --- Step 0: Compute world-space inverse inertia ---
+// --- Step 0: Compute world-space inverse inertia per body ---
 
 void step_compute_world_inertia() {
     uint i = gl_GlobalInvocationID.x;
@@ -119,478 +73,142 @@ void step_compute_world_inertia() {
         2.0*(x*z+w*y),     2.0*(y*z-w*x),     1.0-2.0*(x*x+y*y)
     );
 
+    // I_world^-1 = R * diag(inv_i) * R^T
     mat3 result;
     for (int r = 0; r < 3; r++)
-        for (int c_ = 0; c_ < 3; c_++)
-            result[c_][r] = R[0][r]*inv_i.x*R[0][c_] + R[1][r]*inv_i.y*R[1][c_] + R[2][r]*inv_i.z*R[2][c_];
+        for (int c = 0; c < 3; c++)
+            result[c][r] = R[0][r]*inv_i.x*R[0][c] + R[1][r]*inv_i.y*R[1][c] + R[2][r]*inv_i.z*R[2][c];
 
     uint b = i * 9;
     for (int r = 0; r < 3; r++)
-        for (int c_ = 0; c_ < 3; c_++)
-            body_inv_i_world[b + r*3 + c_] = result[c_][r];
+        for (int c = 0; c < 3; c++)
+            body_inv_i_world[b + r*3 + c] = result[c][r];
 }
 
-// --- Step 1: Build Jacobian + aref + efc_D (parallel, per contact) ---
+// --- Step 1: Apply gravity + PGS contact solve (serial, single thread) ---
 
-void step_build_jacobian() {
-    uint ci = gl_GlobalInvocationID.x;
-    uint nc = counters[1];
-    if (ci >= nc) return;
-
-    uint ga = contact_geom_a[ci];
-    uint gb = contact_geom_b[ci];
-    uint bi_a = geom_body_idx[ga];
-    uint bi_b = geom_body_idx[gb];
-
-    vec3 cpos = vec3(contact_pos[ci*3], contact_pos[ci*3+1], contact_pos[ci*3+2]);
-    vec3 n = vec3(contact_normal[ci*3], contact_normal[ci*3+1], contact_normal[ci*3+2]);
-    float pen = contact_pen[ci];
-    vec3 pa = vec3(body_pos[bi_a*3], body_pos[bi_a*3+1], body_pos[bi_a*3+2]);
-    vec3 pb = vec3(body_pos[bi_b*3], body_pos[bi_b*3+1], body_pos[bi_b*3+2]);
-    vec3 ra = cpos - pa;
-    vec3 rb = cpos - pb;
-
-    // Current constraint velocity: jac_qvel = J · vel
-    vec3 va = vec3(body_vel[bi_a*3], body_vel[bi_a*3+1], body_vel[bi_a*3+2])
-            + cross(vec3(body_omega[bi_a*3], body_omega[bi_a*3+1], body_omega[bi_a*3+2]), ra);
-    vec3 vb = vec3(body_vel[bi_b*3], body_vel[bi_b*3+1], body_vel[bi_b*3+2])
-            + cross(vec3(body_omega[bi_b*3], body_omega[bi_b*3+1], body_omega[bi_b*3+2]), rb);
-    float jac_qvel = dot(va - vb, n);
-
-    // Genesis aref: impedance-based spring-damper
-    // aref = -b * vel - k * imp * pos
-    // Default params: timeconst=2*dt, dampratio=1, dmin=0.9, dmax=0.95, width=0.001
-    float timeconst = max(2.0 * dt, 0.01);
-    float dmax = 0.95;
-    float dmin = 0.9;
-    float width = 0.001;
-
-    float imp_x = pen / width;
-    float imp = dmax;
-    if (imp_x <= 1.0) {
-        float imp_y = imp_x * imp_x; // power=2, mid=0.5 simplified
-        imp = dmin + imp_y * (dmax - dmin);
-        imp = clamp(imp, dmin, dmax);
-    }
-
-    float b_coeff = 2.0 / (dmax * timeconst);
-    float k_coeff = 1.0 / (dmax * dmax * timeconst * timeconst);
-
-    // Normal constraint only (k=0). For simplicity, 1 constraint per contact for now.
-    vec3 d = n;
-    vec3 ang_a = cross(ra, d);
-    vec3 ang_b = cross(rb, d);
-
-    // Store Jacobian: J = [d, ra×d, -d, -(rb×d)]
-    uint j = ci * 12;
-    jac[j+0]=d.x; jac[j+1]=d.y; jac[j+2]=d.z;
-    jac[j+3]=ang_a.x; jac[j+4]=ang_a.y; jac[j+5]=ang_a.z;
-    jac[j+6]=-d.x; jac[j+7]=-d.y; jac[j+8]=-d.z;
-    jac[j+9]=-ang_b.x; jac[j+10]=-ang_b.y; jac[j+11]=-ang_b.z;
-
-    // efc_D = 1 / (J · M⁻¹ · Jᵀ)
-    float inv_ma = body_inv_mass[bi_a];
-    float inv_mb = body_inv_mass[bi_b];
-    mat3 Iinv_a = read_inv_inertia_world(bi_a);
-    mat3 Iinv_b = read_inv_inertia_world(bi_b);
-    float JMJ = dot(d,d)*inv_ma + dot(ang_a, Iinv_a*ang_a)
-              + dot(d,d)*inv_mb + dot(ang_b, Iinv_b*ang_b);
-
-    // Genesis: diag = invweight * (1-imp)/imp; efc_D = 1/diag
-    // But invweight ≈ JMJ for free bodies
-    float diag = max(JMJ * (1.0 - imp) / imp, EPS);
-    efc_D[ci] = 1.0 / diag;
-
-    // Genesis: aref = -b*vel - k*imp*pos (pos = -penetration for contacts)
-    aref[ci] = -b_coeff * jac_qvel - k_coeff * imp * (-pen);
-
-    efc_force[ci] = 0.0;
-}
-
-// --- Step 2: Init qacc + Ma + initial Jaref + initial constraint update ---
-
-void step_init_qacc() {
-    uint bi = gl_GlobalInvocationID.x;
-    if (bi >= count) return;
-
-    float inv_m = body_inv_mass[bi];
-    uint b = bi * 6;
-
-    // qacc = 0 initially (Genesis: qacc_smooth or warmstart)
-    // force = gravity * mass (applied force in DOF space)
-    // For free rigid body: force[0..2] = mass * gravity, force[3..5] = 0
-    float mass = (inv_m > 0.0) ? (1.0 / inv_m) : 0.0;
-
-    for (int d = 0; d < 6; d++) {
-        qacc[b + d] = 0.0;
-        qfrc[b + d] = 0.0;
-        grad[b + d] = 0.0;
-        search[b + d] = 0.0;
-    }
-}
-
-// --- Step 3: Newton solver (serial, single thread) ---
-// Exact Genesis algorithm: initialize → update_constraint → hessian+cholesky → gradient → iterate
-
-void step_newton_solve() {
+void step_solve() {
     if (gl_GlobalInvocationID.x != 0) return;
 
     uint nc = counters[1];
-    if (nc == 0) return;
     uint nb = count;
 
-    // WORKING PENALTY FORCES — use until Newton solver is fixed
-    const float stiffness = 5000.0;
-    const float damping_c = 50.0;
-    for (uint bi = 0; bi < nb; bi++)
-        for (int d = 0; d < 6; d++) qfrc[bi*6+d] = 0.0;
-
-    for (uint ci = 0; ci < nc; ci++) {
-        uint ga = contact_geom_a[ci];
-        uint gb = contact_geom_b[ci];
-        uint bi_a = geom_body_idx[ga];
-        uint bi_b = geom_body_idx[gb];
-        if (body_inv_mass[bi_a] == 0.0 && body_inv_mass[bi_b] == 0.0) continue;
-
-        vec3 n = vec3(contact_normal[ci*3], contact_normal[ci*3+1], contact_normal[ci*3+2]);
-        float pen = contact_pen[ci];
-        if (pen <= 0.0) continue;
-
-        vec3 va = vec3(body_vel[bi_a*3], body_vel[bi_a*3+1], body_vel[bi_a*3+2]);
-        vec3 vb = vec3(body_vel[bi_b*3], body_vel[bi_b*3+1], body_vel[bi_b*3+2]);
-        float v_rel = dot(va - vb, n);
-
-        float f = stiffness * pen - damping_c * v_rel;
-        if (f < 0.0) f = 0.0;
-
-        vec3 force = f * n;
-        qfrc[bi_a*6+0] += force.x; qfrc[bi_a*6+1] += force.y; qfrc[bi_a*6+2] += force.z;
-        qfrc[bi_b*6+0] -= force.x; qfrc[bi_b*6+1] -= force.y; qfrc[bi_b*6+2] -= force.z;
-    }
-
-    for (uint bi = 0; bi < nb; bi++) {
-        float inv_m = body_inv_mass[bi];
-        if (inv_m <= 0.0) continue;
-        uint b = bi * 6;
-        qacc[b+0] = GRAVITY.x + qfrc[b+0] * inv_m;
-        qacc[b+1] = GRAVITY.y + qfrc[b+1] * inv_m;
-        qacc[b+2] = GRAVITY.z + qfrc[b+2] * inv_m;
-        qacc[b+3] = 0.0; qacc[b+4] = 0.0; qacc[b+5] = 0.0;
-    }
-    return;
-
-    // --- NEWTON SOLVER (WIP — disabled until fully implemented from Genesis) ---
-    const int MAX_ITER = 20;
-
-    // --- Initialize Jaref = -aref + J·qacc ---
-    for (uint ci = 0; ci < nc; ci++) {
-        uint bi_a = geom_body_idx[contact_geom_a[ci]];
-        uint bi_b = geom_body_idx[contact_geom_b[ci]];
-        float jr = -aref[ci];
-        uint j = ci * 12;
-        for (int d = 0; d < 6; d++) jr += jac[j+d] * qacc[bi_a*6+d];
-        for (int d = 0; d < 6; d++) jr += jac[j+6+d] * qacc[bi_b*6+d];
-        Jaref[ci] = jr;
-    }
-
-    // --- Initialize Ma = M * qacc ---
+    // Apply gravity + damping
     for (uint bi = 0; bi < nb; bi++) {
         if (body_inv_mass[bi] <= 0.0) continue;
-        uint b = bi * 6;
-        for (int d1 = 0; d1 < 6; d1++) {
-            float val = 0.0;
-            for (int d2 = 0; d2 < 6; d2++)
-                val += mass_mat(bi, d1, d2) * qacc[b+d2];
-            Ma[b+d1] = val;
-        }
+        body_vel[bi*3+0] += 0.0 * dt;       // gravity_x
+        body_vel[bi*3+1] += -9.81 * dt;     // gravity_y
+        body_vel[bi*3+2] += 0.0 * dt;       // gravity_z
     }
 
-    // --- Initial update_constraint (compute efc_force, qfrc, cost) ---
-    // efc_force = -D * Jaref * active; active = (Jaref < 0) for contacts
-    for (uint ci = 0; ci < nc; ci++) {
-        bool is_active = Jaref[ci] < 0.0;
-        efc_force[ci] = is_active ? (-efc_D[ci] * Jaref[ci]) : 0.0;
+    if (nc == 0) return;
+
+    // Zero accumulated impulses
+    for (uint ci = 0; ci < nc; ci++)
+        lambda_n[ci] = 0.0;
+
+    // --- PGS iterations ---
+    for (int iter = 0; iter < PGS_ITERATIONS; iter++) {
+        for (uint ci = 0; ci < nc; ci++) {
+            uint ga = contact_geom_a[ci];
+            uint gb = contact_geom_b[ci];
+            uint bi_a = geom_body_idx[ga];
+            uint bi_b = geom_body_idx[gb];
+            float inv_ma = body_inv_mass[bi_a];
+            float inv_mb = body_inv_mass[bi_b];
+            if (inv_ma == 0.0 && inv_mb == 0.0) continue;
+
+            vec3 n = vec3(contact_normal[ci*3], contact_normal[ci*3+1], contact_normal[ci*3+2]);
+            float pen = contact_pen[ci];
+            vec3 cpos = vec3(contact_pos[ci*3], contact_pos[ci*3+1], contact_pos[ci*3+2]);
+            vec3 pa = vec3(body_pos[bi_a*3], body_pos[bi_a*3+1], body_pos[bi_a*3+2]);
+            vec3 pb = vec3(body_pos[bi_b*3], body_pos[bi_b*3+1], body_pos[bi_b*3+2]);
+            vec3 ra = cpos - pa;
+            vec3 rb = cpos - pb;
+
+            vec3 va = vec3(body_vel[bi_a*3], body_vel[bi_a*3+1], body_vel[bi_a*3+2]);
+            vec3 wa = vec3(body_omega[bi_a*3], body_omega[bi_a*3+1], body_omega[bi_a*3+2]);
+            vec3 vb = vec3(body_vel[bi_b*3], body_vel[bi_b*3+1], body_vel[bi_b*3+2]);
+            vec3 wb = vec3(body_omega[bi_b*3], body_omega[bi_b*3+1], body_omega[bi_b*3+2]);
+
+            // Relative velocity at contact: v_b - v_a (matching pgs_boxes.py convention)
+            vec3 vel_a = va + cross(wa, ra);
+            vec3 vel_b = vb + cross(wb, rb);
+            float vn = dot(vel_b - vel_a, n);
+
+            // Effective mass
+            vec3 ra_x_n = cross(ra, n);
+            vec3 rb_x_n = cross(rb, n);
+            float k = inv_ma + inv_mb
+                    + dot(ra_x_n, apply_inv_I(bi_a, ra_x_n))
+                    + dot(rb_x_n, apply_inv_I(bi_b, rb_x_n));
+
+            // Baumgarte bias
+            float bias = BAUMGARTE * max(pen - SLOP, 0.0) / dt;
+
+            // PGS impulse update (normal)
+            float d_ln = (-vn + bias) / k;
+            float old_ln = lambda_n[ci];
+            float new_ln = max(old_ln + d_ln, 0.0);
+            d_ln = new_ln - old_ln;
+            lambda_n[ci] = new_ln;
+
+            // Apply normal impulse
+            vec3 imp = d_ln * n;
+            body_vel[bi_a*3+0] -= inv_ma * imp.x;
+            body_vel[bi_a*3+1] -= inv_ma * imp.y;
+            body_vel[bi_a*3+2] -= inv_ma * imp.z;
+            vec3 dwa = apply_inv_I(bi_a, cross(ra, imp));
+            body_omega[bi_a*3+0] -= dwa.x;
+            body_omega[bi_a*3+1] -= dwa.y;
+            body_omega[bi_a*3+2] -= dwa.z;
+
+            body_vel[bi_b*3+0] += inv_mb * imp.x;
+            body_vel[bi_b*3+1] += inv_mb * imp.y;
+            body_vel[bi_b*3+2] += inv_mb * imp.z;
+            vec3 dwb = apply_inv_I(bi_b, cross(rb, imp));
+            body_omega[bi_b*3+0] += dwb.x;
+            body_omega[bi_b*3+1] += dwb.y;
+            body_omega[bi_b*3+2] += dwb.z;
+
+            // --- Coulomb friction ---
+            // Re-read velocities after normal impulse
+            va = vec3(body_vel[bi_a*3], body_vel[bi_a*3+1], body_vel[bi_a*3+2]);
+            wa = vec3(body_omega[bi_a*3], body_omega[bi_a*3+1], body_omega[bi_a*3+2]);
+            vb = vec3(body_vel[bi_b*3], body_vel[bi_b*3+1], body_vel[bi_b*3+2]);
+            wb = vec3(body_omega[bi_b*3], body_omega[bi_b*3+1], body_omega[bi_b*3+2]);
+
+            vec3 dv = (vb + cross(wb, rb)) - (va + cross(wa, ra));
+            vec3 vt = dv - dot(dv, n) * n;
+            float vt_len = length(vt);
+            if (vt_len > 1e-6) {
+                vec3 td = vt / vt_len;
+                vec3 ra_x_t = cross(ra, td);
+                vec3 rb_x_t = cross(rb, td);
+                float kt = inv_ma + inv_mb
+                         + dot(ra_x_t, apply_inv_I(bi_a, ra_x_t))
+                         + dot(rb_x_t, apply_inv_I(bi_b, rb_x_t));
+                float d_lt = min(vt_len / kt, FRICTION * lambda_n[ci]);
+
+                vec3 imp_t = d_lt * td;
+                body_vel[bi_a*3+0] += inv_ma * imp_t.x;
+                body_vel[bi_a*3+1] += inv_ma * imp_t.y;
+                body_vel[bi_a*3+2] += inv_ma * imp_t.z;
+                vec3 dwa_t = apply_inv_I(bi_a, cross(ra, imp_t));
+                body_omega[bi_a*3+0] += dwa_t.x;
+                body_omega[bi_a*3+1] += dwa_t.y;
+                body_omega[bi_a*3+2] += dwa_t.z;
+
+                body_vel[bi_b*3+0] -= inv_mb * imp_t.x;
+                body_vel[bi_b*3+1] -= inv_mb * imp_t.y;
+                body_vel[bi_b*3+2] -= inv_mb * imp_t.z;
+                vec3 dwb_t = apply_inv_I(bi_b, cross(rb, imp_t));
+                body_omega[bi_b*3+0] -= dwb_t.x;
+                body_omega[bi_b*3+1] -= dwb_t.y;
+                body_omega[bi_b*3+2] -= dwb_t.z;
+            }
+        }
     }
-
-    // qfrc = Jᵀ · efc_force
-    for (uint bi = 0; bi < nb; bi++)
-        for (int d = 0; d < 6; d++) qfrc[bi*6+d] = 0.0;
-    for (uint ci = 0; ci < nc; ci++) {
-        uint bi_a = geom_body_idx[contact_geom_a[ci]];
-        uint bi_b = geom_body_idx[contact_geom_b[ci]];
-        uint j = ci * 12;
-        float f = efc_force[ci];
-        for (int d = 0; d < 6; d++) qfrc[bi_a*6+d] += jac[j+d] * f;
-        for (int d = 0; d < 6; d++) qfrc[bi_b*6+d] += jac[j+6+d] * f;
-    }
-
-    // --- Initial Hessian + Cholesky ---
-    for (uint bi = 0; bi < nb; bi++) {
-        if (body_inv_mass[bi] <= 0.0) continue;
-
-        // H = M (6x6)
-        for (int r = 0; r < 6; r++)
-            for (int c_ = 0; c_ <= r; c_++)
-                H_set(bi, r, c_, mass_mat(bi, r, c_));
-
-        // H += Jᵀ · D · J for active constraints involving this body
-        for (uint ci = 0; ci < nc; ci++) {
-            bool is_active = Jaref[ci] < 0.0;
-            if (!is_active) continue;
-            float D = efc_D[ci];
-
-            uint bi_a = geom_body_idx[contact_geom_a[ci]];
-            uint bi_b = geom_body_idx[contact_geom_b[ci]];
-
-            // This body's 6 entries in the Jacobian row
-            uint j_offset = 0;
-            if (bi == bi_b) j_offset = 6;
-            else if (bi != bi_a) continue;
-
-            uint j = ci * 12 + j_offset;
-            for (int r = 0; r < 6; r++)
-                for (int c_ = 0; c_ <= r; c_++)
-                    H_set(bi, r, c_, H_get(bi, r, c_) + jac[j+r] * jac[j+c_] * D);
-        }
-
-        // Cholesky factorize H = L·Lᵀ (in-place, lower triangle)
-        for (int i = 0; i < 6; i++) {
-            float tmp = H_get(bi, i, i);
-            for (int k = 0; k < i; k++)
-                tmp -= H_get(bi, i, k) * H_get(bi, i, k);
-            H_set(bi, i, i, sqrt(max(tmp, EPS)));
-
-            float inv_diag = 1.0 / H_get(bi, i, i);
-            for (int j_ = i + 1; j_ < 6; j_++) {
-                float dot_val = 0.0;
-                for (int k = 0; k < i; k++)
-                    dot_val += H_get(bi, j_, k) * H_get(bi, i, k);
-                H_set(bi, j_, i, (H_get(bi, j_, i) - dot_val) * inv_diag);
-            }
-        }
-    }
-
-    // --- Initial gradient + search direction ---
-    // Applied force: force[0..2] = mass*gravity, force[3..5] = 0
-    // grad = Ma - force - qfrc
-    // For qacc=0: Ma=0, grad = -force - qfrc = -(mass*gravity + qfrc)
-    for (uint bi = 0; bi < nb; bi++) {
-        if (body_inv_mass[bi] <= 0.0) continue;
-        float mass = 1.0 / body_inv_mass[bi];
-        uint b = bi * 6;
-
-        // grad = Ma - force - qfrc (Genesis exact)
-        for (int d = 0; d < 6; d++) {
-            float force_d = (d < 3) ? (mass * GRAVITY[d]) : 0.0;
-            grad[b+d] = Ma[b+d] - force_d - qfrc[b+d];
-        }
-
-        // Cholesky solve: H · search = grad → search = H⁻¹ · grad
-        // Forward substitution: L · y = grad
-        float y[6];
-        for (int i = 0; i < 6; i++) {
-            float val = grad[b+i];
-            for (int j_ = 0; j_ < i; j_++)
-                val -= H_get(bi, i, j_) * y[j_];
-            y[i] = val / H_get(bi, i, i);
-        }
-        // Backward substitution: Lᵀ · x = y
-        for (int i = 5; i >= 0; i--) {
-            float val = y[i];
-            for (int j_ = i + 1; j_ < 6; j_++)
-                val -= H_get(bi, j_, i) * search[b+j_];
-            search[b+i] = val / H_get(bi, i, i);
-        }
-
-        // search = -H⁻¹ · grad (descent direction)
-        for (int d = 0; d < 6; d++)
-            search[b+d] = -search[b+d];
-    }
-
-    // --- Newton iterations ---
-    for (int iter = 0; iter < MAX_ITER; iter++) {
-
-        // --- Genesis ls_init: compute mv = M*search, jv = J*search ---
-        for (uint bi = 0; bi < nb; bi++) {
-            if (body_inv_mass[bi] <= 0.0) continue;
-            uint b = bi * 6;
-            for (int d1 = 0; d1 < 6; d1++) {
-                float val = 0.0;
-                for (int d2 = 0; d2 < 6; d2++)
-                    val += mass_mat(bi, d1, d2) * search[b+d2];
-                mv[b+d1] = val;
-            }
-        }
-        for (uint ci = 0; ci < nc; ci++) {
-            uint bi_a = geom_body_idx[contact_geom_a[ci]];
-            uint bi_b = geom_body_idx[contact_geom_b[ci]];
-            uint j = ci * 12;
-            float val = 0.0;
-            for (int d = 0; d < 6; d++) val += jac[j+d] * search[bi_a*6+d];
-            for (int d = 0; d < 6; d++) val += jac[j+6+d] * search[bi_b*6+d];
-            jv[ci] = val;
-        }
-
-        // --- Genesis line search: quadratic model ---
-        // cost(alpha) = gauss(alpha) + sum_c constraint_cost(alpha)
-        // gauss(alpha) = gauss_0 + gauss_1*alpha + gauss_2*alpha^2
-        // gauss_0 = 0.5*(Ma-force)*(qacc-qacc0) [current cost]
-        // gauss_1 = search*(Ma-force)
-        // gauss_2 = 0.5*search*mv
-        float gauss_1 = 0.0, gauss_2 = 0.0;
-        for (uint bi = 0; bi < nb; bi++) {
-            if (body_inv_mass[bi] <= 0.0) continue;
-            float mass = 1.0 / body_inv_mass[bi];
-            uint b = bi * 6;
-            for (int d = 0; d < 6; d++) {
-                float force_d = (d < 3) ? (mass * GRAVITY[d]) : 0.0;
-                gauss_1 += search[b+d] * (Ma[b+d] - force_d);
-                gauss_2 += 0.5 * search[b+d] * mv[b+d];
-            }
-        }
-
-        // Constraint quadratic: for each contact, cost = 0.5*D*Jaref^2 when active
-        // At alpha: Jaref_new = Jaref + alpha*jv
-        // cost_c(alpha) = 0.5*D*(Jaref+alpha*jv)^2 if active
-        // = 0.5*D*Jaref^2 + D*Jaref*jv*alpha + 0.5*D*jv^2*alpha^2
-        // Total deriv at alpha=0: deriv = gauss_1 + sum_c D*Jaref*jv (active)
-        // Total second deriv: deriv2 = 2*gauss_2 + sum_c D*jv^2 (active)
-        float total_1 = gauss_1, total_2 = gauss_2;
-        for (uint ci = 0; ci < nc; ci++) {
-            bool is_act = Jaref[ci] < 0.0;
-            if (!is_act) continue;
-            total_1 += efc_D[ci] * Jaref[ci] * jv[ci];
-            total_2 += 0.5 * efc_D[ci] * jv[ci] * jv[ci];
-        }
-
-        // Newton step on quadratic: alpha = -deriv / (2*second_deriv)
-        float alpha = 0.0;
-        float deriv2 = 2.0 * total_2;
-        if (deriv2 > EPS) {
-            alpha = -total_1 / deriv2;
-            alpha = max(0.0, alpha); // don't go backwards
-        }
-        if (abs(alpha) < EPS) break; // converged
-
-        // --- Update qacc, Ma, Jaref ---
-        for (uint bi = 0; bi < nb; bi++) {
-            if (body_inv_mass[bi] <= 0.0) continue;
-            uint b = bi * 6;
-            for (int d = 0; d < 6; d++) {
-                qacc[b+d] += alpha * search[b+d];
-                Ma[b+d] += alpha * mv[b+d];
-            }
-        }
-        for (uint ci = 0; ci < nc; ci++) {
-            Jaref[ci] += alpha * jv[ci];
-        }
-
-        // Update constraint: efc_force, qfrc
-        for (uint ci = 0; ci < nc; ci++) {
-            bool is_active = Jaref[ci] < 0.0;
-            efc_force[ci] = is_active ? (-efc_D[ci] * Jaref[ci]) : 0.0;
-        }
-
-        for (uint bi = 0; bi < nb; bi++)
-            for (int d = 0; d < 6; d++) qfrc[bi*6+d] = 0.0;
-        for (uint ci = 0; ci < nc; ci++) {
-            uint bi_a = geom_body_idx[contact_geom_a[ci]];
-            uint bi_b = geom_body_idx[contact_geom_b[ci]];
-            uint j = ci * 12;
-            float f = efc_force[ci];
-            for (int d = 0; d < 6; d++) qfrc[bi_a*6+d] += jac[j+d] * f;
-            for (int d = 0; d < 6; d++) qfrc[bi_b*6+d] += jac[j+6+d] * f;
-        }
-
-        // Rebuild Hessian + Cholesky (active set may have changed)
-        for (uint bi = 0; bi < nb; bi++) {
-            if (body_inv_mass[bi] <= 0.0) continue;
-            float mass = 1.0 / body_inv_mass[bi];
-            uint b = bi * 6;
-
-            // H = M
-            for (int r = 0; r < 6; r++)
-                for (int c_ = 0; c_ <= r; c_++)
-                    H_set(bi, r, c_, mass_mat(bi, r, c_));
-
-            // H += Jᵀ·D·J for active constraints
-            for (uint ci = 0; ci < nc; ci++) {
-                bool is_active = Jaref[ci] < 0.0;
-                if (!is_active) continue;
-                float D = efc_D[ci];
-                uint bi_a = geom_body_idx[contact_geom_a[ci]];
-                uint bi_b = geom_body_idx[contact_geom_b[ci]];
-                uint j_offset = 0;
-                if (bi == bi_b) j_offset = 6;
-                else if (bi != bi_a) continue;
-                uint j = ci * 12 + j_offset;
-                for (int r = 0; r < 6; r++)
-                    for (int c_ = 0; c_ <= r; c_++)
-                        H_set(bi, r, c_, H_get(bi, r, c_) + jac[j+r]*jac[j+c_]*D);
-            }
-
-            // Cholesky
-            for (int i = 0; i < 6; i++) {
-                float tmp = H_get(bi, i, i);
-                for (int k = 0; k < i; k++) tmp -= H_get(bi, i, k) * H_get(bi, i, k);
-                H_set(bi, i, i, sqrt(max(tmp, EPS)));
-                float inv_diag = 1.0 / H_get(bi, i, i);
-                for (int j_ = i+1; j_ < 6; j_++) {
-                    float dot_val = 0.0;
-                    for (int k = 0; k < i; k++) dot_val += H_get(bi, j_, k) * H_get(bi, i, k);
-                    H_set(bi, j_, i, (H_get(bi, j_, i) - dot_val) * inv_diag);
-                }
-            }
-
-            // Gradient: grad = Ma - force - qfrc (Genesis exact)
-            for (int d = 0; d < 6; d++) {
-                float force_d = (d < 3) ? (mass * GRAVITY[d]) : 0.0;
-                grad[b+d] = Ma[b+d] - force_d - qfrc[b+d];
-            }
-
-            // Cholesky solve: search = -H⁻¹ · grad
-            float y[6];
-            for (int i = 0; i < 6; i++) {
-                float val = grad[b+i];
-                for (int j_ = 0; j_ < i; j_++) val -= H_get(bi, i, j_) * y[j_];
-                y[i] = val / H_get(bi, i, i);
-            }
-            for (int i = 5; i >= 0; i--) {
-                float val = y[i];
-                for (int j_ = i+1; j_ < 6; j_++) val -= H_get(bi, j_, i) * search[b+j_];
-                search[b+i] = val / H_get(bi, i, i);
-            }
-            for (int d = 0; d < 6; d++) search[b+d] = -search[b+d];
-        }
-
-        // Check convergence: if gradient is small, stop
-        float grad_norm = 0.0;
-        for (uint bi = 0; bi < nb; bi++) {
-            if (body_inv_mass[bi] <= 0.0) continue;
-            uint b = bi * 6;
-            for (int d = 0; d < 6; d++) grad_norm += grad[b+d] * grad[b+d];
-        }
-        if (grad_norm < EPS) break;
-    }
-
-    // qacc now contains the solved accelerations including gravity + contact corrections
-    // Step 4 will apply: vel += qacc * dt
-}
-
-// --- Step 4: Apply qacc to velocities ---
-
-void step_apply_qacc() {
-    uint bi = gl_GlobalInvocationID.x;
-    if (bi >= count) return;
-    if (body_inv_mass[bi] <= 0.0) return;
-
-    uint b = bi * 6;
-    body_vel[bi*3+0] += qacc[b+0] * dt;
-    body_vel[bi*3+1] += qacc[b+1] * dt;
-    body_vel[bi*3+2] += qacc[b+2] * dt;
-    body_omega[bi*3+0] += qacc[b+3] * dt;
-    body_omega[bi*3+1] += qacc[b+4] * dt;
-    body_omega[bi*3+2] += qacc[b+5] * dt;
 }
 
 // --- Main ---
@@ -598,9 +216,6 @@ void step_apply_qacc() {
 void main() {
     switch (step) {
         case 0: step_compute_world_inertia(); break;
-        case 1: step_build_jacobian(); break;
-        case 2: step_init_qacc(); break;
-        case 3: step_newton_solve(); break;
-        case 4: step_apply_qacc(); break;
+        case 1: step_solve(); break;
     }
 }

@@ -28,12 +28,14 @@ pub fn fileExists(path: [*:0]const u8) bool {
     return true;
 }
 
+/// Get file modification time (seconds since epoch). Returns 0 if file doesn't exist.
 pub fn mtime(path: [*:0]const u8) i64 {
     var st: libc.struct_stat = undefined;
     if (libc.stat(path, &st) != 0) return 0;
     return @intCast(st.st_mtim.tv_sec);
 }
 
+/// Check if file a is newer than file b
 pub fn isNewer(a: [*:0]const u8, b: [*:0]const u8) bool {
     return mtime(a) > mtime(b);
 }

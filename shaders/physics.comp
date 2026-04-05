@@ -121,23 +121,22 @@ void step_compute_aabb() {
     uint bi = geom_body_idx[i];
     uint vs = body_vert_start[bi];
     uint vc = body_vert_count[bi];
-    vec3 center = vec3(body_pos[bi*3], body_pos[bi*3+1], body_pos[bi*3+2]);
 
+    // Compute local AABB from original (local-space) vertices — not world verts
     vec3 amin = vec3(1e10);
     vec3 amax = vec3(-1e10);
     for (uint v = vs; v < vs + vc; v++) {
-        vec3 p = vec3(verts[v*3], verts[v*3+1], verts[v*3+2]);
+        vec3 p = vec3(orig_verts[v*3], orig_verts[v*3+1], orig_verts[v*3+2]);
         amin = min(amin, p);
         amax = max(amax, p);
     }
 
-    // Store as local AABB (relative to center)
-    geom_aabb_min[i*3]   = amin.x - center.x;
-    geom_aabb_min[i*3+1] = amin.y - center.y;
-    geom_aabb_min[i*3+2] = amin.z - center.z;
-    geom_aabb_max[i*3]   = amax.x - center.x;
-    geom_aabb_max[i*3+1] = amax.y - center.y;
-    geom_aabb_max[i*3+2] = amax.z - center.z;
+    geom_aabb_min[i*3]   = amin.x;
+    geom_aabb_min[i*3+1] = amin.y;
+    geom_aabb_min[i*3+2] = amin.z;
+    geom_aabb_max[i*3]   = amax.x;
+    geom_aabb_max[i*3+1] = amax.y;
+    geom_aabb_max[i*3+2] = amax.z;
 }
 
 // --- Step 2: Broad phase (N^2 AABB overlap test) ---

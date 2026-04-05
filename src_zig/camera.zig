@@ -22,6 +22,7 @@ pub const Camera = struct {
     }
 
     pub fn update(self: *Camera, window: *c.GLFWwindow, dt: f32) void {
+        // Movement
         const ry = self.yaw * math.pi / 180.0;
         const cos_ry = @cos(ry);
         const sin_ry = @sin(ry);
@@ -67,25 +68,29 @@ pub const Camera = struct {
         self.last_mouse = .{ mx, my };
     }
 
-    /// Build a view-projection matrix (column-major, OpenGL clip space)
+    /// Build a view-projection matrix (column-major, Vulkan clip space)
     pub fn mvp(self: *const Camera, aspect: f32) [16]f32 {
+        // Direction from yaw/pitch
         const ry = self.yaw * math.pi / 180.0;
         const rp = self.pitch * math.pi / 180.0;
         const dx = @cos(rp) * @cos(ry);
         const dy = @sin(rp);
         const dz = @cos(rp) * @sin(ry);
 
+        // Right = normalize(direction x up)
         const rx = -dz;
         const rz = dx;
         const rl = @sqrt(rx * rx + rz * rz);
         const right = [3]f32{ rx / rl, 0, rz / rl };
 
+        // Up = right x direction
         const up = [3]f32{
             0 * dz - right[2] * dy,
             right[2] * dx - right[0] * dz,
             right[0] * dy - 0 * dx,
         };
 
+        // View matrix (column-major): transpose of [right, up, -forward] with translation
         const tx = -(right[0] * self.pos[0] + right[1] * self.pos[1] + right[2] * self.pos[2]);
         const ty = -(up[0] * self.pos[0] + up[1] * self.pos[1] + up[2] * self.pos[2]);
         const tz = dx * self.pos[0] + dy * self.pos[1] + dz * self.pos[2];
@@ -104,12 +109,13 @@ pub const Camera = struct {
         const f = 1.0 / @tan(fov / 2.0);
 
         const proj = [16]f32{
-            f / aspect, 0,  0,                           0,
-            0,          -f, 0,                           0,
-            0,          0,  far / (near - far),          -1,
-            0,          0,  (near * far) / (near - far), 0,
+            f / aspect, 0,  0,                              0,
+            0,          -f, 0,                              0,
+            0,          0,  far / (near - far),             -1,
+            0,          0,  (near * far) / (near - far),    0,
         };
 
+        // result = proj * view
         return matMul(proj, view);
     }
 };
