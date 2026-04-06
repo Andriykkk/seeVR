@@ -65,19 +65,25 @@ pub fn main() !void {
 
     std.debug.print("Mode: {s} | {} vertices, {} triangles, {} bodies, {} geoms\n", .{
         if (comptime raytrace_mode) "raytrace" else "raster",
-        d.num_vertices, d.num_triangles, d.num_bodies, d.num_geoms,
+        d.num_vertices,
+        d.num_triangles,
+        d.num_bodies,
+        d.num_geoms,
     });
 
     var camera = Camera.init(0, 5, 15, -90, -15);
     const aspect: f32 = @as(f32, @floatFromInt(WIDTH)) / @as(f32, @floatFromInt(HEIGHT));
     var last_time: f64 = c.glfwGetTime();
+    var fps_smooth: f32 = 0;
+    var frame: u64 = 0;
 
     while (!scene.shouldClose()) {
         const now = c.glfwGetTime();
         const dt: f32 = @floatCast(now - last_time);
         last_time = now;
+        if (dt > 0) fps_smooth = 0.95 * fps_smooth + 0.05 * (1.0 / dt);
         if (comptime Gui != void) {
-            if (dt > 0) gui.fps = 0.95 * gui.fps + 0.05 * (1.0 / dt);
+            gui.fps = fps_smooth;
         }
 
         scene.pollEvents();
@@ -92,6 +98,15 @@ pub fn main() !void {
             try scene.beginFrame();
             scene.blitRtImage();
             try scene.endFrame();
+
+            frame += 1;
+            if (frame % 60 == 0) {
+                const rays_per_frame = @as(u64, WIDTH) * @as(u64, HEIGHT) * 3 * 4;
+                const mrays = @as(f32, @floatFromInt(rays_per_frame)) * fps_smooth / 1_000_000.0;
+                std.debug.print("FPS: {d:.0}  verts: {}  tris: {}  bodies: {}  rays: {d:.1} Mray/s\n", .{
+                    fps_smooth, d.num_vertices, d.num_triangles, d.num_bodies, mrays,
+                });
+            }
         } else {
             // Rasterize
             const mvp = camera.mvp(aspect);

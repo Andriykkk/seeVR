@@ -30,6 +30,7 @@ layout(set=0, binding=9) buffer BvhPrim    { uint  prim_idx[]; };
 
 const float PI = 3.14159265;
 const int MAX_BOUNCES = 3;
+const int SAMPLES_PER_PIXEL = 4;
 
 // ======================== RNG ========================
 
@@ -160,43 +161,49 @@ void main() {
     float fov_scale = tan(30.0 * PI / 180.0);
     float aspect = float(width) / float(height);
 
-    uint seed = px + py * width + frame_num * width * height;
+    vec3 pixel_color = vec3(0.0);
 
-    float jx = rand_f(seed) - 0.5;
-    float jy = rand_f(seed + 1u) - 0.5;
+    for (int si = 0; si < SAMPLES_PER_PIXEL; si++) {
+        uint seed = px + py * width + frame_num * width * height + uint(si) * 12345u;
 
-    float u = (2.0 * (float(px) + 0.5 + jx) / float(width) - 1.0) * aspect * fov_scale;
-    float v = -(2.0 * (float(py) + 0.5 + jy) / float(height) - 1.0) * fov_scale;
+        float jx = rand_f(seed) - 0.5;
+        float jy = rand_f(seed + 1u) - 0.5;
 
-    vec3 rd = normalize(cam_dir + u * cam_right + v * cam_up);
-    vec3 ro = cam_pos;
+        float u = (2.0 * (float(px) + 0.5 + jx) / float(width) - 1.0) * aspect * fov_scale;
+        float v = -(2.0 * (float(py) + 0.5 + jy) / float(height) - 1.0) * fov_scale;
 
-    vec3 throughput = vec3(1.0);
-    vec3 color = vec3(0.0);
+        vec3 rd = normalize(cam_dir + u * cam_right + v * cam_up);
+        vec3 ro = cam_pos;
 
-    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
-        float t;
-        vec3 normal, albedo;
-        trace(ro, rd, t, normal, albedo);
+        vec3 throughput = vec3(1.0);
+        vec3 color = vec3(0.0);
 
-        if (t >= 1e9) {
-            color += throughput * sky_color(rd);
-            break;
+        for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+            float t;
+            vec3 normal, albedo;
+            trace(ro, rd, t, normal, albedo);
+
+            if (t >= 1e9) {
+                color += throughput * sky_color(rd);
+                break;
+            }
+
+            vec3 hit = ro + rd * t;
+            throughput *= albedo;
+
+            if (bounce > 0) {
+                float p = max(throughput.x, max(throughput.y, throughput.z));
+                if (rand_f(seed + uint(bounce) * 7u) > p) break;
+                throughput /= p;
+            }
+
+            seed = pcg(seed);
+            rd = sample_hemisphere(normal, seed, seed + 1u);
+            ro = hit + normal * 0.001;
         }
 
-        vec3 hit = ro + rd * t;
-        throughput *= albedo;
-
-        if (bounce > 0) {
-            float p = max(throughput.x, max(throughput.y, throughput.z));
-            if (rand_f(seed + uint(bounce) * 7u) > p) break;
-            throughput /= p;
-        }
-
-        seed = pcg(seed);
-        rd = sample_hemisphere(normal, seed, seed + 1u);
-        ro = hit + normal * 0.001;
+        pixel_color += color;
     }
 
-    imageStore(rt_image, ivec2(px, py), vec4(color, 1.0));
+    imageStore(rt_image, ivec2(px, py), vec4(pixel_color / float(SAMPLES_PER_PIXEL), 1.0));
 }
