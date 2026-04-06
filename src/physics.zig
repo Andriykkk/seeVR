@@ -19,8 +19,8 @@ pub const Physics = struct {
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator) !Physics {
         const shader = try vk.getShader("src/shaders/physics.comp", .compute, allocator);
 
-        // 18 bindings matching physics.comp layout
-        const buffers = [18]Vulkan.Buffer{
+        // 21 bindings matching physics.comp
+        const buffers = [21]Vulkan.Buffer{
             data.body_pos,           // 0
             data.body_quat,          // 1
             data.body_vel,           // 2
@@ -39,9 +39,12 @@ pub const Physics = struct {
             data.contact_body_b,     // 15
             data.contact_lambda_n,   // 16
             data.atomic_counters,    // 17
+            data.body_aabb_min,      // 18
+            data.body_aabb_max,      // 19
+            data.collision_pairs,    // 20
         };
 
-        const pipe = try vk.createComputePipeline(shader, 18, &buffers, @sizeOf(PC));
+        const pipe = try vk.createComputePipeline(shader, 21, &buffers, @sizeOf(PC));
         return .{ .vk = vk, .pipe = pipe };
     }
 
@@ -50,6 +53,11 @@ pub const Physics = struct {
 
         const vk = self.vk;
         const groups = @max((num_bodies + 255) / 256, 1);
+        const gx = gravity[0];
+        const gy = gravity[1];
+        const gz = gravity[2];
+        const max_c: u32 = @import("data.zig").MAX_CONTACTS;
+        const max_p: u32 = @import("data.zig").MAX_COLLISION_PAIRS;
 
         var cmd: c.VkCommandBuffer = null;
         _ = c.vkAllocateCommandBuffers(vk.device, &c.VkCommandBufferAllocateInfo{
@@ -77,38 +85,41 @@ pub const Physics = struct {
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipe.pipeline);
         c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipe.layout, 0, 1, &self.pipe.desc_set, 0, null);
 
-        const gx = gravity[0];
-        const gy = gravity[1];
-        const gz = gravity[2];
+        // 8: Clear counters (pairs + contacts)
+        dispatch(cmd, self.pipe.layout, .{ .step = 8, .count = 1, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
+        bar(cmd, &barrier);
 
-        // Clear counters
-        self.dispatch(cmd, .{ .step = 6, .count = 1, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
-        self.bar(cmd, &barrier);
+        // 0: Gravity
+        dispatch(cmd, self.pipe.layout, .{ .step = 0, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+        bar(cmd, &barrier);
 
-        // Gravity + damping
-        self.dispatch(cmd, .{ .step = 0, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
-        self.bar(cmd, &barrier);
+        // 1: Compute AABB
+        dispatch(cmd, self.pipe.layout, .{ .step = 1, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+        bar(cmd, &barrier);
 
-        // Detect contacts (SAT)
-        self.dispatch(cmd, .{ .step = 1, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
-        self.bar(cmd, &barrier);
+        // 2: Broad phase (AABB overlap → pairs)
+        dispatch(cmd, self.pipe.layout, .{ .step = 2, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+        bar(cmd, &barrier);
 
-        // Clear impulses
-        self.dispatch(cmd, .{ .step = 2, .count = @import("data.zig").MAX_CONTACTS, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (@import("data.zig").MAX_CONTACTS + 255) / 256);
-        self.bar(cmd, &barrier);
+        // 3: Narrow phase (SAT only on pairs)
+        dispatch(cmd, self.pipe.layout, .{ .step = 3, .count = max_p, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (max_p + 255) / 256);
+        bar(cmd, &barrier);
 
-        // PGS solve (serial)
-        self.dispatch(cmd, .{ .step = 3, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
-        self.bar(cmd, &barrier);
+        // 4: Clear impulses
+        dispatch(cmd, self.pipe.layout, .{ .step = 4, .count = max_c, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (max_c + 255) / 256);
+        bar(cmd, &barrier);
 
-        // Integrate
-        self.dispatch(cmd, .{ .step = 4, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
-        self.bar(cmd, &barrier);
+        // 5: PGS solve (serial)
+        dispatch(cmd, self.pipe.layout, .{ .step = 5, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
+        bar(cmd, &barrier);
 
-        // Update render vertices
-        self.dispatch(cmd, .{ .step = 5, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+        // 6: Integrate
+        dispatch(cmd, self.pipe.layout, .{ .step = 6, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+        bar(cmd, &barrier);
 
-        // Compute → vertex read
+        // 7: Update render vertices
+        dispatch(cmd, self.pipe.layout, .{ .step = 7, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &barrier, 0, null, 0, null);
 
         _ = c.vkEndCommandBuffer(cmd);
@@ -131,13 +142,13 @@ pub const Physics = struct {
         return result;
     }
 
-    fn dispatch(self: *Physics, cmd: c.VkCommandBuffer, pc: PC, group_count: u32) void {
-        c.vkCmdPushConstants(cmd, self.pipe.layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PC), @ptrCast(&pc));
+    fn dispatch(cmd: c.VkCommandBuffer, layout: c.VkPipelineLayout, pc: PC, group_count: u32) void {
+        c.vkCmdPushConstants(cmd, layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PC), @ptrCast(&pc));
         c.vkCmdDispatch(cmd, group_count, 1, 1);
     }
 
-    fn bar(_: *Physics, cmd: c.VkCommandBuffer, barrier: *const c.VkMemoryBarrier) void {
-        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, barrier, 0, null, 0, null);
+    fn bar(cmd: c.VkCommandBuffer, b: *const c.VkMemoryBarrier) void {
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, b, 0, null, 0, null);
     }
 
     pub fn deinit(self: *Physics) void {

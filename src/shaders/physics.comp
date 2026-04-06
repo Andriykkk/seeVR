@@ -3,8 +3,8 @@
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
-    uint step;      // 0=gravity, 1=detect, 2=clear, 3=solve, 4=integrate, 5=update_verts, 6=clear_counters
-    uint count;     // num_bodies or num_geoms depending on step
+    uint step;
+    uint count;
     float dt;
     float gravity_x;
     float gravity_y;
@@ -18,7 +18,7 @@ layout(set=0, binding=2)  buffer BVel       { float body_vel[]; };
 layout(set=0, binding=3)  buffer BOmega     { float body_omega[]; };
 layout(set=0, binding=4)  buffer BInvMass   { float body_inv_mass[]; };
 layout(set=0, binding=5)  buffer BInvInertia{ float body_inv_inertia[]; };
-layout(set=0, binding=6)  buffer BHalf      { float body_half[]; };  // half_size per body (float3)
+layout(set=0, binding=6)  buffer BHalf      { float body_half[]; };
 layout(set=0, binding=7)  buffer BVertStart { uint  body_vert_start[]; };
 layout(set=0, binding=8)  buffer BVertCount { uint  body_vert_count[]; };
 
@@ -34,18 +34,22 @@ layout(set=0, binding=14) buffer CBodyA     { uint  contact_body_a[]; };
 layout(set=0, binding=15) buffer CBodyB     { uint  contact_body_b[]; };
 layout(set=0, binding=16) buffer CLambdaN   { float lambda_n[]; };
 
-// Counters: [0] = num_contacts
+// Counters: [0]=num_pairs, [1]=num_contacts
 layout(set=0, binding=17) buffer Counters   { uint  counters[]; };
+
+// Broad phase
+layout(set=0, binding=18) buffer BAabbMin   { float body_aabb_min[]; };
+layout(set=0, binding=19) buffer BAabbMax   { float body_aabb_max[]; };
+layout(set=0, binding=20) buffer ColPairs   { uint  collision_pairs[]; };
 
 const float FRICTION = 0.5;
 const float BAUMGARTE = 0.2;
 const float SLOP = 0.005;
 const int PGS_ITERATIONS = 30;
 const int MAX_CONTACTS = 4000;
+const int MAX_PAIRS = 10000;
 
-// ======================== Quaternion helpers ========================
-
-// Quat layout: body_quat[i*4+0..3] = (x, y, z, w) matching pgs_boxes.py
+// ======================== Helpers ========================
 
 mat3 quat_to_mat(uint bi) {
     float x = body_quat[bi*4+0];
@@ -70,7 +74,6 @@ void set_omega(uint bi, vec3 w){ body_omega[bi*3]=w.x; body_omega[bi*3+1]=w.y; b
 
 vec3 col3(mat3 M, int c) { return vec3(M[c][0], M[c][1], M[c][2]); }
 
-// apply_inv_I: R @ (inv_I_local * (R^T @ v))
 vec3 apply_inv_I(uint bi, vec3 v) {
     mat3 R = quat_to_mat(bi);
     vec3 inv_i = get_inv_i(bi);
@@ -103,7 +106,6 @@ void sat_test(uint a, uint b,
     best_n = vec3(0, 1, 0);
     int sep = 0;
 
-    // A's 3 face normals
     for (int i = 0; i < 3; i++) {
         float ra_ = ha[i];
         float rb_ = hb[0]*absC[0][i] + hb[1]*absC[1][i] + hb[2]*absC[2][i];
@@ -115,7 +117,6 @@ void sat_test(uint a, uint b,
         }
     }
 
-    // B's 3 face normals
     for (int i = 0; i < 3; i++) {
         float tp = t[0]*C[i][0] + t[1]*C[i][1] + t[2]*C[i][2];
         float ra_ = ha[0]*absC[i][0] + ha[1]*absC[i][1] + ha[2]*absC[i][2];
@@ -128,7 +129,6 @@ void sat_test(uint a, uint b,
         }
     }
 
-    // 9 edge-cross axes
     for (int i = 0; i < 3; i++) {
         int i0 = (i+1)%3, i1 = (i+2)%3;
         for (int j = 0; j < 3; j++) {
@@ -157,7 +157,7 @@ void sat_test(uint a, uint b,
 // ======================== Contact generation ========================
 
 void add_contact(vec3 cp, vec3 n, float pen, uint ba, uint bb) {
-    uint idx = atomicAdd(counters[0], 1);
+    uint idx = atomicAdd(counters[1], 1);
     if (idx < MAX_CONTACTS) {
         contact_pos[idx*3]   = cp.x;
         contact_pos[idx*3+1] = cp.y;
@@ -182,7 +182,6 @@ void add_face_contacts(uint ref, uint inc, int ref_face, vec3 normal) {
     vec3 tan1 = col3(R_ref, rt1);
     vec3 tan2 = col3(R_ref, rt2);
 
-    // Find incident face
     float min_d = 1e10;
     int inc_ax = 0; float inc_sg = 1.0;
     for (int k = 0; k < 3; k++) {
@@ -261,7 +260,7 @@ void add_edge_contact(uint a, uint b, int ei, int ej, vec3 normal, float pen) {
 
 // ======================== Steps ========================
 
-// Step 0: apply gravity (parallel per body)
+// Step 0: apply gravity (per body)
 void step_gravity() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= count) return;
@@ -275,41 +274,90 @@ void step_gravity() {
     body_omega[i*3+2] *= 0.998;
 }
 
-// Step 1: detect contacts (N² SAT, parallel per pair-row)
-void step_detect() {
+// Step 1: compute AABB per body from pos + quat + half-extents (per body)
+void step_compute_aabb() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= count) return;
+
+    vec3 p = get_pos(i);
+    vec3 h = get_half(i);
+    mat3 R = quat_to_mat(i);
+
+    // World-space half-extents: project rotated axes
+    vec3 ex = abs(col3(R, 0)) * h.x;
+    vec3 ey = abs(col3(R, 1)) * h.y;
+    vec3 ez = abs(col3(R, 2)) * h.z;
+    vec3 wh = ex + ey + ez;
+
+    body_aabb_min[i*3+0] = p.x - wh.x;
+    body_aabb_min[i*3+1] = p.y - wh.y;
+    body_aabb_min[i*3+2] = p.z - wh.z;
+    body_aabb_max[i*3+0] = p.x + wh.x;
+    body_aabb_max[i*3+1] = p.y + wh.y;
+    body_aabb_max[i*3+2] = p.z + wh.z;
+}
+
+// Step 2: broad phase — N² AABB overlap, output pairs (per body row)
+void step_broad_phase() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+
+    vec3 min_a = vec3(body_aabb_min[i*3], body_aabb_min[i*3+1], body_aabb_min[i*3+2]);
+    vec3 max_a = vec3(body_aabb_max[i*3], body_aabb_max[i*3+1], body_aabb_max[i*3+2]);
 
     for (uint j = i + 1; j < count; j++) {
         if (body_inv_mass[i] <= 0.0 && body_inv_mass[j] <= 0.0) continue;
 
-        int overlap, ref_is_a, best_face;
-        float pen; vec3 normal;
-        sat_test(i, j, overlap, ref_is_a, best_face, pen, normal);
+        vec3 min_b = vec3(body_aabb_min[j*3], body_aabb_min[j*3+1], body_aabb_min[j*3+2]);
+        vec3 max_b = vec3(body_aabb_max[j*3], body_aabb_max[j*3+1], body_aabb_max[j*3+2]);
 
-        if (overlap == 1) {
-            if (ref_is_a == 1) {
-                add_face_contacts(i, j, best_face, normal);
-            } else if (ref_is_a == 0) {
-                add_face_contacts(j, i, best_face, -normal);
-            } else {
-                add_edge_contact(i, j, best_face / 3, best_face % 3, normal, pen);
+        bool overlap = !(max_a.x < min_b.x || max_b.x < min_a.x ||
+                         max_a.y < min_b.y || max_b.y < min_a.y ||
+                         max_a.z < min_b.z || max_b.z < min_a.z);
+        if (overlap) {
+            uint idx = atomicAdd(counters[0], 1);
+            if (idx < MAX_PAIRS) {
+                collision_pairs[idx*2]   = i;
+                collision_pairs[idx*2+1] = j;
             }
         }
     }
 }
 
-// Step 2: clear impulses
+// Step 3: narrow phase — SAT only on broad phase pairs
+void step_narrow_phase() {
+    uint pi = gl_GlobalInvocationID.x;
+    uint num_pairs = min(counters[0], MAX_PAIRS);
+    if (pi >= num_pairs) return;
+
+    uint a = collision_pairs[pi*2];
+    uint b = collision_pairs[pi*2+1];
+
+    int overlap, ref_is_a, best_face;
+    float pen; vec3 normal;
+    sat_test(a, b, overlap, ref_is_a, best_face, pen, normal);
+
+    if (overlap == 1) {
+        if (ref_is_a == 1)
+            add_face_contacts(a, b, best_face, normal);
+        else if (ref_is_a == 0)
+            add_face_contacts(b, a, best_face, -normal);
+        else
+            add_edge_contact(a, b, best_face / 3, best_face % 3, normal, pen);
+    }
+}
+
+// Step 4: clear impulses
 void step_clear() {
     uint i = gl_GlobalInvocationID.x;
     if (i < MAX_CONTACTS) lambda_n[i] = 0.0;
 }
 
-// Step 3: PGS solve (serial, single thread)
+// Step 5: PGS solve (serial)
 void step_solve() {
     if (gl_GlobalInvocationID.x != 0) return;
 
-    uint nc = min(counters[0], MAX_CONTACTS);
+    uint nc = min(counters[1], MAX_CONTACTS);
 
     for (int iter = 0; iter < PGS_ITERATIONS; iter++) {
         for (uint ci = 0; ci < nc; ci++) {
@@ -373,21 +421,18 @@ void step_solve() {
     }
 }
 
-// Step 4: integrate (parallel per body)
+// Step 6: integrate (per body)
 void step_integrate() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= count) return;
     if (body_inv_mass[i] <= 0.0) return;
 
-    // Position
     body_pos[i*3+0] += body_vel[i*3+0] * dt;
     body_pos[i*3+1] += body_vel[i*3+1] * dt;
     body_pos[i*3+2] += body_vel[i*3+2] * dt;
 
-    // Quaternion: q += 0.5 * (omega, 0) * q * dt
     float ox = body_omega[i*3], oy = body_omega[i*3+1], oz = body_omega[i*3+2];
     float qx = body_quat[i*4], qy = body_quat[i*4+1], qz = body_quat[i*4+2], qw = body_quat[i*4+3];
-    // quat_mul((ox,oy,oz,0), (qx,qy,qz,qw))
     float dx = 0.0*qx + ox*qw + oy*qz - oz*qy;
     float dy = 0.0*qy - ox*qz + oy*qw + oz*qx;
     float dz = 0.0*qz + ox*qy - oy*qx + oz*qw;
@@ -402,7 +447,7 @@ void step_integrate() {
     body_quat[i*4]=qx; body_quat[i*4+1]=qy; body_quat[i*4+2]=qz; body_quat[i*4+3]=qw;
 }
 
-// Step 5: update render vertices (parallel per body)
+// Step 7: update render vertices (per body)
 void step_update_verts() {
     uint b = gl_GlobalInvocationID.x;
     if (b >= count) return;
@@ -421,22 +466,23 @@ void step_update_verts() {
     }
 }
 
-// Step 6: clear counters
+// Step 8: clear counters
 void step_clear_counters() {
     if (gl_GlobalInvocationID.x != 0) return;
-    counters[0] = 0;
+    counters[0] = 0;  // num_pairs
+    counters[1] = 0;  // num_contacts
 }
-
-// ======================== Main ========================
 
 void main() {
     switch (step) {
         case 0: step_gravity();        break;
-        case 1: step_detect();         break;
-        case 2: step_clear();          break;
-        case 3: step_solve();          break;
-        case 4: step_integrate();      break;
-        case 5: step_update_verts();   break;
-        case 6: step_clear_counters(); break;
+        case 1: step_compute_aabb();   break;
+        case 2: step_broad_phase();    break;
+        case 3: step_narrow_phase();   break;
+        case 4: step_clear();          break;
+        case 5: step_solve();          break;
+        case 6: step_integrate();      break;
+        case 7: step_update_verts();   break;
+        case 8: step_clear_counters(); break;
     }
 }

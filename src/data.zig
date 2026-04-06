@@ -11,6 +11,7 @@ pub const MAX_TRIANGLES: u32 = 10_000;
 pub const MAX_BODIES: u32 = 256;
 pub const MAX_GEOMS: u32 = 256;
 pub const MAX_CONTACTS: u32 = 4_000;
+pub const MAX_COLLISION_PAIRS: u32 = 10_000;
 
 pub const Data = struct {
     vk: *Vulkan,
@@ -42,6 +43,11 @@ pub const Data = struct {
     geom_data: Buffer, // [MAX_GEOMS*7] float — shape params: box=[half_x,half_y,half_z,0,0,0,0]
     geom_friction: Buffer, // [MAX_GEOMS] float — Coulomb friction coefficient
 
+    // ---- GPU Broad phase ----
+    body_aabb_min: Buffer, // [MAX_BODIES] float3 — AABB min, computed each frame from pos+quat+half
+    body_aabb_max: Buffer, // [MAX_BODIES] float3 — AABB max
+    collision_pairs: Buffer, // [MAX_COLLISION_PAIRS*2] uint — pairs of body indices from broad phase
+
     // ---- GPU Contact buffers (written by collision, read by solver) ----
     contact_pos: Buffer, // [MAX_CONTACTS] float3 — contact point in world space
     contact_normal: Buffer, // [MAX_CONTACTS] float3 — contact normal direction
@@ -51,7 +57,7 @@ pub const Data = struct {
     contact_lambda_n: Buffer, // [MAX_CONTACTS] float — PGS accumulated normal impulse
 
     // ---- GPU Counters ----
-    atomic_counters: Buffer, // [4] uint — [0]=num_contacts, used by collision+solver
+    atomic_counters: Buffer, // [4] uint — [0]=num_pairs, [1]=num_contacts
 
     // ---- CPU staging — render ----
     s_vertices: []f32, // staging for vertices
@@ -112,6 +118,10 @@ pub const Data = struct {
             .geom_local_quat = try vk.createBuffer(MAX_GEOMS * @sizeOf([4]f32), STORAGE),
             .geom_data = try vk.createBuffer(MAX_GEOMS * @sizeOf([7]f32), STORAGE),
             .geom_friction = try vk.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
+
+            .body_aabb_min = try vk.createBuffer(MAX_BODIES * @sizeOf([3]f32), STORAGE),
+            .body_aabb_max = try vk.createBuffer(MAX_BODIES * @sizeOf([3]f32), STORAGE),
+            .collision_pairs = try vk.createBuffer(MAX_COLLISION_PAIRS * 2 * @sizeOf(u32), STORAGE),
 
             .contact_pos = try vk.createBuffer(MAX_CONTACTS * @sizeOf([3]f32), STORAGE),
             .contact_normal = try vk.createBuffer(MAX_CONTACTS * @sizeOf([3]f32), STORAGE),
