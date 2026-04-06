@@ -59,7 +59,7 @@ pub const Scene = struct {
             .depth_memory = null,
             .depth_view = null,
             .render_pass = null,
-            .framebuffers = undefined,
+            .framebuffers = .{ null, null, null, null, null, null, null, null },
             .pipeline_layout = null,
             .pipeline = null,
             .rt_image = null,
@@ -448,7 +448,7 @@ pub const Scene = struct {
             c.vkDestroyFence(dev, self.in_flight[i], null);
         }
         for (0..self.swapchain_count) |i| {
-            c.vkDestroyFramebuffer(dev, self.framebuffers[i], null);
+            if (self.framebuffers[i] != null) c.vkDestroyFramebuffer(dev, self.framebuffers[i], null);
             c.vkDestroyImageView(dev, self.swapchain_views[i], null);
         }
         if (self.depth_view != null) c.vkDestroyImageView(dev, self.depth_view, null);

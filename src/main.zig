@@ -7,6 +7,7 @@ const Camera = @import("camera.zig").Camera;
 const Physics = @import("physics.zig").Physics;
 const build_options = @import("build_options");
 const Gui = if (build_options.enable_imgui) @import("gui.zig").Gui else void;
+const BVH = if (build_options.raytrace) @import("bvh.zig").BVH else void;
 const raytrace_mode = build_options.raytrace;
 
 const WIDTH = 800;
@@ -52,6 +53,9 @@ pub fn main() !void {
     var physics = try Physics.init(&vk_ctx, &d, allocator);
     defer physics.deinit();
 
+    var bvh = if (comptime BVH != void) try BVH.init(&vk_ctx, &d, allocator) else {};
+    defer if (comptime BVH != void) bvh.deinit();
+
     var gui = if (comptime Gui != void) try Gui.init(&vk_ctx, &scene, window) else {};
     defer if (comptime Gui != void) gui.deinit();
 
@@ -79,9 +83,10 @@ pub fn main() !void {
         try physics.step(d.num_bodies, 10, 1.0 / 60.0, .{ 0, -9.81, 0 });
 
         if (comptime raytrace_mode) {
-            // TODO: BVH build + raytrace compute dispatch writing to scene.rt_image
+            try bvh.build(d.num_triangles);
+            // TODO: raytrace compute dispatch writing to scene.rt_image
             try scene.beginFrame();
-            scene.blitRtImage(); // blit rt_image → swapchain
+            scene.blitRtImage();
             try scene.endFrame();
         } else {
             // Rasterize

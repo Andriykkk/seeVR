@@ -1,6 +1,8 @@
 const std = @import("std");
 const Vulkan = @import("vulkan.zig").Vulkan;
 const Buffer = Vulkan.Buffer;
+const build_options = @import("build_options");
+const is_raytrace = build_options.raytrace;
 
 const VERTEX = Vulkan.USAGE_VERTEX;
 const INDEX = Vulkan.USAGE_INDEX;
@@ -66,6 +68,22 @@ pub const Data = struct {
 
     // ---- GPU Counters ----
     atomic_counters: Buffer, // [4] uint — [0]=num_pairs, [1]=num_contacts
+
+    // ---- GPU BVH (raytrace only, void when raster) ----
+    bvh_aabb_min: if (is_raytrace) Buffer else void,
+    bvh_aabb_max: if (is_raytrace) Buffer else void,
+    bvh_left: if (is_raytrace) Buffer else void,
+    bvh_right: if (is_raytrace) Buffer else void,
+    bvh_count: if (is_raytrace) Buffer else void,
+    bvh_parent: if (is_raytrace) Buffer else void,
+    bvh_prim_indices: if (is_raytrace) Buffer else void,
+    bvh_morton: if (is_raytrace) Buffer else void,
+    bvh_sort_indices: if (is_raytrace) Buffer else void,
+    bvh_sort_temp: if (is_raytrace) Buffer else void,
+    bvh_morton_temp: if (is_raytrace) Buffer else void,
+    bvh_centroids: if (is_raytrace) Buffer else void,
+    bvh_flags: if (is_raytrace) Buffer else void,
+    bvh_scene_bounds: if (is_raytrace) Buffer else void,
 
     // ---- CPU staging — render ----
     s_vertices: []f32,
@@ -144,6 +162,21 @@ pub const Data = struct {
             .contact_lambda_n = try vk.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
 
             .atomic_counters = try vk.createBuffer(4 * @sizeOf(u32), STORAGE),
+
+            .bvh_aabb_min = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE) else {},
+            .bvh_aabb_max = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE) else {},
+            .bvh_left = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * 2 * @sizeOf(u32), STORAGE) else {},
+            .bvh_right = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * 2 * @sizeOf(u32), STORAGE) else {},
+            .bvh_count = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * 2 * @sizeOf(u32), STORAGE) else {},
+            .bvh_parent = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * 2 * @sizeOf(u32), STORAGE) else {},
+            .bvh_prim_indices = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE) else {},
+            .bvh_morton = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE) else {},
+            .bvh_sort_indices = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE) else {},
+            .bvh_sort_temp = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE) else {},
+            .bvh_morton_temp = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE) else {},
+            .bvh_centroids = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf([3]f32), STORAGE) else {},
+            .bvh_flags = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE) else {},
+            .bvh_scene_bounds = if (is_raytrace) try vk.createBuffer(2 * @sizeOf([3]f32), STORAGE) else {},
 
             .s_vertices = try alloc.alloc(f32, MAX_VERTICES * 3),
             .s_colors = try alloc.alloc(f32, MAX_VERTICES * 3),
