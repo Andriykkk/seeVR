@@ -267,6 +267,16 @@ pub const Data = struct {
         try v.uploadSlice(self.body_vert_count, u32, self.s_body_vert_count[0..self.num_bodies]);
     }
 
+    pub fn gpuMemoryBytes(self: *const Data) usize {
+        var total: usize = 0;
+        inline for (@typeInfo(Data).@"struct".fields) |field| {
+            if (field.type == Buffer) {
+                total += @field(self, field.name).size;
+            }
+        }
+        return total;
+    }
+
     pub fn deinit(self: *Data) void {
         inline for (@typeInfo(Data).@"struct".fields) |field| {
             if (field.type == Buffer) {

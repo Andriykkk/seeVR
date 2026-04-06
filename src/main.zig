@@ -5,6 +5,8 @@ const Data = @import("data.zig").Data;
 const Scene = @import("scene.zig").Scene;
 const Camera = @import("camera.zig").Camera;
 const Physics = @import("physics.zig").Physics;
+const build_options = @import("build_options");
+const Gui = if (build_options.enable_imgui) @import("gui.zig").Gui else void;
 
 const WIDTH = 800;
 const HEIGHT = 600;
@@ -45,25 +47,26 @@ pub fn main() !void {
     var physics = try Physics.init(&vk_ctx, &d, allocator);
     defer physics.deinit();
 
-    std.debug.print("Scene: {} vertices, {} triangles, {} bodies\n", .{ d.num_vertices, d.num_triangles, d.num_bodies });
+    var gui = if (comptime Gui != void) try Gui.init(&vk_ctx, &scene, window) else {};
+    defer if (comptime Gui != void) gui.deinit();
 
     var camera = Camera.init(0, 5, 15, -90, -15);
     const aspect: f32 = @as(f32, @floatFromInt(WIDTH)) / @as(f32, @floatFromInt(HEIGHT));
     var last_time: f64 = c.glfwGetTime();
-    var fps_smooth: f32 = 0;
-    var frame: u64 = 0;
 
     while (!scene.shouldClose()) {
         const now = c.glfwGetTime();
         const dt: f32 = @floatCast(now - last_time);
         last_time = now;
-        if (dt > 0) fps_smooth = 0.95 * fps_smooth + 0.05 * (1.0 / dt);
+        if (comptime Gui != void) {
+            if (dt > 0) gui.fps = 0.95 * gui.fps + 0.05 * (1.0 / dt);
+        }
 
         scene.pollEvents();
         camera.update(window, dt);
         const mvp = camera.mvp(aspect);
 
-        // Physics: 10 substeps at dt=1/600, matching pgs_boxes.py
+        // Physics: 10 substeps at dt=1/600
         const substeps = 10;
         const phys_dt = 1.0 / (60.0 * @as(f32, substeps));
         for (0..substeps) |_| {
@@ -73,13 +76,12 @@ pub fn main() !void {
         // Render
         try scene.beginFrame();
         scene.draw(&d, &mvp);
-        try scene.endFrame();
-
-        // FPS
-        frame += 1;
-        if (frame % 60 == 0) {
+        if (comptime Gui != void) {
             const counters = physics.readCounters(&d) catch .{ 0, 0 };
-            std.debug.print("FPS: {d:.0}  contacts: {}\n", .{ fps_smooth, counters[0] });
+            gui.pairs = counters[0];
+            gui.contacts = counters[1];
+            gui.render(&d, scene.cmd_buffers[scene.current_frame]);
         }
+        try scene.endFrame();
     }
 }
