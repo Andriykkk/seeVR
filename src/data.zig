@@ -16,48 +16,50 @@ pub const Data = struct {
     vk: *Vulkan,
     alloc: std.mem.Allocator,
 
-    // Render
-    vertices: Buffer,
-    colors: Buffer,
-    indices: Buffer,
-    original_vertices: Buffer,
+    // ---- GPU Render buffers ----
+    vertices: Buffer, // [MAX_VERTICES] float3 — world-space positions, updated each frame by compute
+    colors: Buffer, // [MAX_VERTICES] float3 — per-vertex RGB color
+    indices: Buffer, // [MAX_TRIANGLES*3] uint — triangle indices into vertices
+    original_vertices: Buffer, // [MAX_VERTICES] float3 — local-space positions, never changes after upload
 
-    // Body state
-    body_pos: Buffer,
-    body_quat: Buffer,
-    body_vel: Buffer,
-    body_omega: Buffer,
-    body_inv_mass: Buffer,
-    body_inertia: Buffer,
-    body_inv_inertia: Buffer,
-    body_half: Buffer, // half-extents per body (derived from geom_data on upload)
-    body_vert_start: Buffer,
-    body_vert_count: Buffer,
+    // ---- GPU Body state (dynamics only, no collision shape data) ----
+    body_pos: Buffer, // [MAX_BODIES] float3 — center of mass position
+    body_quat: Buffer, // [MAX_BODIES] float4 — orientation quaternion (x,y,z,w)
+    body_vel: Buffer, // [MAX_BODIES] float3 — linear velocity
+    body_omega: Buffer, // [MAX_BODIES] float3 — angular velocity
+    body_inv_mass: Buffer, // [MAX_BODIES] float — 1/mass (0 = static/fixed)
+    body_inertia: Buffer, // [MAX_BODIES] float3 — diagonal inertia tensor
+    body_inv_inertia: Buffer, // [MAX_BODIES] float3 — 1/inertia per axis
+    body_half: Buffer, // [MAX_BODIES] float3 — half-extents, derived from first geom on upload
+    body_vert_start: Buffer, // [MAX_BODIES] uint — first vertex index, derived from first geom on upload
+    body_vert_count: Buffer, // [MAX_BODIES] uint — vertex count, derived from first geom on upload
 
-    // Geom (collision shapes attached to bodies)
-    geom_type: Buffer,
-    geom_body_idx: Buffer,
-    geom_local_pos: Buffer,
-    geom_local_quat: Buffer,
-    geom_data: Buffer, // [MAX_GEOMS*7] float — box: half_x/y/z in [0..2]
-    geom_friction: Buffer,
+    // ---- GPU Geom buffers (collision shapes, each linked to a body via geom_body_idx) ----
+    geom_type: Buffer, // [MAX_GEOMS] int — shape type: 1=sphere, 2=box, 5=mesh
+    geom_body_idx: Buffer, // [MAX_GEOMS] uint — which body this geom belongs to
+    geom_local_pos: Buffer, // [MAX_GEOMS] float3 — offset from body center (local frame)
+    geom_local_quat: Buffer, // [MAX_GEOMS] float4 — rotation relative to body (local frame)
+    geom_data: Buffer, // [MAX_GEOMS*7] float — shape params: box=[half_x,half_y,half_z,0,0,0,0]
+    geom_friction: Buffer, // [MAX_GEOMS] float — Coulomb friction coefficient
 
-    // Contacts
-    contact_pos: Buffer,
-    contact_normal: Buffer,
-    contact_penetration: Buffer,
-    contact_body_a: Buffer,
-    contact_body_b: Buffer,
-    contact_lambda_n: Buffer,
+    // ---- GPU Contact buffers (written by collision, read by solver) ----
+    contact_pos: Buffer, // [MAX_CONTACTS] float3 — contact point in world space
+    contact_normal: Buffer, // [MAX_CONTACTS] float3 — contact normal direction
+    contact_penetration: Buffer, // [MAX_CONTACTS] float — penetration depth
+    contact_body_a: Buffer, // [MAX_CONTACTS] uint — body index A
+    contact_body_b: Buffer, // [MAX_CONTACTS] uint — body index B
+    contact_lambda_n: Buffer, // [MAX_CONTACTS] float — PGS accumulated normal impulse
 
-    // Counters: [0]=num_contacts
-    atomic_counters: Buffer,
+    // ---- GPU Counters ----
+    atomic_counters: Buffer, // [4] uint — [0]=num_contacts, used by collision+solver
 
-    // CPU staging — bodies
-    s_vertices: []f32,
-    s_colors: []f32,
-    s_indices: []u32,
-    s_orig_verts: []f32,
+    // ---- CPU staging — render ----
+    s_vertices: []f32, // staging for vertices
+    s_colors: []f32, // staging for colors
+    s_indices: []u32, // staging for indices
+    s_orig_verts: []f32, // staging for original_vertices
+
+    // ---- CPU staging — body ----
     s_body_pos: []f32,
     s_body_quat: []f32,
     s_body_vel: []f32,
@@ -65,16 +67,18 @@ pub const Data = struct {
     s_body_inv_mass: []f32,
     s_body_inertia: []f32,
     s_body_inv_inertia: []f32,
-    s_body_vert_start: []u32,
-    s_body_vert_count: []u32,
+    s_body_vert_start: []u32, // derived from geom in upload()
+    s_body_vert_count: []u32, // derived from geom in upload()
 
-    // CPU staging — geoms
+    // ---- CPU staging — geom (owns vertices, linked to body) ----
     s_geom_type: []i32,
-    s_geom_body_idx: []u32,
+    s_geom_body_idx: []u32, // geom → body mapping
     s_geom_local_pos: []f32,
     s_geom_local_quat: []f32,
-    s_geom_data: []f32,
+    s_geom_data: []f32, // shape params, box: half-extents in [0..2]
     s_geom_friction: []f32,
+    s_geom_vert_start: []u32, // first vertex index in vertices/orig_verts (geom owns these)
+    s_geom_vert_count: []u32, // number of vertices belonging to this geom
 
     num_vertices: u32,
     num_triangles: u32,
@@ -137,6 +141,8 @@ pub const Data = struct {
             .s_geom_local_quat = try alloc.alloc(f32, MAX_GEOMS * 4),
             .s_geom_data = try alloc.alloc(f32, MAX_GEOMS * 7),
             .s_geom_friction = try alloc.alloc(f32, MAX_GEOMS),
+            .s_geom_vert_start = try alloc.alloc(u32, MAX_GEOMS),
+            .s_geom_vert_count = try alloc.alloc(u32, MAX_GEOMS),
 
             .num_vertices = 0,
             .num_triangles = 0,
@@ -185,8 +191,6 @@ pub const Data = struct {
         self.s_body_vel[b3..][0..3].* = .{ 0, 0, 0 };
         self.s_body_omega[b3..][0..3].* = .{ 0, 0, 0 };
         self.s_body_inv_mass[bi] = if (mass > 0) 1.0 / mass else 0;
-        self.s_body_vert_start[bi] = vs;
-        self.s_body_vert_count[bi] = 8;
         if (mass > 0) {
             const wx = half[0] * 2;
             const wy = half[1] * 2;
@@ -210,6 +214,8 @@ pub const Data = struct {
         self.s_geom_local_quat[gi * 4 ..][0..4].* = .{ 1, 0, 0, 0 };
         self.s_geom_data[gi * 7 ..][0..7].* = .{ half[0], half[1], half[2], 0, 0, 0, 0 };
         self.s_geom_friction[gi] = 0.5;
+        self.s_geom_vert_start[gi] = vs;
+        self.s_geom_vert_count[gi] = 8;
         self.num_geoms += 1;
 
         return bi;
@@ -228,8 +234,6 @@ pub const Data = struct {
         try v.uploadSlice(self.body_inv_mass, f32, self.s_body_inv_mass[0..self.num_bodies]);
         try v.uploadSlice(self.body_inertia, f32, self.s_body_inertia[0 .. self.num_bodies * 3]);
         try v.uploadSlice(self.body_inv_inertia, f32, self.s_body_inv_inertia[0 .. self.num_bodies * 3]);
-        try v.uploadSlice(self.body_vert_start, u32, self.s_body_vert_start[0..self.num_bodies]);
-        try v.uploadSlice(self.body_vert_count, u32, self.s_body_vert_count[0..self.num_bodies]);
         try v.uploadSlice(self.geom_type, i32, self.s_geom_type[0..self.num_geoms]);
         try v.uploadSlice(self.geom_body_idx, u32, self.s_geom_body_idx[0..self.num_geoms]);
         try v.uploadSlice(self.geom_local_pos, f32, self.s_geom_local_pos[0 .. self.num_geoms * 3]);
@@ -237,7 +241,7 @@ pub const Data = struct {
         try v.uploadSlice(self.geom_data, f32, self.s_geom_data[0 .. self.num_geoms * 7]);
         try v.uploadSlice(self.geom_friction, f32, self.s_geom_friction[0..self.num_geoms]);
 
-        // Derive body_half from geom_data (first geom per body)
+        // Derive body buffers from first geom per body
         var body_half = try self.alloc.alloc(f32, MAX_BODIES * 3);
         defer self.alloc.free(body_half);
         for (0..self.num_geoms) |gi| {
@@ -245,8 +249,12 @@ pub const Data = struct {
             body_half[bi * 3 + 0] = self.s_geom_data[gi * 7 + 0];
             body_half[bi * 3 + 1] = self.s_geom_data[gi * 7 + 1];
             body_half[bi * 3 + 2] = self.s_geom_data[gi * 7 + 2];
+            self.s_body_vert_start[bi] = self.s_geom_vert_start[gi];
+            self.s_body_vert_count[bi] = self.s_geom_vert_count[gi];
         }
         try v.uploadSlice(self.body_half, f32, body_half[0 .. self.num_bodies * 3]);
+        try v.uploadSlice(self.body_vert_start, u32, self.s_body_vert_start[0..self.num_bodies]);
+        try v.uploadSlice(self.body_vert_count, u32, self.s_body_vert_count[0..self.num_bodies]);
     }
 
     pub fn deinit(self: *Data) void {
