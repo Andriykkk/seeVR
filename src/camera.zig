@@ -68,6 +68,34 @@ pub const Camera = struct {
     }
 
     /// Build a view-projection matrix (column-major, OpenGL clip space)
+    pub fn direction(self: *const Camera) [3]f32 {
+        const ry = self.yaw * math.pi / 180.0;
+        const rp = self.pitch * math.pi / 180.0;
+        return .{ @cos(rp) * @cos(ry), @sin(rp), @cos(rp) * @sin(ry) };
+    }
+
+    pub fn right(self: *const Camera) [3]f32 {
+        const ry = self.yaw * math.pi / 180.0;
+        const rp = self.pitch * math.pi / 180.0;
+        const dx = @cos(rp) * @cos(ry);
+        const dz = @cos(rp) * @sin(ry);
+        const rx = -dz;
+        const rz = dx;
+        const rl = @sqrt(rx * rx + rz * rz);
+        return .{ rx / rl, 0, rz / rl };
+    }
+
+    pub fn up(self: *const Camera) [3]f32 {
+        const d = self.direction();
+        const r = self.right();
+        // up = right x direction
+        return .{
+            r[1] * d[2] - r[2] * d[1],
+            r[2] * d[0] - r[0] * d[2],
+            r[0] * d[1] - r[1] * d[0],
+        };
+    }
+
     pub fn mvp(self: *const Camera, aspect: f32) [16]f32 {
         const ry = self.yaw * math.pi / 180.0;
         const rp = self.pitch * math.pi / 180.0;
@@ -78,23 +106,23 @@ pub const Camera = struct {
         const rx = -dz;
         const rz = dx;
         const rl = @sqrt(rx * rx + rz * rz);
-        const right = [3]f32{ rx / rl, 0, rz / rl };
+        const r = [3]f32{ rx / rl, 0, rz / rl };
 
-        const up = [3]f32{
-            0 * dz - right[2] * dy,
-            right[2] * dx - right[0] * dz,
-            right[0] * dy - 0 * dx,
+        const u = [3]f32{
+            0 * dz - r[2] * dy,
+            r[2] * dx - r[0] * dz,
+            r[0] * dy - 0 * dx,
         };
 
-        const tx = -(right[0] * self.pos[0] + right[1] * self.pos[1] + right[2] * self.pos[2]);
-        const ty = -(up[0] * self.pos[0] + up[1] * self.pos[1] + up[2] * self.pos[2]);
+        const tx = -(r[0] * self.pos[0] + r[1] * self.pos[1] + r[2] * self.pos[2]);
+        const ty = -(u[0] * self.pos[0] + u[1] * self.pos[1] + u[2] * self.pos[2]);
         const tz = dx * self.pos[0] + dy * self.pos[1] + dz * self.pos[2];
 
         const view = [16]f32{
-            right[0], up[0], -dx, 0,
-            right[1], up[1], -dy, 0,
-            right[2], up[2], -dz, 0,
-            tx,       ty,    tz,  1,
+            r[0], u[0], -dx, 0,
+            r[1], u[1], -dy, 0,
+            r[2], u[2], -dz, 0,
+            tx,   ty,   tz,  1,
         };
 
         // Perspective projection (Vulkan: Y flipped, depth 0..1)

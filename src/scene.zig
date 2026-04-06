@@ -284,11 +284,11 @@ pub const Scene = struct {
         if (c.vkCreateImage(vk.device, &c.VkImageCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = null, .flags = 0,
             .imageType = c.VK_IMAGE_TYPE_2D,
-            .format = c.VK_FORMAT_R8G8B8A8_UNORM,
+            .format = c.VK_FORMAT_R32G32B32A32_SFLOAT,
             .extent = .{ .width = self.extent.width, .height = self.extent.height, .depth = 1 },
             .mipLevels = 1, .arrayLayers = 1, .samples = c.VK_SAMPLE_COUNT_1_BIT,
             .tiling = c.VK_IMAGE_TILING_OPTIMAL,
-            .usage = c.VK_IMAGE_USAGE_STORAGE_BIT | c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            .usage = c.VK_IMAGE_USAGE_STORAGE_BIT | c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | c.VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
             .queueFamilyIndexCount = 0, .pQueueFamilyIndices = null,
             .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
@@ -307,7 +307,7 @@ pub const Scene = struct {
 
         if (c.vkCreateImageView(vk.device, &c.VkImageViewCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = null, .flags = 0,
-            .image = self.rt_image, .viewType = c.VK_IMAGE_VIEW_TYPE_2D, .format = c.VK_FORMAT_R8G8B8A8_UNORM,
+            .image = self.rt_image, .viewType = c.VK_IMAGE_VIEW_TYPE_2D, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT,
             .components = .{ .r = c.VK_COMPONENT_SWIZZLE_IDENTITY, .g = c.VK_COMPONENT_SWIZZLE_IDENTITY, .b = c.VK_COMPONENT_SWIZZLE_IDENTITY, .a = c.VK_COMPONENT_SWIZZLE_IDENTITY },
             .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
         }, null, &self.rt_view) != c.VK_SUCCESS)
@@ -356,12 +356,13 @@ pub const Scene = struct {
         c.vkCmdDrawIndexed(cmd, d.num_triangles * 3, 1, 0, 0, 0);
     }
 
-    /// Blit rt_image to swapchain (raytrace mode only)
+    /// Blit rt_image (written by compute) to swapchain (raytrace mode only)
     pub fn blitRtImage(self: *Scene) void {
         if (comptime !is_raytrace) return;
 
         const cmd = self.cmd_buffers[self.current_frame];
         const subresource = c.VkImageSubresourceLayers{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 };
+        const sub_range = c.VkImageSubresourceRange{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 };
 
         // rt_image: GENERAL → TRANSFER_SRC
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &c.VkImageMemoryBarrier{
@@ -369,8 +370,7 @@ pub const Scene = struct {
             .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT,
             .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL, .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-            .image = self.rt_image,
-            .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
+            .image = self.rt_image, .subresourceRange = sub_range,
         });
 
         // swapchain: UNDEFINED → TRANSFER_DST
@@ -379,11 +379,10 @@ pub const Scene = struct {
             .srcAccessMask = 0, .dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
             .oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-            .image = self.swapchain_images[self.current_image],
-            .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
+            .image = self.swapchain_images[self.current_image], .subresourceRange = sub_range,
         });
 
-        // Blit
+        // Blit rt_image → swapchain (handles format conversion RGBA32F → swapchain format)
         c.vkCmdBlitImage(cmd, self.rt_image, c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.swapchain_images[self.current_image], c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c.VkImageBlit{
             .srcSubresource = subresource, .dstSubresource = subresource,
             .srcOffsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = @intCast(self.extent.width), .y = @intCast(self.extent.height), .z = 1 } },
@@ -396,8 +395,7 @@ pub const Scene = struct {
             .srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = 0,
             .oldLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .newLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
-            .image = self.swapchain_images[self.current_image],
-            .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
+            .image = self.swapchain_images[self.current_image], .subresourceRange = sub_range,
         });
     }
 

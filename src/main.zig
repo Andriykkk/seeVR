@@ -8,6 +8,7 @@ const Physics = @import("physics.zig").Physics;
 const build_options = @import("build_options");
 const Gui = if (build_options.enable_imgui) @import("gui.zig").Gui else void;
 const BVH = if (build_options.raytrace) @import("bvh.zig").BVH else void;
+const RT = if (build_options.raytrace) @import("raytracer.zig").Raytracer else void;
 const raytrace_mode = build_options.raytrace;
 
 const WIDTH = 800;
@@ -56,6 +57,9 @@ pub fn main() !void {
     var bvh = if (comptime BVH != void) try BVH.init(&vk_ctx, &d, allocator) else {};
     defer if (comptime BVH != void) bvh.deinit();
 
+    var rt = if (comptime RT != void) try RT.init(&vk_ctx, &d, scene.rt_view, WIDTH, HEIGHT, allocator) else {};
+    defer if (comptime RT != void) rt.deinit();
+
     var gui = if (comptime Gui != void) try Gui.init(&vk_ctx, &scene, window) else {};
     defer if (comptime Gui != void) gui.deinit();
 
@@ -84,7 +88,7 @@ pub fn main() !void {
 
         if (comptime raytrace_mode) {
             try bvh.build(d.num_triangles);
-            // TODO: raytrace compute dispatch writing to scene.rt_image
+            try rt.render(camera.pos, camera.direction(), camera.right(), camera.up(), d.num_triangles);
             try scene.beginFrame();
             scene.blitRtImage();
             try scene.endFrame();

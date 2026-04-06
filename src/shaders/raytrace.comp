@@ -1,0 +1,202 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PC {
+    float cam_pos_x, cam_pos_y, cam_pos_z;
+    float cam_dir_x, cam_dir_y, cam_dir_z;
+    float cam_right_x, cam_right_y, cam_right_z;
+    float cam_up_x, cam_up_y, cam_up_z;
+    uint width, height;
+    uint frame_num;
+    uint num_triangles;
+};
+
+// Output image (storage image, written directly)
+layout(set=0, binding=0, rgba32f) uniform image2D rt_image;
+
+// Scene geometry
+layout(set=0, binding=1) buffer Vertices   { float verts[]; };
+layout(set=0, binding=2) buffer Indices    { uint  idx[]; };
+layout(set=0, binding=3) buffer Colors     { float colors[]; };
+
+// BVH
+layout(set=0, binding=4) buffer BvhMin     { float node_min[]; };
+layout(set=0, binding=5) buffer BvhMax     { float node_max[]; };
+layout(set=0, binding=6) buffer BvhLeft    { uint  node_left[]; };
+layout(set=0, binding=7) buffer BvhRight   { uint  node_right[]; };
+layout(set=0, binding=8) buffer BvhCount   { uint  node_count[]; };
+layout(set=0, binding=9) buffer BvhPrim    { uint  prim_idx[]; };
+
+const float PI = 3.14159265;
+const int MAX_BOUNCES = 3;
+
+// ======================== RNG ========================
+
+uint pcg(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28) + 4)) ^ state) * 277803737u;
+    return (word >> 22) ^ word;
+}
+
+float rand_f(uint seed) {
+    return float(pcg(seed)) / 4294967295.0;
+}
+
+// ======================== Ray-triangle ========================
+
+float ray_tri(vec3 ro, vec3 rd, vec3 v0, vec3 v1, vec3 v2) {
+    vec3 e1 = v1 - v0, e2 = v2 - v0;
+    vec3 h = cross(rd, e2);
+    float a = dot(e1, h);
+    if (abs(a) < 1e-8) return -1.0;
+    float f = 1.0 / a;
+    vec3 s = ro - v0;
+    float u = f * dot(s, h);
+    if (u < 0.0 || u > 1.0) return -1.0;
+    vec3 q = cross(s, e1);
+    float v = f * dot(rd, q);
+    if (v < 0.0 || u + v > 1.0) return -1.0;
+    float t = f * dot(e2, q);
+    return t > 0.001 ? t : -1.0;
+}
+
+// ======================== AABB intersection ========================
+
+bool ray_aabb(vec3 ro, vec3 inv_d, vec3 bmin, vec3 bmax, float closest) {
+    vec3 t1 = (bmin - ro) * inv_d;
+    vec3 t2 = (bmax - ro) * inv_d;
+    vec3 tmin = min(t1, t2);
+    vec3 tmax = max(t1, t2);
+    float enter = max(max(tmin.x, tmin.y), tmin.z);
+    float exit_ = min(min(tmax.x, tmax.y), tmax.z);
+    return exit_ >= enter && enter < closest && exit_ > 0.0;
+}
+
+// ======================== BVH traversal ========================
+
+void trace(vec3 ro, vec3 rd, out float closest_t, out vec3 hit_normal, out vec3 hit_color) {
+    closest_t = 1e10;
+    hit_normal = vec3(0, 1, 0);
+    hit_color = vec3(0);
+
+    vec3 inv_d = 1.0 / rd;
+
+    int stack[32];
+    stack[0] = 0;
+    int sp = 1;
+
+    while (sp > 0) {
+        sp--;
+        int node = stack[sp];
+
+        vec3 nmin = vec3(node_min[node*3], node_min[node*3+1], node_min[node*3+2]);
+        vec3 nmax = vec3(node_max[node*3], node_max[node*3+1], node_max[node*3+2]);
+        if (!ray_aabb(ro, inv_d, nmin, nmax, closest_t)) continue;
+
+        uint tri_count = node_count[node];
+        uint left_first = node_left[node];
+
+        if (tri_count > 0) {
+            for (uint i = 0; i < tri_count; i++) {
+                uint ti = prim_idx[left_first + i];
+                uint i0 = idx[ti*3], i1 = idx[ti*3+1], i2 = idx[ti*3+2];
+                vec3 v0 = vec3(verts[i0*3], verts[i0*3+1], verts[i0*3+2]);
+                vec3 v1 = vec3(verts[i1*3], verts[i1*3+1], verts[i1*3+2]);
+                vec3 v2 = vec3(verts[i2*3], verts[i2*3+1], verts[i2*3+2]);
+
+                float t = ray_tri(ro, rd, v0, v1, v2);
+                if (t > 0.0 && t < closest_t) {
+                    closest_t = t;
+                    vec3 n = normalize(cross(v1 - v0, v2 - v0));
+                    if (dot(n, rd) > 0.0) n = -n;
+                    hit_normal = n;
+                    hit_color = vec3(colors[i0*3], colors[i0*3+1], colors[i0*3+2]);
+                }
+            }
+        } else {
+            uint right = node_right[node];
+            if (sp < 31) { stack[sp] = int(left_first); sp++; }
+            if (sp < 31) { stack[sp] = int(right); sp++; }
+        }
+    }
+}
+
+// ======================== Sky ========================
+
+vec3 sky_color(vec3 rd) {
+    float t = 0.5 * (rd.y + 1.0);
+    return mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t) * 0.8;
+}
+
+// ======================== Hemisphere sampling ========================
+
+vec3 sample_hemisphere(vec3 n, uint seed1, uint seed2) {
+    float r1 = rand_f(seed1);
+    float r2 = rand_f(seed2);
+    float phi = 2.0 * PI * r1;
+    float cos_t = sqrt(r2);
+    float sin_t = sqrt(1.0 - r2);
+
+    vec3 up = abs(n.y) > 0.99 ? vec3(1, 0, 0) : vec3(0, 1, 0);
+    vec3 tan1 = normalize(cross(up, n));
+    vec3 tan2 = cross(n, tan1);
+
+    return normalize(tan1 * sin_t * cos(phi) + n * cos_t + tan2 * sin_t * sin(phi));
+}
+
+// ======================== Main ========================
+
+void main() {
+    uint px = gl_GlobalInvocationID.x;
+    uint py = gl_GlobalInvocationID.y;
+    if (px >= width || py >= height) return;
+
+    vec3 cam_pos = vec3(cam_pos_x, cam_pos_y, cam_pos_z);
+    vec3 cam_dir = vec3(cam_dir_x, cam_dir_y, cam_dir_z);
+    vec3 cam_right = vec3(cam_right_x, cam_right_y, cam_right_z);
+    vec3 cam_up = vec3(cam_up_x, cam_up_y, cam_up_z);
+
+    float fov_scale = tan(30.0 * PI / 180.0);
+    float aspect = float(width) / float(height);
+
+    uint seed = px + py * width + frame_num * width * height;
+
+    float jx = rand_f(seed) - 0.5;
+    float jy = rand_f(seed + 1u) - 0.5;
+
+    float u = (2.0 * (float(px) + 0.5 + jx) / float(width) - 1.0) * aspect * fov_scale;
+    float v = -(2.0 * (float(py) + 0.5 + jy) / float(height) - 1.0) * fov_scale;
+
+    vec3 rd = normalize(cam_dir + u * cam_right + v * cam_up);
+    vec3 ro = cam_pos;
+
+    vec3 throughput = vec3(1.0);
+    vec3 color = vec3(0.0);
+
+    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+        float t;
+        vec3 normal, albedo;
+        trace(ro, rd, t, normal, albedo);
+
+        if (t >= 1e9) {
+            color += throughput * sky_color(rd);
+            break;
+        }
+
+        vec3 hit = ro + rd * t;
+        throughput *= albedo;
+
+        if (bounce > 0) {
+            float p = max(throughput.x, max(throughput.y, throughput.z));
+            if (rand_f(seed + uint(bounce) * 7u) > p) break;
+            throughput /= p;
+        }
+
+        seed = pcg(seed);
+        rd = sample_hemisphere(normal, seed, seed + 1u);
+        ro = hit + normal * 0.001;
+    }
+
+    imageStore(rt_image, ivec2(px, py), vec4(color, 1.0));
+}
