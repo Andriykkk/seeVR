@@ -7,7 +7,7 @@ TODO.md
 /simulation
 /Genesis
 CoACD/
-/models
+models
 src/models/*
 
 imgui.ini

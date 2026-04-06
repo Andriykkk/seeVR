@@ -23,32 +23,30 @@ layout(set=0, binding=7)  buffer BVertCount { uint  body_vert_count[]; };
 
 // Geom
 layout(set=0, binding=8)  buffer GBodyIdx   { uint  geom_body_idx[]; };
-layout(set=0, binding=9)  buffer GData      { float geom_data[]; }; // [gi*8]: vs,vc,ns,nc,es,ec,0,0
+layout(set=0, binding=9)  buffer GData      { float geom_data[]; };
 
-// Hull data
-layout(set=0, binding=10) buffer HullVerts  { float hull_verts[]; };   // float3[]
-layout(set=0, binding=11) buffer HullNorms  { float hull_normals[]; }; // float3[]
-layout(set=0, binding=12) buffer HullEdges  { float hull_edges[]; };   // float3[]
+// Hull vertices only — GJK/EPA don't need normals or edges
+layout(set=0, binding=10) buffer HullVerts  { float hull_verts[]; };
 
 // Render vertices
-layout(set=0, binding=13) buffer Vertices   { float verts[]; };
-layout(set=0, binding=14) buffer OrigVerts   { float orig_verts[]; };
+layout(set=0, binding=11) buffer Vertices   { float verts[]; };
+layout(set=0, binding=12) buffer OrigVerts   { float orig_verts[]; };
 
 // Contacts
-layout(set=0, binding=15) buffer CPos       { float contact_pos[]; };
-layout(set=0, binding=16) buffer CNormal    { float contact_normal[]; };
-layout(set=0, binding=17) buffer CPen       { float contact_pen[]; };
-layout(set=0, binding=18) buffer CBodyA     { uint  contact_body_a[]; };
-layout(set=0, binding=19) buffer CBodyB     { uint  contact_body_b[]; };
-layout(set=0, binding=20) buffer CLambdaN   { float lambda_n[]; };
+layout(set=0, binding=13) buffer CPos       { float contact_pos[]; };
+layout(set=0, binding=14) buffer CNormal    { float contact_normal[]; };
+layout(set=0, binding=15) buffer CPen       { float contact_pen[]; };
+layout(set=0, binding=16) buffer CBodyA     { uint  contact_body_a[]; };
+layout(set=0, binding=17) buffer CBodyB     { uint  contact_body_b[]; };
+layout(set=0, binding=18) buffer CLambdaN   { float lambda_n[]; };
 
 // Counters: [0]=num_pairs, [1]=num_contacts
-layout(set=0, binding=21) buffer Counters   { uint  counters[]; };
+layout(set=0, binding=19) buffer Counters   { uint  counters[]; };
 
 // Broad phase
-layout(set=0, binding=22) buffer BAabbMin   { float body_aabb_min[]; };
-layout(set=0, binding=23) buffer BAabbMax   { float body_aabb_max[]; };
-layout(set=0, binding=24) buffer ColPairs   { uint  collision_pairs[]; };
+layout(set=0, binding=20) buffer BAabbMin   { float body_aabb_min[]; };
+layout(set=0, binding=21) buffer BAabbMax   { float body_aabb_max[]; };
+layout(set=0, binding=22) buffer ColPairs   { uint  collision_pairs[]; };
 
 const float FRICTION = 0.5;
 const float BAUMGARTE = 0.2;
@@ -56,6 +54,9 @@ const float SLOP = 0.005;
 const int PGS_ITERATIONS = 30;
 const int MAX_CONTACTS = 4000;
 const int MAX_PAIRS = 10000;
+const int GJK_MAX_ITER = 32;
+const int EPA_MAX_ITER = 32;
+const int EPA_MAX_FACES = 64;
 
 // ======================== Helpers ========================
 
@@ -81,109 +82,285 @@ vec3 apply_inv_I(uint bi, vec3 v) {
     return R * (inv_i * (transpose(R) * v));
 }
 
-// Read hull info from geom_data
-void get_hull_info(uint bi, out uint vs, out uint vc, out uint ns, out uint nc, out uint es, out uint ec) {
-    // Find geom for this body — for now assume geom index == body index (1:1)
-    uint gi = bi;
-    vs = uint(geom_data[gi*8+0]); vc = uint(geom_data[gi*8+1]);
-    ns = uint(geom_data[gi*8+2]); nc = uint(geom_data[gi*8+3]);
-    es = uint(geom_data[gi*8+4]); ec = uint(geom_data[gi*8+5]);
+vec3 get_hull_vert(uint idx) { return vec3(hull_verts[idx*3], hull_verts[idx*3+1], hull_verts[idx*3+2]); }
+
+void get_hull_info(uint bi, out uint vs, out uint vc) {
+    uint gi = bi; // 1:1 body:geom for now
+    vs = uint(geom_data[gi*8+0]);
+    vc = uint(geom_data[gi*8+1]);
 }
 
-vec3 get_hull_vert(uint idx)   { return vec3(hull_verts[idx*3], hull_verts[idx*3+1], hull_verts[idx*3+2]); }
-vec3 get_hull_normal(uint idx) { return vec3(hull_normals[idx*3], hull_normals[idx*3+1], hull_normals[idx*3+2]); }
-vec3 get_hull_edge(uint idx)   { return vec3(hull_edges[idx*3], hull_edges[idx*3+1], hull_edges[idx*3+2]); }
+// ======================== Support function ========================
 
-// Project all hull verts of body bi onto axis, return (min, max)
-vec2 project_hull(uint bi, mat3 R, vec3 pos, vec3 axis) {
-    uint vs, vc, ns, nc, es, ec;
-    get_hull_info(bi, vs, vc, ns, nc, es, ec);
-    float mn = 1e10, mx = -1e10;
+// Farthest point of body bi's hull in world-space direction d
+vec3 support(uint bi, vec3 d) {
+    mat3 R = quat_to_mat(bi);
+    vec3 p = get_pos(bi);
+    vec3 local_d = transpose(R) * d; // direction in local space
+
+    uint vs, vc;
+    get_hull_info(bi, vs, vc);
+
+    float best = -1e10;
+    vec3 best_v = vec3(0);
     for (uint i = 0; i < vc; i++) {
-        vec3 local_v = get_hull_vert(vs + i);
-        vec3 world_v = pos + R * local_v;
-        float d = dot(world_v, axis);
-        mn = min(mn, d);
-        mx = max(mx, d);
+        vec3 v = get_hull_vert(vs + i);
+        float dd = dot(v, local_d);
+        if (dd > best) {
+            best = dd;
+            best_v = v;
+        }
     }
-    return vec2(mn, mx);
+    return p + R * best_v;
 }
 
-// ======================== General SAT ========================
+// Minkowski difference support: supportA(d) - supportB(-d)
+vec3 mink_support(uint a, uint b, vec3 d) {
+    return support(a, d) - support(b, -d);
+}
 
-void sat_test(uint a, uint b, out int overlap, out float min_pen, out vec3 best_n) {
-    mat3 Ra = quat_to_mat(a);
-    mat3 Rb = quat_to_mat(b);
-    vec3 pa = get_pos(a);
-    vec3 pb = get_pos(b);
-    vec3 d = pb - pa;
+// ======================== GJK ========================
 
-    uint a_vs, a_vc, a_ns, a_nc, a_es, a_ec;
-    uint b_vs, b_vc, b_ns, b_nc, b_es, b_ec;
-    get_hull_info(a, a_vs, a_vc, a_ns, a_nc, a_es, a_ec);
-    get_hull_info(b, b_vs, b_vc, b_ns, b_nc, b_es, b_ec);
+// Triple product: (a x b) x c = b*dot(c,a) - a*dot(c,b)
+vec3 triple_cross(vec3 a, vec3 b, vec3 c) {
+    return b * dot(c, a) - a * dot(c, b);
+}
 
-    min_pen = 1e10;
-    best_n = vec3(0, 1, 0);
-    int sep = 0;
+// GJK: returns true if overlapping, fills simplex points and count
+bool gjk(uint a, uint b, out vec3 simp[4], out int simp_count) {
+    vec3 d = get_pos(b) - get_pos(a);
+    if (dot(d,d) < 1e-10) d = vec3(1, 0, 0);
 
-    // Test face normals of A
-    for (uint i = 0; i < a_nc && sep == 0; i++) {
-        vec3 axis = Ra * get_hull_normal(a_ns + i);
-        vec2 pa_ = project_hull(a, Ra, pa, axis);
-        vec2 pb_ = project_hull(b, Rb, pb, axis);
-        float pen = min(pa_.y, pb_.y) - max(pa_.x, pb_.x);
-        if (pen < 0.0) { sep = 1; break; }
-        if (pen < min_pen) {
-            min_pen = pen;
-            best_n = axis * ((dot(d, axis) >= 0.0) ? 1.0 : -1.0);
+    simp[0] = mink_support(a, b, d);
+    d = -simp[0];
+    simp_count = 1;
+
+    for (int iter = 0; iter < GJK_MAX_ITER; iter++) {
+        vec3 A = mink_support(a, b, d);
+        if (dot(A, d) < 0.0) return false; // no intersection
+
+        simp[simp_count] = A;
+        simp_count++;
+
+        if (simp_count == 2) {
+            // Line case
+            vec3 AB = simp[0] - simp[1];
+            vec3 AO = -simp[1];
+            d = triple_cross(AB, AO, AB);
+            if (dot(d,d) < 1e-10) d = cross(AB, vec3(1,0,0));
+            if (dot(d,d) < 1e-10) d = cross(AB, vec3(0,1,0));
         }
-    }
+        else if (simp_count == 3) {
+            // Triangle case
+            vec3 A2 = simp[2]; // newest
+            vec3 B2 = simp[1];
+            vec3 C2 = simp[0];
+            vec3 AB = B2 - A2;
+            vec3 AC = C2 - A2;
+            vec3 AO = -A2;
+            vec3 abc = cross(AB, AC);
 
-    // Test face normals of B
-    for (uint i = 0; i < b_nc && sep == 0; i++) {
-        vec3 axis = Rb * get_hull_normal(b_ns + i);
-        vec2 pa_ = project_hull(a, Ra, pa, axis);
-        vec2 pb_ = project_hull(b, Rb, pb, axis);
-        float pen = min(pa_.y, pb_.y) - max(pa_.x, pb_.x);
-        if (pen < 0.0) { sep = 1; break; }
-        if (pen < min_pen) {
-            min_pen = pen;
-            best_n = axis * ((dot(d, axis) >= 0.0) ? 1.0 : -1.0);
+            if (dot(cross(abc, AC), AO) > 0.0) {
+                if (dot(AC, AO) > 0.0) {
+                    simp[0] = C2; simp[1] = A2; simp_count = 2;
+                    d = triple_cross(AC, AO, AC);
+                } else {
+                    simp[0] = B2; simp[1] = A2; simp_count = 2;
+                    d = triple_cross(AB, AO, AB);
+                }
+            } else if (dot(cross(AB, abc), AO) > 0.0) {
+                simp[0] = B2; simp[1] = A2; simp_count = 2;
+                d = triple_cross(AB, AO, AB);
+            } else {
+                if (dot(abc, AO) > 0.0) {
+                    d = abc;
+                } else {
+                    // Flip winding
+                    vec3 tmp = simp[0]; simp[0] = simp[1]; simp[1] = tmp;
+                    d = -abc;
+                }
+            }
         }
-    }
+        else if (simp_count == 4) {
+            // Tetrahedron case
+            vec3 A3 = simp[3]; // newest
+            vec3 B3 = simp[2];
+            vec3 C3 = simp[1];
+            vec3 D3 = simp[0];
+            vec3 AO = -A3;
 
-    // Test edge-cross axes
-    for (uint i = 0; i < a_ec && sep == 0; i++) {
-        vec3 ea = Ra * get_hull_edge(a_es + i);
-        for (uint j = 0; j < b_ec && sep == 0; j++) {
-            vec3 eb = Rb * get_hull_edge(b_es + j);
-            vec3 axis = cross(ea, eb);
-            float axis_len = length(axis);
-            if (axis_len < 1e-6) continue;
-            axis /= axis_len;
+            vec3 AB = B3 - A3;
+            vec3 AC = C3 - A3;
+            vec3 AD = D3 - A3;
 
-            vec2 pa_ = project_hull(a, Ra, pa, axis);
-            vec2 pb_ = project_hull(b, Rb, pb, axis);
-            float pen = min(pa_.y, pb_.y) - max(pa_.x, pb_.x);
-            if (pen < 0.0) { sep = 1; break; }
-            if (pen < min_pen) {
-                min_pen = pen;
-                best_n = axis * ((dot(d, axis) >= 0.0) ? 1.0 : -1.0);
+            vec3 abc = cross(AB, AC);
+            vec3 acd = cross(AC, AD);
+            vec3 adb = cross(AD, AB);
+
+            // Check which face the origin is outside of
+            if (dot(abc, AO) > 0.0) {
+                simp[0] = C3; simp[1] = B3; simp[2] = A3; simp_count = 3;
+                d = abc;
+            } else if (dot(acd, AO) > 0.0) {
+                simp[0] = D3; simp[1] = C3; simp[2] = A3; simp_count = 3;
+                d = acd;
+            } else if (dot(adb, AO) > 0.0) {
+                simp[0] = B3; simp[1] = D3; simp[2] = A3; simp_count = 3;
+                d = adb;
+            } else {
+                return true; // origin inside tetrahedron
             }
         }
     }
+    return false;
+}
 
-    overlap = 1 - sep;
+// ======================== EPA ========================
+
+struct EPAFace {
+    uint a, b, c;  // indices into polytope verts
+    vec3 n;        // outward normal
+    float dist;    // distance to origin
+};
+
+// EPA: given GJK simplex containing origin, find penetration normal + depth
+bool epa(uint ba, uint bb, vec3 simp[4], out vec3 normal, out float depth) {
+    // Polytope vertices (start with GJK tetrahedron)
+    vec3 pverts[64];
+    pverts[0] = simp[0];
+    pverts[1] = simp[1];
+    pverts[2] = simp[2];
+    pverts[3] = simp[3];
+    int nv = 4;
+
+    // Faces (triangles) — store as flat arrays
+    uint fa[EPA_MAX_FACES], fb[EPA_MAX_FACES], fc[EPA_MAX_FACES];
+    vec3 fn[EPA_MAX_FACES];
+    float fd[EPA_MAX_FACES];
+    int nf = 0;
+
+    // Initial 4 faces of tetrahedron (outward-facing)
+    // Ensure normals point away from origin
+    uint init_faces[12] = uint[12](0,1,2, 0,3,1, 0,2,3, 1,3,2);
+    for (int i = 0; i < 4; i++) {
+        uint ia = init_faces[i*3], ib = init_faces[i*3+1], ic = init_faces[i*3+2];
+        vec3 n = normalize(cross(pverts[ib] - pverts[ia], pverts[ic] - pverts[ia]));
+        if (dot(n, pverts[ia]) < 0.0) {
+            n = -n;
+            uint tmp = ib; ib = ic; ic = tmp;
+        }
+        fa[nf] = ia; fb[nf] = ib; fc[nf] = ic;
+        fn[nf] = n;
+        fd[nf] = dot(n, pverts[ia]);
+        nf++;
+    }
+
+    for (int iter = 0; iter < EPA_MAX_ITER; iter++) {
+        // Find closest face to origin
+        int closest = 0;
+        float min_dist = fd[0];
+        for (int i = 1; i < nf; i++) {
+            if (fd[i] < min_dist) {
+                min_dist = fd[i];
+                closest = i;
+            }
+        }
+
+        normal = fn[closest];
+        depth = fd[closest];
+
+        // Get new support point along closest face normal
+        vec3 p = mink_support(ba, bb, normal);
+        float d = dot(p, normal);
+
+        if (d - depth < 1e-4 || nv >= 63) {
+            // Converged or out of space
+            return true;
+        }
+
+        // Add new vertex
+        uint pi = uint(nv);
+        pverts[nv] = p;
+        nv++;
+
+        // Remove faces visible from new point, collect horizon edges
+        vec3 edges_a[64], edges_b[64];
+        int ne = 0;
+
+        int new_nf = 0;
+        for (int i = 0; i < nf; i++) {
+            if (dot(fn[i], p - pverts[fa[i]]) > 0.0) {
+                // Face visible — remove it, add its edges to horizon
+                uint ea_ = fa[i], eb_ = fb[i], ec_ = fc[i];
+                // Add 3 edges (check for duplicates = shared edges removed)
+                uint face_edges[6] = uint[6](ea_, eb_, eb_, ec_, ec_, ea_);
+                for (int e = 0; e < 3; e++) {
+                    uint e0 = face_edges[e*2], e1 = face_edges[e*2+1];
+                    bool found = false;
+                    for (int k = 0; k < ne; k++) {
+                        // If reverse edge exists, both are internal — remove
+                        if (edges_a[k] == pverts[e1] && edges_b[k] == pverts[e0]) {
+                            // Swap comparison by index instead
+                        }
+                    }
+                    // Simpler: just add, dedup below
+                    if (ne < 64) {
+                        edges_a[ne] = vec3(float(e0), float(e1), 0);
+                        ne++;
+                    }
+                }
+            } else {
+                // Keep face
+                fa[new_nf] = fa[i]; fb[new_nf] = fb[i]; fc[new_nf] = fc[i];
+                fn[new_nf] = fn[i]; fd[new_nf] = fd[i];
+                new_nf++;
+            }
+        }
+        nf = new_nf;
+
+        // Deduplicate horizon edges (remove pairs that appear in both directions)
+        bool removed[64];
+        for (int i = 0; i < ne; i++) removed[i] = false;
+        for (int i = 0; i < ne; i++) {
+            if (removed[i]) continue;
+            uint e0 = uint(edges_a[i].x), e1 = uint(edges_a[i].y);
+            for (int j = i+1; j < ne; j++) {
+                if (removed[j]) continue;
+                uint f0 = uint(edges_a[j].x), f1 = uint(edges_a[j].y);
+                if (e0 == f1 && e1 == f0) {
+                    removed[i] = true;
+                    removed[j] = true;
+                    break;
+                }
+            }
+        }
+
+        // Create new faces from horizon edges to new point
+        for (int i = 0; i < ne; i++) {
+            if (removed[i]) continue;
+            if (nf >= EPA_MAX_FACES) break;
+            uint e0 = uint(edges_a[i].x), e1 = uint(edges_a[i].y);
+            vec3 n = normalize(cross(pverts[e1] - pverts[e0], p - pverts[e0]));
+            if (dot(n, pverts[e0]) < 0.0) {
+                n = -n;
+                uint tmp = e0; e0 = e1; e1 = tmp;
+            }
+            fa[nf] = e0; fb[nf] = e1; fc[nf] = pi;
+            fn[nf] = n;
+            fd[nf] = dot(n, pverts[e0]);
+            nf++;
+        }
+    }
+
+    return true;
 }
 
 // ======================== Contact generation ========================
-// General: find deepest vertex of each body into the other along contact normal
 
 void add_contact(vec3 cp, vec3 n, float pen, uint ba, uint bb) {
     uint idx = atomicAdd(counters[1], 1);
     if (idx < MAX_CONTACTS) {
-        contact_pos[idx*3]   = cp.x; contact_pos[idx*3+1] = cp.y; contact_pos[idx*3+2] = cp.z;
+        contact_pos[idx*3] = cp.x; contact_pos[idx*3+1] = cp.y; contact_pos[idx*3+2] = cp.z;
         contact_normal[idx*3] = n.x; contact_normal[idx*3+1] = n.y; contact_normal[idx*3+2] = n.z;
         contact_pen[idx] = pen;
         contact_body_a[idx] = ba;
@@ -192,25 +369,23 @@ void add_contact(vec3 cp, vec3 n, float pen, uint ba, uint bb) {
 }
 
 void generate_contacts(uint a, uint b, vec3 normal, float pen) {
-    mat3 Ra = quat_to_mat(a);
     mat3 Rb = quat_to_mat(b);
-    vec3 pa = get_pos(a);
     vec3 pb = get_pos(b);
+    mat3 Ra = quat_to_mat(a);
+    vec3 pa = get_pos(a);
 
-    uint a_vs, a_vc, a_ns, a_nc, a_es, a_ec;
-    uint b_vs, b_vc, b_ns, b_nc, b_es, b_ec;
-    get_hull_info(a, a_vs, a_vc, a_ns, a_nc, a_es, a_ec);
-    get_hull_info(b, b_vs, b_vc, b_ns, b_nc, b_es, b_ec);
+    uint a_vs, a_vc, b_vs, b_vc;
+    get_hull_info(a, a_vs, a_vc);
+    get_hull_info(b, b_vs, b_vc);
 
-    // Find vertices of B that penetrate into A (deepest along -normal)
-    // Project onto normal, find the support plane of A along normal
+    // Find A's support plane along normal
     float a_max = -1e10;
     for (uint i = 0; i < a_vc; i++) {
         vec3 wv = pa + Ra * get_hull_vert(a_vs + i);
         a_max = max(a_max, dot(wv, normal));
     }
 
-    // Any vertex of B that is behind A's support plane is a contact
+    // Vertices of B behind A's support plane → contact points
     for (uint i = 0; i < b_vc; i++) {
         vec3 wv = pb + Rb * get_hull_vert(b_vs + i);
         float depth = a_max - dot(wv, normal);
@@ -242,9 +417,8 @@ void step_compute_aabb() {
 
     mat3 R = quat_to_mat(i);
     vec3 p = get_pos(i);
-
-    uint vs, vc, ns, nc, es, ec;
-    get_hull_info(i, vs, vc, ns, nc, es, ec);
+    uint vs, vc;
+    get_hull_info(i, vs, vc);
 
     vec3 amin = vec3(1e10), amax = vec3(-1e10);
     for (uint v = 0; v < vc; v++) {
@@ -280,7 +454,7 @@ void step_broad_phase() {
     }
 }
 
-// Step 3: narrow phase — SAT + contacts on broad phase pairs
+// Step 3: narrow phase — GJK + EPA on broad phase pairs
 void step_narrow_phase() {
     uint pi = gl_GlobalInvocationID.x;
     uint num_pairs = min(counters[0], MAX_PAIRS);
@@ -289,13 +463,20 @@ void step_narrow_phase() {
     uint a = collision_pairs[pi*2];
     uint b = collision_pairs[pi*2+1];
 
-    int overlap;
-    float pen;
-    vec3 normal;
-    sat_test(a, b, overlap, pen, normal);
+    vec3 simp[4];
+    int simp_count;
 
-    if (overlap == 1) {
-        generate_contacts(a, b, normal, pen);
+    if (gjk(a, b, simp, simp_count)) {
+        // Ensure we have a tetrahedron for EPA
+        if (simp_count < 4) return;
+
+        vec3 normal;
+        float depth;
+        if (epa(a, b, simp, normal, depth)) {
+            if (depth > 0.0) {
+                generate_contacts(a, b, normal, depth);
+            }
+        }
     }
 }
 

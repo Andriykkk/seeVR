@@ -13,8 +13,6 @@ pub const MAX_GEOMS: u32 = 256;
 pub const MAX_CONTACTS: u32 = 4_000;
 pub const MAX_COLLISION_PAIRS: u32 = 10_000;
 pub const MAX_HULL_VERTS: u32 = 10_000;
-pub const MAX_HULL_NORMALS: u32 = 5_000;
-pub const MAX_HULL_EDGES: u32 = 5_000;
 
 pub const Data = struct {
     vk: *Vulkan,
@@ -52,8 +50,6 @@ pub const Data = struct {
 
     // ---- GPU Hull data (shared, indexed by geom_data) ----
     hull_verts: Buffer, // [MAX_HULL_VERTS] float3 — local-space convex hull vertices
-    hull_normals: Buffer, // [MAX_HULL_NORMALS] float3 — unique face normal directions (local)
-    hull_edges: Buffer, // [MAX_HULL_EDGES] float3 — unique edge directions (local)
 
     // ---- GPU Broad phase ----
     body_aabb_min: Buffer, // [MAX_BODIES] float3
@@ -100,16 +96,12 @@ pub const Data = struct {
 
     // ---- CPU staging — hull ----
     s_hull_verts: []f32,
-    s_hull_normals: []f32,
-    s_hull_edges: []f32,
 
     num_vertices: u32,
     num_triangles: u32,
     num_bodies: u32,
     num_geoms: u32,
     num_hull_verts: u32,
-    num_hull_normals: u32,
-    num_hull_edges: u32,
 
     pub fn init(vk: *Vulkan, alloc: std.mem.Allocator) !Data {
         return Data{
@@ -139,8 +131,6 @@ pub const Data = struct {
             .geom_friction = try vk.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
 
             .hull_verts = try vk.createBuffer(MAX_HULL_VERTS * @sizeOf([3]f32), STORAGE),
-            .hull_normals = try vk.createBuffer(MAX_HULL_NORMALS * @sizeOf([3]f32), STORAGE),
-            .hull_edges = try vk.createBuffer(MAX_HULL_EDGES * @sizeOf([3]f32), STORAGE),
 
             .body_aabb_min = try vk.createBuffer(MAX_BODIES * @sizeOf([3]f32), STORAGE),
             .body_aabb_max = try vk.createBuffer(MAX_BODIES * @sizeOf([3]f32), STORAGE),
@@ -177,16 +167,12 @@ pub const Data = struct {
             .s_geom_vert_start = try alloc.alloc(u32, MAX_GEOMS),
             .s_geom_vert_count = try alloc.alloc(u32, MAX_GEOMS),
             .s_hull_verts = try alloc.alloc(f32, MAX_HULL_VERTS * 3),
-            .s_hull_normals = try alloc.alloc(f32, MAX_HULL_NORMALS * 3),
-            .s_hull_edges = try alloc.alloc(f32, MAX_HULL_EDGES * 3),
 
             .num_vertices = 0,
             .num_triangles = 0,
             .num_bodies = 0,
             .num_geoms = 0,
             .num_hull_verts = 0,
-            .num_hull_normals = 0,
-            .num_hull_edges = 0,
         };
     }
 
@@ -257,38 +243,15 @@ pub const Data = struct {
         }
         self.num_hull_verts += 8;
 
-        // Hull normals — 3 unique face normal directions for a box
-        const hn = self.num_hull_normals;
-        const box_normals = [3][3]f32{ .{ 1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, 0, 1 } };
-        for (0..3) |i| {
-            const b = (hn + @as(u32, @intCast(i))) * 3;
-            self.s_hull_normals[b + 0] = box_normals[i][0];
-            self.s_hull_normals[b + 1] = box_normals[i][1];
-            self.s_hull_normals[b + 2] = box_normals[i][2];
-        }
-        self.num_hull_normals += 3;
-
-        // Hull edges — 3 unique edge directions for a box (same as normals for axis-aligned)
-        const he = self.num_hull_edges;
-        for (0..3) |i| {
-            const b = (he + @as(u32, @intCast(i))) * 3;
-            self.s_hull_edges[b + 0] = box_normals[i][0];
-            self.s_hull_edges[b + 1] = box_normals[i][1];
-            self.s_hull_edges[b + 2] = box_normals[i][2];
-        }
-        self.num_hull_edges += 3;
-
         // Geom
         self.s_geom_type[gi] = 2;
         self.s_geom_body_idx[gi] = bi;
         self.s_geom_local_pos[gi * 3 ..][0..3].* = .{ 0, 0, 0 };
         self.s_geom_local_quat[gi * 4 ..][0..4].* = .{ 1, 0, 0, 0 };
-        // geom_data[gi*8]: [vert_start, vert_count, norm_start, norm_count, edge_start, edge_count, 0, 0]
+        // geom_data[gi*8]: [vert_start, vert_count, 0, 0, 0, 0, 0, 0]
         self.s_geom_data[gi * 8 ..][0..8].* = .{
             @floatFromInt(hv), @floatFromInt(8),
-            @floatFromInt(hn), @floatFromInt(3),
-            @floatFromInt(he), @floatFromInt(3),
-            0, 0,
+            0, 0, 0, 0, 0, 0,
         };
         self.s_geom_friction[gi] = 0.5;
         self.s_geom_vert_start[gi] = vs;
@@ -318,8 +281,6 @@ pub const Data = struct {
         try v.uploadSlice(self.geom_data, f32, self.s_geom_data[0 .. self.num_geoms * 8]);
         try v.uploadSlice(self.geom_friction, f32, self.s_geom_friction[0..self.num_geoms]);
         try v.uploadSlice(self.hull_verts, f32, self.s_hull_verts[0 .. self.num_hull_verts * 3]);
-        try v.uploadSlice(self.hull_normals, f32, self.s_hull_normals[0 .. self.num_hull_normals * 3]);
-        try v.uploadSlice(self.hull_edges, f32, self.s_hull_edges[0 .. self.num_hull_edges * 3]);
 
         // Derive body vert start/count from first geom per body
         for (0..self.num_geoms) |gi| {
