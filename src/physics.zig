@@ -50,8 +50,8 @@ pub const Physics = struct {
         return .{ .vk = vk, .pipe = pipe };
     }
 
-    pub fn step(self: *Physics, num_bodies: u32, dt: f32, gravity: [3]f32) !void {
-        if (num_bodies == 0) return;
+    pub fn step(self: *Physics, num_bodies: u32, substeps: u32, dt: f32, gravity: [3]f32) !void {
+        if (num_bodies == 0 or substeps == 0) return;
 
         const vk = self.vk;
         const groups = @max((num_bodies + 255) / 256, 1);
@@ -60,6 +60,7 @@ pub const Physics = struct {
         const gz = gravity[2];
         const max_c: u32 = @import("data.zig").MAX_CONTACTS;
         const max_p: u32 = @import("data.zig").MAX_COLLISION_PAIRS;
+        const sub_dt = dt / @as(f32, @floatFromInt(substeps));
 
         var cmd: c.VkCommandBuffer = null;
         _ = c.vkAllocateCommandBuffers(vk.device, &c.VkCommandBufferAllocateInfo{
@@ -87,40 +88,43 @@ pub const Physics = struct {
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipe.pipeline);
         c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipe.layout, 0, 1, &self.pipe.desc_set, 0, null);
 
-        // 8: Clear counters
-        dispatch(cmd, self.pipe.layout, .{ .step = 8, .count = 1, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
-        bar(cmd, &barrier);
+        // All substeps in one command buffer — single GPU submit
+        for (0..substeps) |_| {
+            // Clear counters
+            dispatch(cmd, self.pipe.layout, .{ .step = 8, .count = 1, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
+            bar(cmd, &barrier);
 
-        // 0: Gravity
-        dispatch(cmd, self.pipe.layout, .{ .step = 0, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
-        bar(cmd, &barrier);
+            // Gravity
+            dispatch(cmd, self.pipe.layout, .{ .step = 0, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+            bar(cmd, &barrier);
 
-        // 1: Compute AABB
-        dispatch(cmd, self.pipe.layout, .{ .step = 1, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
-        bar(cmd, &barrier);
+            // AABB
+            dispatch(cmd, self.pipe.layout, .{ .step = 1, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+            bar(cmd, &barrier);
 
-        // 2: Broad phase
-        dispatch(cmd, self.pipe.layout, .{ .step = 2, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
-        bar(cmd, &barrier);
+            // Broad phase
+            dispatch(cmd, self.pipe.layout, .{ .step = 2, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+            bar(cmd, &barrier);
 
-        // 3: Narrow phase (GJK + EPA)
-        dispatch(cmd, self.pipe.layout, .{ .step = 3, .count = max_p, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (max_p + 255) / 256);
-        bar(cmd, &barrier);
+            // Narrow phase (GJK + EPA)
+            dispatch(cmd, self.pipe.layout, .{ .step = 3, .count = max_p, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (max_p + 255) / 256);
+            bar(cmd, &barrier);
 
-        // 4: Clear impulses
-        dispatch(cmd, self.pipe.layout, .{ .step = 4, .count = max_c, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (max_c + 255) / 256);
-        bar(cmd, &barrier);
+            // Clear impulses
+            dispatch(cmd, self.pipe.layout, .{ .step = 4, .count = max_c, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (max_c + 255) / 256);
+            bar(cmd, &barrier);
 
-        // 5: PGS solve
-        dispatch(cmd, self.pipe.layout, .{ .step = 5, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
-        bar(cmd, &barrier);
+            // PGS solve
+            dispatch(cmd, self.pipe.layout, .{ .step = 5, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
+            bar(cmd, &barrier);
 
-        // 6: Integrate
-        dispatch(cmd, self.pipe.layout, .{ .step = 6, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
-        bar(cmd, &barrier);
+            // Integrate
+            dispatch(cmd, self.pipe.layout, .{ .step = 6, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+            bar(cmd, &barrier);
+        }
 
-        // 7: Update render verts
-        dispatch(cmd, self.pipe.layout, .{ .step = 7, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
+        // Update render verts (only once after all substeps)
+        dispatch(cmd, self.pipe.layout, .{ .step = 7, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
 
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &barrier, 0, null, 0, null);
 

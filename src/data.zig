@@ -261,6 +261,107 @@ pub const Data = struct {
         return bi;
     }
 
+    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, mass: f32) !u32 {
+        const vs = self.num_vertices;
+        const ts = self.num_triangles;
+        const bi = self.num_bodies;
+        const gi = self.num_geoms;
+        const pi = 3.14159265;
+
+        // Generate UV sphere vertices
+        const num_v = (segments + 1) * (segments + 1);
+        const num_t = segments * segments * 2;
+
+        for (0..segments + 1) |i_| {
+            const i: f32 = @floatFromInt(i_);
+            const segs: f32 = @floatFromInt(segments);
+            const lat = pi * i / segs;
+            const sin_lat = @sin(lat);
+            const cos_lat = @cos(lat);
+            for (0..segments + 1) |j_| {
+                const j: f32 = @floatFromInt(j_);
+                const lon = 2.0 * pi * j / segs;
+                const idx = (vs + @as(u32, @intCast(i_)) * (segments + 1) + @as(u32, @intCast(j_))) * 3;
+                const lx = radius * @cos(lon) * sin_lat;
+                const ly = radius * cos_lat;
+                const lz = radius * @sin(lon) * sin_lat;
+                self.s_orig_verts[idx + 0] = lx;
+                self.s_orig_verts[idx + 1] = ly;
+                self.s_orig_verts[idx + 2] = lz;
+                self.s_vertices[idx + 0] = center[0] + lx;
+                self.s_vertices[idx + 1] = center[1] + ly;
+                self.s_vertices[idx + 2] = center[2] + lz;
+                self.s_colors[idx + 0] = color[0];
+                self.s_colors[idx + 1] = color[1];
+                self.s_colors[idx + 2] = color[2];
+            }
+        }
+        self.num_vertices += num_v;
+
+        // Triangles (2 per grid quad)
+        var ti: u32 = 0;
+        for (0..segments) |i_| {
+            for (0..segments) |j_| {
+                const cur = vs + @as(u32, @intCast(i_)) * (segments + 1) + @as(u32, @intCast(j_));
+                const nxt = cur + segments + 1;
+                const b = (ts + ti) * 3;
+                self.s_indices[b + 0] = cur;
+                self.s_indices[b + 1] = nxt;
+                self.s_indices[b + 2] = cur + 1;
+                self.s_indices[b + 3] = cur + 1;
+                self.s_indices[b + 4] = nxt;
+                self.s_indices[b + 5] = nxt + 1;
+                ti += 2;
+            }
+        }
+        self.num_triangles += num_t;
+
+        // Body
+        const b3 = bi * 3;
+        self.s_body_pos[b3..][0..3].* = center;
+        self.s_body_quat[bi * 4 ..][0..4].* = .{ 0, 0, 0, 1 };
+        self.s_body_vel[b3..][0..3].* = .{ 0, 0, 0 };
+        self.s_body_omega[b3..][0..3].* = .{ 0, 0, 0 };
+        self.s_body_inv_mass[bi] = if (mass > 0) 1.0 / mass else 0;
+        if (mass > 0) {
+            const inertia = 0.4 * mass * radius * radius;
+            self.s_body_inertia[b3..][0..3].* = .{ inertia, inertia, inertia };
+            self.s_body_inv_inertia[b3..][0..3].* = .{ 1.0 / inertia, 1.0 / inertia, 1.0 / inertia };
+        } else {
+            self.s_body_inertia[b3..][0..3].* = .{ 0, 0, 0 };
+            self.s_body_inv_inertia[b3..][0..3].* = .{ 0, 0, 0 };
+        }
+        self.num_bodies += 1;
+
+        // Hull verts — use the same sphere vertices as collision hull
+        // For GJK support function, all render verts work as hull
+        const hv = self.num_hull_verts;
+        for (0..num_v) |i| {
+            const sv = (vs + @as(u32, @intCast(i))) * 3;
+            const hb = (hv + @as(u32, @intCast(i))) * 3;
+            self.s_hull_verts[hb + 0] = self.s_orig_verts[sv + 0];
+            self.s_hull_verts[hb + 1] = self.s_orig_verts[sv + 1];
+            self.s_hull_verts[hb + 2] = self.s_orig_verts[sv + 2];
+        }
+        self.num_hull_verts += num_v;
+
+        // Geom
+        self.s_geom_type[gi] = 1;
+        self.s_geom_body_idx[gi] = bi;
+        self.s_geom_local_pos[gi * 3 ..][0..3].* = .{ 0, 0, 0 };
+        self.s_geom_local_quat[gi * 4 ..][0..4].* = .{ 1, 0, 0, 0 };
+        self.s_geom_data[gi * 8 ..][0..8].* = .{
+            @floatFromInt(hv), @floatFromInt(num_v),
+            0, 0, 0, 0, 0, 0,
+        };
+        self.s_geom_friction[gi] = 0.5;
+        self.s_geom_vert_start[gi] = vs;
+        self.s_geom_vert_count[gi] = num_v;
+        self.num_geoms += 1;
+
+        return bi;
+    }
+
     pub fn upload(self: *Data) !void {
         const v = self.vk;
         try v.uploadSlice(self.vertices, f32, self.s_vertices[0 .. self.num_vertices * 3]);

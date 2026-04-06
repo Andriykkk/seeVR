@@ -41,6 +41,9 @@ pub fn main() !void {
     // Side boxes
     _ = try d.addBox(.{ 3, 1, 0 }, .{ 0.75, 0.75, 0.75 }, .{ 0.3, 0.8, 0.3 }, 1);
     _ = try d.addBox(.{ -3, 2, 1 }, .{ 0.6, 0.6, 0.6 }, .{ 0.8, 0.5, 0.2 }, 1);
+    // Spheres
+    _ = try d.addSphere(.{ 1.5, 3, 0 }, 0.4, .{ 0.9, 0.3, 0.9 }, 12, 1);
+    _ = try d.addSphere(.{ -1.0, 3, 0 }, 0.5, .{ 0.3, 0.9, 0.9 }, 12, 1);
 
     try d.upload();
 
@@ -66,12 +69,8 @@ pub fn main() !void {
         camera.update(window, dt);
         const mvp = camera.mvp(aspect);
 
-        // Physics: 10 substeps at dt=1/600
-        const substeps = 10;
-        const phys_dt = 1.0 / (60.0 * @as(f32, substeps));
-        for (0..substeps) |_| {
-            try physics.step(d.num_bodies, phys_dt, .{ 0, -9.81, 0 });
-        }
+        // Physics: 10 substeps batched in single GPU submit
+        try physics.step(d.num_bodies, 10, 1.0 / 60.0, .{ 0, -9.81, 0 });
 
         // Render
         try scene.beginFrame();
