@@ -24,6 +24,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const enable_imgui = b.option(bool, "imgui", "Enable ImGui overlay (default: true)") orelse true;
+    const mode_str = b.option([]const u8, "mode", "Render mode: raster or raytrace (default: raster)") orelse "raster";
+    const is_raytrace = std.mem.eql(u8, mode_str, "raytrace");
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -34,6 +36,7 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption(bool, "enable_imgui", enable_imgui);
+    options.addOption(bool, "raytrace", is_raytrace);
     mod.addOptions("build_options", options);
 
     mod.linkSystemLibrary("glfw", .{});

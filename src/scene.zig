@@ -2,6 +2,8 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const Vulkan = @import("vulkan.zig").Vulkan;
 const Data = @import("data.zig").Data;
+const build_options = @import("build_options");
+const is_raytrace = build_options.raytrace;
 
 const MAX_FRAMES_IN_FLIGHT = 2;
 
@@ -11,6 +13,7 @@ pub const Scene = struct {
     width: u32,
     height: u32,
 
+    // Swapchain (both modes)
     swapchain: c.VkSwapchainKHR,
     swapchain_images: [8]c.VkImage,
     swapchain_views: [8]c.VkImageView,
@@ -18,16 +21,21 @@ pub const Scene = struct {
     swapchain_count: u32,
     extent: c.VkExtent2D,
 
+    // Raster-only
     depth_image: c.VkImage,
     depth_memory: c.VkDeviceMemory,
     depth_view: c.VkImageView,
-
     render_pass: c.VkRenderPass,
     framebuffers: [8]c.VkFramebuffer,
-
     pipeline_layout: c.VkPipelineLayout,
     pipeline: c.VkPipeline,
 
+    // Raytrace-only: storage image for compute output
+    rt_image: c.VkImage,
+    rt_memory: c.VkDeviceMemory,
+    rt_view: c.VkImageView,
+
+    // Shared
     cmd_buffers: [MAX_FRAMES_IN_FLIGHT]c.VkCommandBuffer,
     image_available: [MAX_FRAMES_IN_FLIGHT]c.VkSemaphore,
     render_finished: [MAX_FRAMES_IN_FLIGHT]c.VkSemaphore,
@@ -54,6 +62,9 @@ pub const Scene = struct {
             .framebuffers = undefined,
             .pipeline_layout = null,
             .pipeline = null,
+            .rt_image = null,
+            .rt_memory = null,
+            .rt_view = null,
             .cmd_buffers = undefined,
             .image_available = undefined,
             .render_finished = undefined,
@@ -62,7 +73,7 @@ pub const Scene = struct {
             .current_image = 0,
         };
 
-        // --- Swapchain ---
+        // --- Swapchain (both modes) ---
         var caps: c.VkSurfaceCapabilitiesKHR = undefined;
         _ = c.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.physical_device, vk.surface, &caps);
 
@@ -89,18 +100,16 @@ pub const Scene = struct {
 
         if (c.vkCreateSwapchainKHR(vk.device, &c.VkSwapchainCreateInfoKHR{
             .sType = c.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-            .pNext = null,
-            .flags = 0,
+            .pNext = null, .flags = 0,
             .surface = vk.surface,
             .minImageCount = image_count,
             .imageFormat = self.swapchain_format,
             .imageColorSpace = c.VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
             .imageExtent = self.extent,
             .imageArrayLayers = 1,
-            .imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | c.VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             .imageSharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
-            .queueFamilyIndexCount = 0,
-            .pQueueFamilyIndices = null,
+            .queueFamilyIndexCount = 0, .pQueueFamilyIndices = null,
             .preTransform = caps.currentTransform,
             .compositeAlpha = c.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
             .presentMode = c.VK_PRESENT_MODE_FIFO_KHR,
@@ -114,39 +123,54 @@ pub const Scene = struct {
 
         for (0..self.swapchain_count) |i| {
             if (c.vkCreateImageView(vk.device, &c.VkImageViewCreateInfo{
-                .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                .pNext = null,
-                .flags = 0,
+                .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = null, .flags = 0,
                 .image = self.swapchain_images[i],
                 .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
                 .format = self.swapchain_format,
-                .components = .{
-                    .r = c.VK_COMPONENT_SWIZZLE_IDENTITY, .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-                    .b = c.VK_COMPONENT_SWIZZLE_IDENTITY, .a = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-                },
-                .subresourceRange = .{
-                    .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1,
-                },
+                .components = .{ .r = c.VK_COMPONENT_SWIZZLE_IDENTITY, .g = c.VK_COMPONENT_SWIZZLE_IDENTITY, .b = c.VK_COMPONENT_SWIZZLE_IDENTITY, .a = c.VK_COMPONENT_SWIZZLE_IDENTITY },
+                .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
             }, null, &self.swapchain_views[i]) != c.VK_SUCCESS)
                 return error.ImageViewCreateFailed;
         }
 
-        // --- Depth buffer ---
+        if (comptime !is_raytrace) {
+            // --- Raster: depth buffer + render pass + graphics pipeline ---
+            try self.initRaster(vk, allocator);
+        } else {
+            // --- Raytrace: storage image for compute output ---
+            try self.initRaytraceImage(vk);
+        }
+
+        // --- Command buffers + sync (both modes) ---
+        var cmd_bufs: [MAX_FRAMES_IN_FLIGHT]c.VkCommandBuffer = undefined;
+        _ = c.vkAllocateCommandBuffers(vk.device, &c.VkCommandBufferAllocateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .pNext = null,
+            .commandPool = vk.cmd_pool, .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = MAX_FRAMES_IN_FLIGHT,
+        }, &cmd_bufs);
+        self.cmd_buffers = cmd_bufs;
+
+        for (0..MAX_FRAMES_IN_FLIGHT) |i| {
+            if (c.vkCreateSemaphore(vk.device, &c.VkSemaphoreCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = null, .flags = 0 }, null, &self.image_available[i]) != c.VK_SUCCESS) return error.SyncCreateFailed;
+            if (c.vkCreateSemaphore(vk.device, &c.VkSemaphoreCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = null, .flags = 0 }, null, &self.render_finished[i]) != c.VK_SUCCESS) return error.SyncCreateFailed;
+            if (c.vkCreateFence(vk.device, &c.VkFenceCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = null, .flags = c.VK_FENCE_CREATE_SIGNALED_BIT }, null, &self.in_flight[i]) != c.VK_SUCCESS) return error.SyncCreateFailed;
+        }
+
+        const mode_str = if (comptime is_raytrace) "raytrace" else "raster";
+        std.debug.print("Scene init OK ({s}, {}x{}, {} images)\n", .{ mode_str, self.extent.width, self.extent.height, self.swapchain_count });
+        return self;
+    }
+
+    fn initRaster(self: *Scene, vk: *Vulkan, allocator: std.mem.Allocator) !void {
         const depth_format = c.VK_FORMAT_D32_SFLOAT;
 
+        // Depth buffer
         if (c.vkCreateImage(vk.device, &c.VkImageCreateInfo{
-            .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .imageType = c.VK_IMAGE_TYPE_2D,
-            .format = depth_format,
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = null, .flags = 0,
+            .imageType = c.VK_IMAGE_TYPE_2D, .format = depth_format,
             .extent = .{ .width = self.extent.width, .height = self.extent.height, .depth = 1 },
-            .mipLevels = 1, .arrayLayers = 1,
-            .samples = c.VK_SAMPLE_COUNT_1_BIT,
-            .tiling = c.VK_IMAGE_TILING_OPTIMAL,
-            .usage = c.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
-            .queueFamilyIndexCount = 0, .pQueueFamilyIndices = null,
+            .mipLevels = 1, .arrayLayers = 1, .samples = c.VK_SAMPLE_COUNT_1_BIT,
+            .tiling = c.VK_IMAGE_TILING_OPTIMAL, .usage = c.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE, .queueFamilyIndexCount = 0, .pQueueFamilyIndices = null,
             .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
         }, null, &self.depth_image) != c.VK_SUCCESS)
             return error.DepthImageCreateFailed;
@@ -154,8 +178,7 @@ pub const Scene = struct {
         var depth_mem_reqs: c.VkMemoryRequirements = undefined;
         c.vkGetImageMemoryRequirements(vk.device, self.depth_image, &depth_mem_reqs);
         if (c.vkAllocateMemory(vk.device, &c.VkMemoryAllocateInfo{
-            .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .pNext = null,
+            .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = null,
             .allocationSize = depth_mem_reqs.size,
             .memoryTypeIndex = try vk.findMemoryType(depth_mem_reqs.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
         }, null, &self.depth_memory) != c.VK_SUCCESS)
@@ -163,44 +186,23 @@ pub const Scene = struct {
         _ = c.vkBindImageMemory(vk.device, self.depth_image, self.depth_memory, 0);
 
         if (c.vkCreateImageView(vk.device, &c.VkImageViewCreateInfo{
-            .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .image = self.depth_image,
-            .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
-            .format = depth_format,
-            .components = .{
-                .r = c.VK_COMPONENT_SWIZZLE_IDENTITY, .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-                .b = c.VK_COMPONENT_SWIZZLE_IDENTITY, .a = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-            },
-            .subresourceRange = .{
-                .aspectMask = c.VK_IMAGE_ASPECT_DEPTH_BIT,
-                .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1,
-            },
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = null, .flags = 0,
+            .image = self.depth_image, .viewType = c.VK_IMAGE_VIEW_TYPE_2D, .format = depth_format,
+            .components = .{ .r = c.VK_COMPONENT_SWIZZLE_IDENTITY, .g = c.VK_COMPONENT_SWIZZLE_IDENTITY, .b = c.VK_COMPONENT_SWIZZLE_IDENTITY, .a = c.VK_COMPONENT_SWIZZLE_IDENTITY },
+            .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_DEPTH_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
         }, null, &self.depth_view) != c.VK_SUCCESS)
             return error.DepthViewCreateFailed;
 
-        // --- Render pass ---
+        // Render pass
         const attachments = [2]c.VkAttachmentDescription{
-            .{
-                .flags = 0, .format = self.swapchain_format, .samples = c.VK_SAMPLE_COUNT_1_BIT,
-                .loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = c.VK_ATTACHMENT_STORE_OP_STORE,
-                .stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE,
-                .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            },
-            .{
-                .flags = 0, .format = depth_format, .samples = c.VK_SAMPLE_COUNT_1_BIT,
-                .loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE,
-                .stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE,
-                .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = c.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            },
+            .{ .flags = 0, .format = self.swapchain_format, .samples = c.VK_SAMPLE_COUNT_1_BIT, .loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = c.VK_ATTACHMENT_STORE_OP_STORE, .stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR },
+            .{ .flags = 0, .format = depth_format, .samples = c.VK_SAMPLE_COUNT_1_BIT, .loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE, .stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = c.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL },
         };
         const depth_ref = c.VkAttachmentReference{ .attachment = 1, .layout = c.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
 
         if (c.vkCreateRenderPass(vk.device, &c.VkRenderPassCreateInfo{
-            .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .attachmentCount = 2, .pAttachments = &attachments,
-            .subpassCount = 1,
+            .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .pNext = null, .flags = 0,
+            .attachmentCount = 2, .pAttachments = &attachments, .subpassCount = 1,
             .pSubpasses = &c.VkSubpassDescription{
                 .flags = 0, .pipelineBindPoint = c.VK_PIPELINE_BIND_POINT_GRAPHICS,
                 .inputAttachmentCount = 0, .pInputAttachments = null,
@@ -213,46 +215,22 @@ pub const Scene = struct {
         }, null, &self.render_pass) != c.VK_SUCCESS)
             return error.RenderPassCreateFailed;
 
-        // --- Framebuffers ---
+        // Framebuffers
         for (0..self.swapchain_count) |i| {
             const fb_attachments = [2]c.VkImageView{ self.swapchain_views[i], self.depth_view };
             if (c.vkCreateFramebuffer(vk.device, &c.VkFramebufferCreateInfo{
-                .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-                .pNext = null, .flags = 0,
-                .renderPass = self.render_pass,
-                .attachmentCount = 2, .pAttachments = &fb_attachments,
+                .sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .pNext = null, .flags = 0,
+                .renderPass = self.render_pass, .attachmentCount = 2, .pAttachments = &fb_attachments,
                 .width = self.extent.width, .height = self.extent.height, .layers = 1,
             }, null, &self.framebuffers[i]) != c.VK_SUCCESS)
                 return error.FramebufferCreateFailed;
         }
 
-        // --- Graphics pipeline ---
+        // Graphics pipeline
         const vert_mod = try vk.getShader("src/shaders/triangle.vert", .vertex, allocator);
         const frag_mod = try vk.getShader("src/shaders/triangle.frag", .fragment, allocator);
 
-        const shader_stages = [2]c.VkPipelineShaderStageCreateInfo{
-            .{
-                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = null, .flags = 0,
-                .stage = c.VK_SHADER_STAGE_VERTEX_BIT, .module = vert_mod, .pName = "main", .pSpecializationInfo = null,
-            },
-            .{
-                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = null, .flags = 0,
-                .stage = c.VK_SHADER_STAGE_FRAGMENT_BIT, .module = frag_mod, .pName = "main", .pSpecializationInfo = null,
-            },
-        };
-
-        const bindings = [2]c.VkVertexInputBindingDescription{
-            .{ .binding = 0, .stride = 3 * @sizeOf(f32), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX },
-            .{ .binding = 1, .stride = 3 * @sizeOf(f32), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX },
-        };
-        const attrs = [2]c.VkVertexInputAttributeDescription{
-            .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32B32_SFLOAT, .offset = 0 },
-            .{ .location = 1, .binding = 1, .format = c.VK_FORMAT_R32G32B32_SFLOAT, .offset = 0 },
-        };
-
-        const push_range = c.VkPushConstantRange{
-            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 64,
-        };
+        const push_range = c.VkPushConstantRange{ .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 64 };
 
         if (c.vkCreatePipelineLayout(vk.device, &c.VkPipelineLayoutCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pNext = null, .flags = 0,
@@ -263,83 +241,80 @@ pub const Scene = struct {
 
         if (c.vkCreateGraphicsPipelines(vk.device, null, 1, &c.VkGraphicsPipelineCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = null, .flags = 0,
-            .stageCount = 2, .pStages = &shader_stages,
+            .stageCount = 2, .pStages = &[2]c.VkPipelineShaderStageCreateInfo{
+                .{ .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = null, .flags = 0, .stage = c.VK_SHADER_STAGE_VERTEX_BIT, .module = vert_mod, .pName = "main", .pSpecializationInfo = null },
+                .{ .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = null, .flags = 0, .stage = c.VK_SHADER_STAGE_FRAGMENT_BIT, .module = frag_mod, .pName = "main", .pSpecializationInfo = null },
+            },
             .pVertexInputState = &c.VkPipelineVertexInputStateCreateInfo{
                 .sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .pNext = null, .flags = 0,
-                .vertexBindingDescriptionCount = 2, .pVertexBindingDescriptions = &bindings,
-                .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = &attrs,
+                .vertexBindingDescriptionCount = 2, .pVertexBindingDescriptions = &[2]c.VkVertexInputBindingDescription{
+                    .{ .binding = 0, .stride = 3 * @sizeOf(f32), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX },
+                    .{ .binding = 1, .stride = 3 * @sizeOf(f32), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX },
+                },
+                .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = &[2]c.VkVertexInputAttributeDescription{
+                    .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32B32_SFLOAT, .offset = 0 },
+                    .{ .location = 1, .binding = 1, .format = c.VK_FORMAT_R32G32B32_SFLOAT, .offset = 0 },
+                },
             },
-            .pInputAssemblyState = &c.VkPipelineInputAssemblyStateCreateInfo{
-                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .pNext = null, .flags = 0,
-                .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, .primitiveRestartEnable = c.VK_FALSE,
-            },
+            .pInputAssemblyState = &c.VkPipelineInputAssemblyStateCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .pNext = null, .flags = 0, .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, .primitiveRestartEnable = c.VK_FALSE },
             .pTessellationState = null,
             .pViewportState = &c.VkPipelineViewportStateCreateInfo{
                 .sType = c.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = null, .flags = 0,
-                .viewportCount = 1,
-                .pViewports = &c.VkViewport{ .x = 0, .y = 0, .width = @floatFromInt(self.extent.width), .height = @floatFromInt(self.extent.height), .minDepth = 0, .maxDepth = 1 },
-                .scissorCount = 1,
-                .pScissors = &c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent },
+                .viewportCount = 1, .pViewports = &c.VkViewport{ .x = 0, .y = 0, .width = @floatFromInt(self.extent.width), .height = @floatFromInt(self.extent.height), .minDepth = 0, .maxDepth = 1 },
+                .scissorCount = 1, .pScissors = &c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent },
             },
-            .pRasterizationState = &c.VkPipelineRasterizationStateCreateInfo{
-                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .pNext = null, .flags = 0,
-                .depthClampEnable = c.VK_FALSE, .rasterizerDiscardEnable = c.VK_FALSE,
-                .polygonMode = c.VK_POLYGON_MODE_FILL, .cullMode = c.VK_CULL_MODE_BACK_BIT,
-                .frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE,
-                .depthBiasEnable = c.VK_FALSE, .depthBiasConstantFactor = 0, .depthBiasClamp = 0, .depthBiasSlopeFactor = 0,
-                .lineWidth = 1.0,
-            },
-            .pMultisampleState = &c.VkPipelineMultisampleStateCreateInfo{
-                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .pNext = null, .flags = 0,
-                .rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT, .sampleShadingEnable = c.VK_FALSE,
-                .minSampleShading = 1, .pSampleMask = null, .alphaToCoverageEnable = c.VK_FALSE, .alphaToOneEnable = c.VK_FALSE,
-            },
-            .pDepthStencilState = &c.VkPipelineDepthStencilStateCreateInfo{
-                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .pNext = null, .flags = 0,
-                .depthTestEnable = c.VK_TRUE, .depthWriteEnable = c.VK_TRUE, .depthCompareOp = c.VK_COMPARE_OP_LESS,
-                .depthBoundsTestEnable = c.VK_FALSE, .stencilTestEnable = c.VK_FALSE,
-                .front = std.mem.zeroes(c.VkStencilOpState), .back = std.mem.zeroes(c.VkStencilOpState),
-                .minDepthBounds = 0, .maxDepthBounds = 1,
-            },
+            .pRasterizationState = &c.VkPipelineRasterizationStateCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .pNext = null, .flags = 0, .depthClampEnable = c.VK_FALSE, .rasterizerDiscardEnable = c.VK_FALSE, .polygonMode = c.VK_POLYGON_MODE_FILL, .cullMode = c.VK_CULL_MODE_BACK_BIT, .frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE, .depthBiasEnable = c.VK_FALSE, .depthBiasConstantFactor = 0, .depthBiasClamp = 0, .depthBiasSlopeFactor = 0, .lineWidth = 1.0 },
+            .pMultisampleState = &c.VkPipelineMultisampleStateCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .pNext = null, .flags = 0, .rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT, .sampleShadingEnable = c.VK_FALSE, .minSampleShading = 1, .pSampleMask = null, .alphaToCoverageEnable = c.VK_FALSE, .alphaToOneEnable = c.VK_FALSE },
+            .pDepthStencilState = &c.VkPipelineDepthStencilStateCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .pNext = null, .flags = 0, .depthTestEnable = c.VK_TRUE, .depthWriteEnable = c.VK_TRUE, .depthCompareOp = c.VK_COMPARE_OP_LESS, .depthBoundsTestEnable = c.VK_FALSE, .stencilTestEnable = c.VK_FALSE, .front = std.mem.zeroes(c.VkStencilOpState), .back = std.mem.zeroes(c.VkStencilOpState), .minDepthBounds = 0, .maxDepthBounds = 1 },
             .pColorBlendState = &c.VkPipelineColorBlendStateCreateInfo{
                 .sType = c.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .pNext = null, .flags = 0,
-                .logicOpEnable = c.VK_FALSE, .logicOp = c.VK_LOGIC_OP_COPY,
-                .attachmentCount = 1,
-                .pAttachments = &c.VkPipelineColorBlendAttachmentState{
-                    .blendEnable = c.VK_FALSE,
-                    .srcColorBlendFactor = c.VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = c.VK_BLEND_FACTOR_ZERO, .colorBlendOp = c.VK_BLEND_OP_ADD,
-                    .srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ZERO, .alphaBlendOp = c.VK_BLEND_OP_ADD,
-                    .colorWriteMask = c.VK_COLOR_COMPONENT_R_BIT | c.VK_COLOR_COMPONENT_G_BIT | c.VK_COLOR_COMPONENT_B_BIT | c.VK_COLOR_COMPONENT_A_BIT,
-                },
+                .logicOpEnable = c.VK_FALSE, .logicOp = c.VK_LOGIC_OP_COPY, .attachmentCount = 1,
+                .pAttachments = &c.VkPipelineColorBlendAttachmentState{ .blendEnable = c.VK_FALSE, .srcColorBlendFactor = c.VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = c.VK_BLEND_FACTOR_ZERO, .colorBlendOp = c.VK_BLEND_OP_ADD, .srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ZERO, .alphaBlendOp = c.VK_BLEND_OP_ADD, .colorWriteMask = c.VK_COLOR_COMPONENT_R_BIT | c.VK_COLOR_COMPONENT_G_BIT | c.VK_COLOR_COMPONENT_B_BIT | c.VK_COLOR_COMPONENT_A_BIT },
                 .blendConstants = .{ 0, 0, 0, 0 },
             },
             .pDynamicState = null,
-            .layout = self.pipeline_layout,
-            .renderPass = self.render_pass,
-            .subpass = 0,
-            .basePipelineHandle = null,
-            .basePipelineIndex = -1,
+            .layout = self.pipeline_layout, .renderPass = self.render_pass, .subpass = 0,
+            .basePipelineHandle = null, .basePipelineIndex = -1,
         }, null, &self.pipeline) != c.VK_SUCCESS)
             return error.PipelineCreateFailed;
-
-        // --- Command buffers ---
-        var cmd_bufs: [MAX_FRAMES_IN_FLIGHT]c.VkCommandBuffer = undefined;
-        _ = c.vkAllocateCommandBuffers(vk.device, &c.VkCommandBufferAllocateInfo{
-            .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .pNext = null,
-            .commandPool = vk.cmd_pool, .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = MAX_FRAMES_IN_FLIGHT,
-        }, &cmd_bufs);
-        self.cmd_buffers = cmd_bufs;
-
-        // --- Sync ---
-        for (0..MAX_FRAMES_IN_FLIGHT) |i| {
-            if (c.vkCreateSemaphore(vk.device, &c.VkSemaphoreCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = null, .flags = 0 }, null, &self.image_available[i]) != c.VK_SUCCESS) return error.SyncCreateFailed;
-            if (c.vkCreateSemaphore(vk.device, &c.VkSemaphoreCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = null, .flags = 0 }, null, &self.render_finished[i]) != c.VK_SUCCESS) return error.SyncCreateFailed;
-            if (c.vkCreateFence(vk.device, &c.VkFenceCreateInfo{ .sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = null, .flags = c.VK_FENCE_CREATE_SIGNALED_BIT }, null, &self.in_flight[i]) != c.VK_SUCCESS) return error.SyncCreateFailed;
-        }
-
-        std.debug.print("Scene init OK ({}x{}, {} images)\n", .{ self.extent.width, self.extent.height, self.swapchain_count });
-        return self;
     }
+
+    fn initRaytraceImage(self: *Scene, vk: *Vulkan) !void {
+        // Storage image: compute shader writes RGBA, then we blit to swapchain
+        if (c.vkCreateImage(vk.device, &c.VkImageCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = null, .flags = 0,
+            .imageType = c.VK_IMAGE_TYPE_2D,
+            .format = c.VK_FORMAT_R8G8B8A8_UNORM,
+            .extent = .{ .width = self.extent.width, .height = self.extent.height, .depth = 1 },
+            .mipLevels = 1, .arrayLayers = 1, .samples = c.VK_SAMPLE_COUNT_1_BIT,
+            .tiling = c.VK_IMAGE_TILING_OPTIMAL,
+            .usage = c.VK_IMAGE_USAGE_STORAGE_BIT | c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0, .pQueueFamilyIndices = null,
+            .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+        }, null, &self.rt_image) != c.VK_SUCCESS)
+            return error.RtImageCreateFailed;
+
+        var mem_reqs: c.VkMemoryRequirements = undefined;
+        c.vkGetImageMemoryRequirements(vk.device, self.rt_image, &mem_reqs);
+        if (c.vkAllocateMemory(vk.device, &c.VkMemoryAllocateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = null,
+            .allocationSize = mem_reqs.size,
+            .memoryTypeIndex = try vk.findMemoryType(mem_reqs.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        }, null, &self.rt_memory) != c.VK_SUCCESS)
+            return error.RtMemoryAllocFailed;
+        _ = c.vkBindImageMemory(vk.device, self.rt_image, self.rt_memory, 0);
+
+        if (c.vkCreateImageView(vk.device, &c.VkImageViewCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = null, .flags = 0,
+            .image = self.rt_image, .viewType = c.VK_IMAGE_VIEW_TYPE_2D, .format = c.VK_FORMAT_R8G8B8A8_UNORM,
+            .components = .{ .r = c.VK_COMPONENT_SWIZZLE_IDENTITY, .g = c.VK_COMPONENT_SWIZZLE_IDENTITY, .b = c.VK_COMPONENT_SWIZZLE_IDENTITY, .a = c.VK_COMPONENT_SWIZZLE_IDENTITY },
+            .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
+        }, null, &self.rt_view) != c.VK_SUCCESS)
+            return error.RtViewCreateFailed;
+    }
+
+    // ---- Raster frame ----
 
     pub fn beginFrame(self: *Scene) !void {
         const dev = self.vk.device;
@@ -354,17 +329,19 @@ pub const Scene = struct {
             .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .pNext = null, .flags = 0, .pInheritanceInfo = null,
         });
 
-        const clear_values = [2]c.VkClearValue{
-            .{ .color = .{ .float32 = .{ 0.1, 0.1, 0.12, 1.0 } } },
-            .{ .depthStencil = .{ .depth = 1.0, .stencil = 0 } },
-        };
-        c.vkCmdBeginRenderPass(self.cmd_buffers[f], &c.VkRenderPassBeginInfo{
-            .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .pNext = null,
-            .renderPass = self.render_pass,
-            .framebuffer = self.framebuffers[self.current_image],
-            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent },
-            .clearValueCount = 2, .pClearValues = &clear_values,
-        }, c.VK_SUBPASS_CONTENTS_INLINE);
+        if (comptime !is_raytrace) {
+            const clear_values = [2]c.VkClearValue{
+                .{ .color = .{ .float32 = .{ 0.1, 0.1, 0.12, 1.0 } } },
+                .{ .depthStencil = .{ .depth = 1.0, .stencil = 0 } },
+            };
+            c.vkCmdBeginRenderPass(self.cmd_buffers[f], &c.VkRenderPassBeginInfo{
+                .sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .pNext = null,
+                .renderPass = self.render_pass,
+                .framebuffer = self.framebuffers[self.current_image],
+                .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent },
+                .clearValueCount = 2, .pClearValues = &clear_values,
+            }, c.VK_SUBPASS_CONTENTS_INLINE);
+        }
     }
 
     pub fn draw(self: *Scene, d: *const Data, mvp: *const [16]f32) void {
@@ -379,9 +356,58 @@ pub const Scene = struct {
         c.vkCmdDrawIndexed(cmd, d.num_triangles * 3, 1, 0, 0, 0);
     }
 
+    /// Blit rt_image to swapchain (raytrace mode only)
+    pub fn blitRtImage(self: *Scene) void {
+        if (comptime !is_raytrace) return;
+
+        const cmd = self.cmd_buffers[self.current_frame];
+        const subresource = c.VkImageSubresourceLayers{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 };
+
+        // rt_image: GENERAL → TRANSFER_SRC
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &c.VkImageMemoryBarrier{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .pNext = null,
+            .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = c.VK_IMAGE_LAYOUT_GENERAL, .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .image = self.rt_image,
+            .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
+        });
+
+        // swapchain: UNDEFINED → TRANSFER_DST
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &c.VkImageMemoryBarrier{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .pNext = null,
+            .srcAccessMask = 0, .dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .image = self.swapchain_images[self.current_image],
+            .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
+        });
+
+        // Blit
+        c.vkCmdBlitImage(cmd, self.rt_image, c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, self.swapchain_images[self.current_image], c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c.VkImageBlit{
+            .srcSubresource = subresource, .dstSubresource = subresource,
+            .srcOffsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = @intCast(self.extent.width), .y = @intCast(self.extent.height), .z = 1 } },
+            .dstOffsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = @intCast(self.extent.width), .y = @intCast(self.extent.height), .z = 1 } },
+        }, c.VK_FILTER_NEAREST);
+
+        // swapchain: TRANSFER_DST → PRESENT_SRC
+        c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_TRANSFER_BIT, c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, null, 0, null, 1, &c.VkImageMemoryBarrier{
+            .sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .pNext = null,
+            .srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = 0,
+            .oldLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .newLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .image = self.swapchain_images[self.current_image],
+            .subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 },
+        });
+    }
+
     pub fn endFrame(self: *Scene) !void {
         const cmd = self.cmd_buffers[self.current_frame];
-        c.vkCmdEndRenderPass(cmd);
+
+        if (comptime !is_raytrace) {
+            c.vkCmdEndRenderPass(cmd);
+        }
+
         _ = c.vkEndCommandBuffer(cmd);
 
         const wait_stage: c.VkPipelineStageFlags = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -431,6 +457,9 @@ pub const Scene = struct {
         if (self.pipeline != null) c.vkDestroyPipeline(dev, self.pipeline, null);
         if (self.pipeline_layout != null) c.vkDestroyPipelineLayout(dev, self.pipeline_layout, null);
         if (self.render_pass != null) c.vkDestroyRenderPass(dev, self.render_pass, null);
+        if (self.rt_view != null) c.vkDestroyImageView(dev, self.rt_view, null);
+        if (self.rt_image != null) c.vkDestroyImage(dev, self.rt_image, null);
+        if (self.rt_memory != null) c.vkFreeMemory(dev, self.rt_memory, null);
         if (self.swapchain != null) c.vkDestroySwapchainKHR(dev, self.swapchain, null);
     }
 };

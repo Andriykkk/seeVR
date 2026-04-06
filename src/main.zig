@@ -7,6 +7,7 @@ const Camera = @import("camera.zig").Camera;
 const Physics = @import("physics.zig").Physics;
 const build_options = @import("build_options");
 const Gui = if (build_options.enable_imgui) @import("gui.zig").Gui else void;
+const raytrace_mode = build_options.raytrace;
 
 const WIDTH = 800;
 const HEIGHT = 600;
@@ -18,7 +19,8 @@ pub fn main() !void {
     defer c.glfwTerminate();
 
     c.glfwWindowHint(c.GLFW_CLIENT_API, c.GLFW_NO_API);
-    const window = c.glfwCreateWindow(WIDTH, HEIGHT, "PGS Boxes", null, null) orelse
+    const title = if (comptime raytrace_mode) "PGS Boxes [raytrace]" else "PGS Boxes [raster]";
+    const window = c.glfwCreateWindow(WIDTH, HEIGHT, title, null, null) orelse
         return error.WindowCreateFailed;
     defer c.glfwDestroyWindow(window);
 
@@ -53,6 +55,11 @@ pub fn main() !void {
     var gui = if (comptime Gui != void) try Gui.init(&vk_ctx, &scene, window) else {};
     defer if (comptime Gui != void) gui.deinit();
 
+    std.debug.print("Mode: {s} | {} vertices, {} triangles, {} bodies, {} geoms\n", .{
+        if (comptime raytrace_mode) "raytrace" else "raster",
+        d.num_vertices, d.num_triangles, d.num_bodies, d.num_geoms,
+    });
+
     var camera = Camera.init(0, 5, 15, -90, -15);
     const aspect: f32 = @as(f32, @floatFromInt(WIDTH)) / @as(f32, @floatFromInt(HEIGHT));
     var last_time: f64 = c.glfwGetTime();
@@ -67,20 +74,27 @@ pub fn main() !void {
 
         scene.pollEvents();
         camera.update(window, dt);
-        const mvp = camera.mvp(aspect);
 
-        // Physics: 10 substeps batched in single GPU submit
+        // Physics
         try physics.step(d.num_bodies, 10, 1.0 / 60.0, .{ 0, -9.81, 0 });
 
-        // Render
-        try scene.beginFrame();
-        scene.draw(&d, &mvp);
-        if (comptime Gui != void) {
-            const counters = physics.readCounters(&d) catch .{ 0, 0 };
-            gui.pairs = counters[0];
-            gui.contacts = counters[1];
-            gui.render(&d, scene.cmd_buffers[scene.current_frame]);
+        if (comptime raytrace_mode) {
+            // TODO: BVH build + raytrace compute dispatch writing to scene.rt_image
+            try scene.beginFrame();
+            scene.blitRtImage(); // blit rt_image → swapchain
+            try scene.endFrame();
+        } else {
+            // Rasterize
+            const mvp = camera.mvp(aspect);
+            try scene.beginFrame();
+            scene.draw(&d, &mvp);
+            if (comptime Gui != void) {
+                const counters = physics.readCounters(&d) catch .{ 0, 0 };
+                gui.pairs = counters[0];
+                gui.contacts = counters[1];
+                gui.render(&d, scene.cmd_buffers[scene.current_frame]);
+            }
+            try scene.endFrame();
         }
-        try scene.endFrame();
     }
 }
