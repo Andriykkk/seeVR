@@ -19,32 +19,35 @@ pub const Physics = struct {
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator) !Physics {
         const shader = try vk.getShader("src/shaders/physics.comp", .compute, allocator);
 
-        // 21 bindings matching physics.comp
-        const buffers = [21]Vulkan.Buffer{
-            data.body_pos,           // 0
-            data.body_quat,          // 1
-            data.body_vel,           // 2
-            data.body_omega,         // 3
-            data.body_inv_mass,      // 4
-            data.body_inv_inertia,   // 5
-            data.body_half,          // 6
-            data.body_vert_start,    // 7
-            data.body_vert_count,    // 8
-            data.vertices,           // 9
-            data.original_vertices,  // 10
-            data.contact_pos,        // 11
-            data.contact_normal,     // 12
-            data.contact_penetration, // 13
-            data.contact_body_a,     // 14
-            data.contact_body_b,     // 15
-            data.contact_lambda_n,   // 16
-            data.atomic_counters,    // 17
-            data.body_aabb_min,      // 18
-            data.body_aabb_max,      // 19
-            data.collision_pairs,    // 20
+        const buffers = [25]Vulkan.Buffer{
+            data.body_pos,            // 0
+            data.body_quat,           // 1
+            data.body_vel,            // 2
+            data.body_omega,          // 3
+            data.body_inv_mass,       // 4
+            data.body_inv_inertia,    // 5
+            data.body_vert_start,     // 6
+            data.body_vert_count,     // 7
+            data.geom_body_idx,       // 8
+            data.geom_data,           // 9
+            data.hull_verts,          // 10
+            data.hull_normals,        // 11
+            data.hull_edges,          // 12
+            data.vertices,            // 13
+            data.original_vertices,   // 14
+            data.contact_pos,         // 15
+            data.contact_normal,      // 16
+            data.contact_penetration, // 17
+            data.contact_body_a,      // 18
+            data.contact_body_b,      // 19
+            data.contact_lambda_n,    // 20
+            data.atomic_counters,     // 21
+            data.body_aabb_min,       // 22
+            data.body_aabb_max,       // 23
+            data.collision_pairs,     // 24
         };
 
-        const pipe = try vk.createComputePipeline(shader, 21, &buffers, @sizeOf(PC));
+        const pipe = try vk.createComputePipeline(shader, 25, &buffers, @sizeOf(PC));
         return .{ .vk = vk, .pipe = pipe };
     }
 
@@ -85,7 +88,7 @@ pub const Physics = struct {
         c.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipe.pipeline);
         c.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipe.layout, 0, 1, &self.pipe.desc_set, 0, null);
 
-        // 8: Clear counters (pairs + contacts)
+        // 8: Clear counters
         dispatch(cmd, self.pipe.layout, .{ .step = 8, .count = 1, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
         bar(cmd, &barrier);
 
@@ -97,11 +100,11 @@ pub const Physics = struct {
         dispatch(cmd, self.pipe.layout, .{ .step = 1, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
         bar(cmd, &barrier);
 
-        // 2: Broad phase (AABB overlap → pairs)
+        // 2: Broad phase
         dispatch(cmd, self.pipe.layout, .{ .step = 2, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
         bar(cmd, &barrier);
 
-        // 3: Narrow phase (SAT only on pairs)
+        // 3: Narrow phase (SAT on pairs)
         dispatch(cmd, self.pipe.layout, .{ .step = 3, .count = max_p, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (max_p + 255) / 256);
         bar(cmd, &barrier);
 
@@ -109,7 +112,7 @@ pub const Physics = struct {
         dispatch(cmd, self.pipe.layout, .{ .step = 4, .count = max_c, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, (max_c + 255) / 256);
         bar(cmd, &barrier);
 
-        // 5: PGS solve (serial)
+        // 5: PGS solve
         dispatch(cmd, self.pipe.layout, .{ .step = 5, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, 1);
         bar(cmd, &barrier);
 
@@ -117,7 +120,7 @@ pub const Physics = struct {
         dispatch(cmd, self.pipe.layout, .{ .step = 6, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
         bar(cmd, &barrier);
 
-        // 7: Update render vertices
+        // 7: Update render verts
         dispatch(cmd, self.pipe.layout, .{ .step = 7, .count = num_bodies, .dt = dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz }, groups);
 
         c.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &barrier, 0, null, 0, null);
