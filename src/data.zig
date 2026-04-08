@@ -209,7 +209,7 @@ pub const Data = struct {
         };
     }
 
-    pub fn addBox(self: *Data, center: [3]f32, half: [3]f32, color: [3]f32, mass: f32) !u32 {
+    pub fn addBox(self: *Data, center: [3]f32, half: [3]f32, color: [3]f32, mass: f32, friction: f32) !u32 {
         const vs = self.num_vertices;
         const ts = self.num_triangles;
         const bi = self.num_bodies;
@@ -286,7 +286,7 @@ pub const Data = struct {
             @floatFromInt(hv), @floatFromInt(8),
             0, 0, 0, 0, 0, 0,
         };
-        self.s_geom_friction[gi] = 0.5;
+        self.s_geom_friction[gi] = friction;
         self.s_geom_vert_start[gi] = vs;
         self.s_geom_vert_count[gi] = 8;
         self.num_geoms += 1;
@@ -294,7 +294,7 @@ pub const Data = struct {
         return bi;
     }
 
-    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, mass: f32) !u32 {
+    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, mass: f32, friction: f32) !u32 {
         const vs = self.num_vertices;
         const ts = self.num_triangles;
         const bi = self.num_bodies;
@@ -387,7 +387,7 @@ pub const Data = struct {
             @floatFromInt(hv), @floatFromInt(num_v),
             0, 0, 0, 0, 0, 0,
         };
-        self.s_geom_friction[gi] = 0.5;
+        self.s_geom_friction[gi] = friction;
         self.s_geom_vert_start[gi] = vs;
         self.s_geom_vert_count[gi] = num_v;
         self.num_geoms += 1;

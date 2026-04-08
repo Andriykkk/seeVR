@@ -24,31 +24,31 @@ layout(set=0, binding=7)  buffer BVertCount { uint  body_vert_count[]; };
 // Geom
 layout(set=0, binding=8)  buffer GBodyIdx   { uint  geom_body_idx[]; };
 layout(set=0, binding=9)  buffer GData      { float geom_data[]; };
+layout(set=0, binding=10) buffer GFriction  { float geom_friction[]; };
 
-// Hull vertices only — GJK/EPA don't need normals or edges
-layout(set=0, binding=10) buffer HullVerts  { float hull_verts[]; };
+// Hull vertices
+layout(set=0, binding=11) buffer HullVerts  { float hull_verts[]; };
 
 // Render vertices
-layout(set=0, binding=11) buffer Vertices   { float verts[]; };
-layout(set=0, binding=12) buffer OrigVerts   { float orig_verts[]; };
+layout(set=0, binding=12) buffer Vertices   { float verts[]; };
+layout(set=0, binding=13) buffer OrigVerts   { float orig_verts[]; };
 
 // Contacts
-layout(set=0, binding=13) buffer CPos       { float contact_pos[]; };
-layout(set=0, binding=14) buffer CNormal    { float contact_normal[]; };
-layout(set=0, binding=15) buffer CPen       { float contact_pen[]; };
-layout(set=0, binding=16) buffer CBodyA     { uint  contact_body_a[]; };
-layout(set=0, binding=17) buffer CBodyB     { uint  contact_body_b[]; };
-layout(set=0, binding=18) buffer CLambdaN   { float lambda_n[]; };
+layout(set=0, binding=14) buffer CPos       { float contact_pos[]; };
+layout(set=0, binding=15) buffer CNormal    { float contact_normal[]; };
+layout(set=0, binding=16) buffer CPen       { float contact_pen[]; };
+layout(set=0, binding=17) buffer CBodyA     { uint  contact_body_a[]; };
+layout(set=0, binding=18) buffer CBodyB     { uint  contact_body_b[]; };
+layout(set=0, binding=19) buffer CLambdaN   { float lambda_n[]; };
 
 // Counters: [0]=num_pairs, [1]=num_contacts
-layout(set=0, binding=19) buffer Counters   { uint  counters[]; };
+layout(set=0, binding=20) buffer Counters   { uint  counters[]; };
 
 // Broad phase
-layout(set=0, binding=20) buffer BAabbMin   { float body_aabb_min[]; };
-layout(set=0, binding=21) buffer BAabbMax   { float body_aabb_max[]; };
-layout(set=0, binding=22) buffer ColPairs   { uint  collision_pairs[]; };
+layout(set=0, binding=21) buffer BAabbMin   { float body_aabb_min[]; };
+layout(set=0, binding=22) buffer BAabbMax   { float body_aabb_max[]; };
+layout(set=0, binding=23) buffer ColPairs   { uint  collision_pairs[]; };
 
-const float FRICTION = 0.5;
 const float BAUMGARTE = 0.2;
 const float SLOP = 0.005;
 const int PGS_ITERATIONS = 30;
@@ -528,7 +528,8 @@ void step_solve() {
             set_omega(a, get_omega(a) - apply_inv_I(a, cross(ra, imp)));
             set_omega(b, get_omega(b) + apply_inv_I(b, cross(rb, imp)));
 
-            // Coulomb friction
+            // Coulomb friction — geometric mean of both geoms' friction
+            float mu = sqrt(geom_friction[a] * geom_friction[b]);
             va = get_vel(a) + cross(get_omega(a), ra);
             vb = get_vel(b) + cross(get_omega(b), rb);
             vec3 dv = vb - va;
@@ -541,7 +542,7 @@ void step_solve() {
                 float kt = inv_ma + inv_mb
                           + dot(ra_x_t, apply_inv_I(a, ra_x_t))
                           + dot(rb_x_t, apply_inv_I(b, rb_x_t));
-                float d_lt = min(vt_len / kt, FRICTION * lambda_n[ci]);
+                float d_lt = min(vt_len / kt, mu * lambda_n[ci]);
                 vec3 imp_t = d_lt * td;
                 set_vel(a, get_vel(a) + inv_ma * imp_t);
                 set_vel(b, get_vel(b) - inv_mb * imp_t);
