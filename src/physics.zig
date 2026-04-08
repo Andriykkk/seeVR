@@ -39,8 +39,8 @@ pub const Physics = struct {
             data.contact_pos,         // 15
             data.contact_normal,      // 16
             data.contact_penetration, // 17
-            data.contact_body_a,      // 18
-            data.contact_body_b,      // 19
+            data.contact_geom_a,      // 18
+            data.contact_geom_b,      // 19
             data.contact_lambda_n,    // 20
             data.atomic_counters,     // 21
             data.body_aabb_min,       // 22

@@ -38,8 +38,8 @@ layout(set=0, binding=14) buffer OrigVerts   { float orig_verts[]; };
 layout(set=0, binding=15) buffer CPos       { float contact_pos[]; };
 layout(set=0, binding=16) buffer CNormal    { float contact_normal[]; };
 layout(set=0, binding=17) buffer CPen       { float contact_pen[]; };
-layout(set=0, binding=18) buffer CBodyA     { uint  contact_body_a[]; };
-layout(set=0, binding=19) buffer CBodyB     { uint  contact_body_b[]; };
+layout(set=0, binding=18) buffer CGeomA     { uint  contact_geom_a[]; };
+layout(set=0, binding=19) buffer CGeomB     { uint  contact_geom_b[]; };
 layout(set=0, binding=20) buffer CLambdaN   { float lambda_n[]; };
 
 // Counters: [0]=num_pairs, [1]=num_contacts
@@ -364,8 +364,8 @@ void add_contact(vec3 cp, vec3 n, float pen, uint ba, uint bb) {
         contact_pos[idx*3] = cp.x; contact_pos[idx*3+1] = cp.y; contact_pos[idx*3+2] = cp.z;
         contact_normal[idx*3] = n.x; contact_normal[idx*3+1] = n.y; contact_normal[idx*3+2] = n.z;
         contact_pen[idx] = pen;
-        contact_body_a[idx] = ba;
-        contact_body_b[idx] = bb;
+        contact_geom_a[idx] = ba;
+        contact_geom_b[idx] = bb;
     }
 }
 
@@ -495,8 +495,10 @@ void step_solve() {
     // Pre-compute restitution bias from initial velocities (before PGS changes them)
     float contact_bias[4000]; // matches MAX_CONTACTS
     for (uint ci = 0; ci < nc; ci++) {
-        uint a = contact_body_a[ci];
-        uint b = contact_body_b[ci];
+        uint ga = contact_geom_a[ci];
+        uint gb = contact_geom_b[ci];
+        uint a = geom_body_idx[ga];
+        uint b = geom_body_idx[gb];
         vec3 n = vec3(contact_normal[ci*3], contact_normal[ci*3+1], contact_normal[ci*3+2]);
         vec3 cp = vec3(contact_pos[ci*3], contact_pos[ci*3+1], contact_pos[ci*3+2]);
         vec3 ra = cp - get_pos(a);
@@ -505,14 +507,16 @@ void step_solve() {
         vec3 vb = get_vel(b) + cross(get_omega(b), rb);
         float vn = dot(vb - va, n);
         float pen = contact_pen[ci];
-        float e = max(geom_restitution[a], geom_restitution[b]);
+        float e = max(geom_restitution[ga], geom_restitution[gb]);
         contact_bias[ci] = BAUMGARTE * max(pen - SLOP, 0.0) / dt + e * max(-vn, 0.0);
     }
 
     for (int iter = 0; iter < PGS_ITERATIONS; iter++) {
         for (uint ci = 0; ci < nc; ci++) {
-            uint a = contact_body_a[ci];
-            uint b = contact_body_b[ci];
+            uint ga = contact_geom_a[ci];
+            uint gb = contact_geom_b[ci];
+            uint a = geom_body_idx[ga];
+            uint b = geom_body_idx[gb];
             float inv_ma = body_inv_mass[a];
             float inv_mb = body_inv_mass[b];
             if (inv_ma == 0.0 && inv_mb == 0.0) continue;
@@ -545,7 +549,7 @@ void step_solve() {
             set_omega(b, get_omega(b) + apply_inv_I(b, cross(rb, imp)));
 
             // Coulomb friction — geometric mean of both geoms' friction
-            float mu = sqrt(geom_friction[a] * geom_friction[b]);
+            float mu = sqrt(geom_friction[ga] * geom_friction[gb]);
             va = get_vel(a) + cross(get_omega(a), ra);
             vb = get_vel(b) + cross(get_omega(b), rb);
             vec3 dv = vb - va;

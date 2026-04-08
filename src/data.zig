@@ -63,8 +63,8 @@ pub const Data = struct {
     contact_pos: Buffer, // [MAX_CONTACTS] float3
     contact_normal: Buffer, // [MAX_CONTACTS] float3
     contact_penetration: Buffer, // [MAX_CONTACTS] float
-    contact_body_a: Buffer, // [MAX_CONTACTS] uint
-    contact_body_b: Buffer, // [MAX_CONTACTS] uint
+    contact_geom_a: Buffer, // [MAX_CONTACTS] uint
+    contact_geom_b: Buffer, // [MAX_CONTACTS] uint
     contact_lambda_n: Buffer, // [MAX_CONTACTS] float
 
     // ---- GPU Counters ----
@@ -160,8 +160,8 @@ pub const Data = struct {
             .contact_pos = try vk.createBuffer(MAX_CONTACTS * @sizeOf([3]f32), STORAGE),
             .contact_normal = try vk.createBuffer(MAX_CONTACTS * @sizeOf([3]f32), STORAGE),
             .contact_penetration = try vk.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
-            .contact_body_a = try vk.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
-            .contact_body_b = try vk.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
+            .contact_geom_a = try vk.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
+            .contact_geom_b = try vk.createBuffer(MAX_CONTACTS * @sizeOf(u32), STORAGE),
             .contact_lambda_n = try vk.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
 
             .atomic_counters = try vk.createBuffer(4 * @sizeOf(u32), STORAGE),
