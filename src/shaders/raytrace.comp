@@ -34,6 +34,7 @@ layout(set=0, binding=11) buffer MatAlbedo     { float mat_albedo[]; };    // [m
 layout(set=0, binding=12) buffer MatRoughness  { float mat_roughness[]; }; // [mat] float
 layout(set=0, binding=13) buffer MatMetallic   { float mat_metallic[]; };  // [mat] float
 layout(set=0, binding=14) buffer MatEmission   { float mat_emission[]; };  // [mat*3] float3
+layout(set=0, binding=15) buffer MatIor        { float mat_ior[]; };       // [mat] float (0=opaque, >0=glass)
 
 const float PI = 3.14159265;
 const int MAX_BOUNCES = 16;
@@ -83,10 +84,11 @@ bool ray_aabb(vec3 ro, vec3 inv_d, vec3 bmin, vec3 bmax, float closest) {
 
 // ======================== BVH traversal ========================
 
-void trace(vec3 ro, vec3 rd, out float closest_t, out vec3 hit_normal, out uint hit_tri) {
+void trace(vec3 ro, vec3 rd, out float closest_t, out vec3 hit_normal, out uint hit_tri, out bool front_face) {
     closest_t = 1e10;
     hit_normal = vec3(0, 1, 0);
     hit_tri = 0xFFFFFFFF;
+    front_face = true;
 
     vec3 inv_d = 1.0 / rd;
 
@@ -117,8 +119,8 @@ void trace(vec3 ro, vec3 rd, out float closest_t, out vec3 hit_normal, out uint 
                 if (t > 0.0 && t < closest_t) {
                     closest_t = t;
                     vec3 n = normalize(cross(v1 - v0, v2 - v0));
-                    if (dot(n, rd) > 0.0) n = -n;
-                    hit_normal = n;
+                    front_face = dot(n, rd) < 0.0;
+                    hit_normal = front_face ? n : -n; // always face ray
                     hit_tri = ti;
                 }
             }
@@ -195,7 +197,8 @@ void main() {
             float t;
             vec3 normal;
             uint hit_ti;
-            trace(ro, rd, t, normal, hit_ti);
+            bool front_face;
+            trace(ro, rd, t, normal, hit_ti, front_face);
 
             if (t >= 1e9) {
                 color += throughput * sky_color(rd);
@@ -209,6 +212,7 @@ void main() {
             float roughness = mat_roughness[mi];
             float metallic = mat_metallic[mi];
             vec3 emission = vec3(mat_emission[mi*3], mat_emission[mi*3+1], mat_emission[mi*3+2]);
+            float ior = mat_ior[mi];
 
             // Emission — add light, stop bouncing
             color += throughput * emission;
@@ -225,30 +229,50 @@ void main() {
 
             seed = pcg(seed);
 
-            // Bounce direction based on material
-            vec3 reflected = reflect(rd, normal);
-            vec3 diffuse_dir = sample_hemisphere(normal, seed, seed + 1u);
+            if (ior > 0.0) {
+                // ---- Glass / transparent ----
+                float eta = front_face ? (1.0 / ior) : ior; // air→glass or glass→air
+                float cos_i = abs(dot(rd, normal));
+                float sin2_t = eta * eta * (1.0 - cos_i * cos_i);
 
-            float cos_theta = max(dot(-rd, normal), 0.0);
+                // Fresnel (Schlick)
+                float r0 = (1.0 - ior) / (1.0 + ior);
+                r0 = r0 * r0;
+                float fresnel = schlick(cos_i, r0);
 
-            if (metallic > 0.5) {
-                // Metal: specular reflection tinted by albedo
+                bool total_internal_reflection = sin2_t > 1.0;
+
+                if (rand_f(seed + 5u) < fresnel || total_internal_reflection) {
+                    // Reflect
+                    rd = reflect(rd, normal);
+                    ro = hit + normal * 0.001;
+                } else {
+                    // Refract
+                    rd = refract(rd, normal, eta);
+                    ro = hit - normal * 0.001; // pass through surface
+                }
+                throughput *= albedo; // colored glass tints light
+            } else if (metallic > 0.5) {
+                // ---- Metal ----
+                vec3 reflected = reflect(rd, normal);
+                vec3 diffuse_dir = sample_hemisphere(normal, seed, seed + 1u);
                 rd = normalize(mix(reflected, diffuse_dir, roughness * roughness));
                 throughput *= albedo;
+                ro = hit + normal * 0.001;
             } else {
-                // Dielectric: Fresnel decides reflect vs diffuse
+                // ---- Dielectric (plastic, rubber, etc) ----
+                vec3 reflected = reflect(rd, normal);
+                vec3 diffuse_dir = sample_hemisphere(normal, seed, seed + 1u);
+                float cos_theta = max(dot(-rd, normal), 0.0);
                 float fresnel = schlick(cos_theta, 0.04);
                 if (rand_f(seed + 3u) < fresnel) {
-                    // Specular reflection (white for dielectrics)
                     rd = normalize(mix(reflected, diffuse_dir, roughness * roughness));
                 } else {
-                    // Diffuse
                     rd = diffuse_dir;
                     throughput *= albedo;
                 }
+                ro = hit + normal * 0.001;
             }
-
-            ro = hit + normal * 0.001;
         }
 
         pixel_color += color;

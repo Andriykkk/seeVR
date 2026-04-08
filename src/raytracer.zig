@@ -13,7 +13,7 @@ const PC = extern struct {
     num_triangles: u32,
 };
 
-const NUM_BINDINGS = 15; // 1 image + 14 storage buffers
+const NUM_BINDINGS = 16; // 1 image + 15 storage buffers
 
 pub const Raytracer = struct {
     vk: *Vulkan,
@@ -107,7 +107,7 @@ pub const Raytracer = struct {
         //  1=vertices, 2=indices,
         //  3-8=BVH (aabb_min, aabb_max, left, right, count, prim_indices),
         //  9=tri_geom, 10=geom_material,
-        //  11-14=material (albedo, roughness, metallic, emission)
+        //  11-15=material (albedo, roughness, metallic, emission, ior)
         const buffers = [num_buffers]Vulkan.Buffer{
             data.vertices,           // 1
             data.indices,            // 2
@@ -123,6 +123,7 @@ pub const Raytracer = struct {
             data.material_roughness, // 12
             data.material_metallic,  // 13
             data.material_emission,  // 14
+            data.material_ior,       // 15
         };
 
         var writes: [NUM_BINDINGS]c.VkWriteDescriptorSet = undefined;

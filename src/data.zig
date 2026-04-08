@@ -8,13 +8,13 @@ const VERTEX = Vulkan.USAGE_VERTEX;
 const INDEX = Vulkan.USAGE_INDEX;
 const STORAGE = Vulkan.USAGE_STORAGE;
 
-pub const MAX_VERTICES: u32 = 10_000;
-pub const MAX_TRIANGLES: u32 = 10_000;
+pub const MAX_VERTICES: u32 = 10_000_000;
+pub const MAX_TRIANGLES: u32 = 10_000_000;
 pub const MAX_BODIES: u32 = 256;
 pub const MAX_GEOMS: u32 = 256;
 pub const MAX_CONTACTS: u32 = 4_000;
 pub const MAX_COLLISION_PAIRS: u32 = 10_000;
-pub const MAX_HULL_VERTS: u32 = 10_000;
+pub const MAX_HULL_VERTS: u32 = 10_000_000;
 pub const MAX_MATERIALS: u32 = 256;
 
 pub const Data = struct {
@@ -58,6 +58,7 @@ pub const Data = struct {
     material_roughness: Buffer, // [MAX_MATERIALS] float — 0=mirror, 1=diffuse
     material_metallic: Buffer, // [MAX_MATERIALS] float — 0=dielectric, 1=metal
     material_emission: Buffer, // [MAX_MATERIALS] float3 — emissive color/intensity
+    material_ior: Buffer, // [MAX_MATERIALS] float — index of refraction (0=opaque, 1.5=glass)
 
     // ---- GPU Hull data (shared, indexed by geom_data) ----
     hull_verts: Buffer, // [MAX_HULL_VERTS] float3 — local-space convex hull vertices
@@ -133,6 +134,7 @@ pub const Data = struct {
     s_material_roughness: []f32,
     s_material_metallic: []f32,
     s_material_emission: []f32,
+    s_material_ior: []f32,
 
     // ---- CPU staging — hull ----
     s_hull_verts: []f32,
@@ -177,6 +179,7 @@ pub const Data = struct {
             .material_roughness = try vk.createBuffer(MAX_MATERIALS * @sizeOf(f32), STORAGE),
             .material_metallic = try vk.createBuffer(MAX_MATERIALS * @sizeOf(f32), STORAGE),
             .material_emission = try vk.createBuffer(MAX_MATERIALS * @sizeOf([3]f32), STORAGE),
+            .material_ior = try vk.createBuffer(MAX_MATERIALS * @sizeOf(f32), STORAGE),
 
             .hull_verts = try vk.createBuffer(MAX_HULL_VERTS * @sizeOf([3]f32), STORAGE),
 
@@ -239,6 +242,7 @@ pub const Data = struct {
             .s_material_roughness = try alloc.alloc(f32, MAX_MATERIALS),
             .s_material_metallic = try alloc.alloc(f32, MAX_MATERIALS),
             .s_material_emission = try alloc.alloc(f32, MAX_MATERIALS * 3),
+            .s_material_ior = try alloc.alloc(f32, MAX_MATERIALS),
             .s_hull_verts = try alloc.alloc(f32, MAX_HULL_VERTS * 3),
 
             .num_vertices = 0,
@@ -251,7 +255,7 @@ pub const Data = struct {
     }
 
     /// Add a material for path tracing. Returns material index.
-    pub fn addMaterial(self: *Data, albedo: [3]f32, roughness: f32, metallic: f32, emission: [3]f32) u32 {
+    pub fn addMaterial(self: *Data, albedo: [3]f32, roughness: f32, metallic: f32, emission: [3]f32, ior: f32) u32 {
         const mi = self.num_materials;
         self.s_material_albedo[mi * 3 + 0] = albedo[0];
         self.s_material_albedo[mi * 3 + 1] = albedo[1];
@@ -261,6 +265,7 @@ pub const Data = struct {
         self.s_material_emission[mi * 3 + 0] = emission[0];
         self.s_material_emission[mi * 3 + 1] = emission[1];
         self.s_material_emission[mi * 3 + 2] = emission[2];
+        self.s_material_ior[mi] = ior;
         self.num_materials += 1;
         return mi;
     }
@@ -275,7 +280,7 @@ pub const Data = struct {
             .{ -half[0], -half[1], -half[2] }, .{ half[0], -half[1], -half[2] },
             .{ half[0], half[1], -half[2] },   .{ -half[0], half[1], -half[2] },
             .{ -half[0], -half[1], half[2] },  .{ half[0], -half[1], half[2] },
-            .{ half[0], half[1], half[2] },     .{ -half[0], half[1], half[2] },
+            .{ half[0], half[1], half[2] },    .{ -half[0], half[1], half[2] },
         };
         const box_f = [12][3]u32{
             .{ 0, 2, 1 }, .{ 0, 3, 2 }, .{ 5, 7, 4 }, .{ 5, 6, 7 },
@@ -340,7 +345,9 @@ pub const Data = struct {
         // geom_data[gi*8]: [vert_start, vert_count, 0, 0, 0, 0, 0, 0]
         self.s_geom_data[gi * 8 ..][0..8].* = .{
             @floatFromInt(hv), @floatFromInt(8),
-            0, 0, 0, 0, 0, 0,
+            0,                 0,
+            0,                 0,
+            0,                 0,
         };
         self.s_geom_friction[gi] = friction;
         self.s_geom_restitution[gi] = restitution;
@@ -445,7 +452,9 @@ pub const Data = struct {
         self.s_geom_local_quat[gi * 4 ..][0..4].* = .{ 1, 0, 0, 0 };
         self.s_geom_data[gi * 8 ..][0..8].* = .{
             @floatFromInt(hv), @floatFromInt(num_v),
-            0, 0, 0, 0, 0, 0,
+            0,                 0,
+            0,                 0,
+            0,                 0,
         };
         self.s_geom_friction[gi] = friction;
         self.s_geom_restitution[gi] = restitution;
@@ -485,6 +494,7 @@ pub const Data = struct {
             try v.uploadSlice(self.material_roughness, f32, self.s_material_roughness[0..self.num_materials]);
             try v.uploadSlice(self.material_metallic, f32, self.s_material_metallic[0..self.num_materials]);
             try v.uploadSlice(self.material_emission, f32, self.s_material_emission[0 .. self.num_materials * 3]);
+            try v.uploadSlice(self.material_ior, f32, self.s_material_ior[0..self.num_materials]);
         }
         try v.uploadSlice(self.hull_verts, f32, self.s_hull_verts[0 .. self.num_hull_verts * 3]);
 
