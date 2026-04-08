@@ -49,6 +49,7 @@ pub const Data = struct {
     //   [6]=reserved        [7]=reserved
     geom_data: Buffer, // [MAX_GEOMS*8] float
     geom_friction: Buffer, // [MAX_GEOMS] float
+    geom_restitution: Buffer, // [MAX_GEOMS] float
 
     // ---- GPU Hull data (shared, indexed by geom_data) ----
     hull_verts: Buffer, // [MAX_HULL_VERTS] float3 — local-space convex hull vertices
@@ -109,6 +110,7 @@ pub const Data = struct {
     s_geom_local_quat: []f32,
     s_geom_data: []f32,
     s_geom_friction: []f32,
+    s_geom_restitution: []f32,
     s_geom_vert_start: []u32,
     s_geom_vert_count: []u32,
 
@@ -147,6 +149,7 @@ pub const Data = struct {
             .geom_local_quat = try vk.createBuffer(MAX_GEOMS * @sizeOf([4]f32), STORAGE),
             .geom_data = try vk.createBuffer(MAX_GEOMS * 8 * @sizeOf(f32), STORAGE),
             .geom_friction = try vk.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
+            .geom_restitution = try vk.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
 
             .hull_verts = try vk.createBuffer(MAX_HULL_VERTS * @sizeOf([3]f32), STORAGE),
 
@@ -197,6 +200,7 @@ pub const Data = struct {
             .s_geom_local_quat = try alloc.alloc(f32, MAX_GEOMS * 4),
             .s_geom_data = try alloc.alloc(f32, MAX_GEOMS * 8),
             .s_geom_friction = try alloc.alloc(f32, MAX_GEOMS),
+            .s_geom_restitution = try alloc.alloc(f32, MAX_GEOMS),
             .s_geom_vert_start = try alloc.alloc(u32, MAX_GEOMS),
             .s_geom_vert_count = try alloc.alloc(u32, MAX_GEOMS),
             .s_hull_verts = try alloc.alloc(f32, MAX_HULL_VERTS * 3),
@@ -209,7 +213,7 @@ pub const Data = struct {
         };
     }
 
-    pub fn addBox(self: *Data, center: [3]f32, half: [3]f32, color: [3]f32, mass: f32, friction: f32) !u32 {
+    pub fn addBox(self: *Data, center: [3]f32, half: [3]f32, color: [3]f32, mass: f32, friction: f32, restitution: f32) !u32 {
         const vs = self.num_vertices;
         const ts = self.num_triangles;
         const bi = self.num_bodies;
@@ -287,6 +291,7 @@ pub const Data = struct {
             0, 0, 0, 0, 0, 0,
         };
         self.s_geom_friction[gi] = friction;
+        self.s_geom_restitution[gi] = restitution;
         self.s_geom_vert_start[gi] = vs;
         self.s_geom_vert_count[gi] = 8;
         self.num_geoms += 1;
@@ -294,7 +299,7 @@ pub const Data = struct {
         return bi;
     }
 
-    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, mass: f32, friction: f32) !u32 {
+    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, mass: f32, friction: f32, restitution: f32) !u32 {
         const vs = self.num_vertices;
         const ts = self.num_triangles;
         const bi = self.num_bodies;
@@ -388,6 +393,7 @@ pub const Data = struct {
             0, 0, 0, 0, 0, 0,
         };
         self.s_geom_friction[gi] = friction;
+        self.s_geom_restitution[gi] = restitution;
         self.s_geom_vert_start[gi] = vs;
         self.s_geom_vert_count[gi] = num_v;
         self.num_geoms += 1;
@@ -414,6 +420,7 @@ pub const Data = struct {
         try v.uploadSlice(self.geom_local_quat, f32, self.s_geom_local_quat[0 .. self.num_geoms * 4]);
         try v.uploadSlice(self.geom_data, f32, self.s_geom_data[0 .. self.num_geoms * 8]);
         try v.uploadSlice(self.geom_friction, f32, self.s_geom_friction[0..self.num_geoms]);
+        try v.uploadSlice(self.geom_restitution, f32, self.s_geom_restitution[0..self.num_geoms]);
         try v.uploadSlice(self.hull_verts, f32, self.s_hull_verts[0 .. self.num_hull_verts * 3]);
 
         // Derive body vert start/count from first geom per body

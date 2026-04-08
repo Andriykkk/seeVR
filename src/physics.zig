@@ -19,8 +19,8 @@ pub const Physics = struct {
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator) !Physics {
         const shader = try vk.getShader("src/shaders/physics.comp", .compute, allocator);
 
-        // 24 bindings matching physics.comp
-        const buffers = [24]Vulkan.Buffer{
+        // 25 bindings matching physics.comp
+        const buffers = [25]Vulkan.Buffer{
             data.body_pos,            // 0
             data.body_quat,           // 1
             data.body_vel,            // 2
@@ -32,22 +32,23 @@ pub const Physics = struct {
             data.geom_body_idx,       // 8
             data.geom_data,           // 9
             data.geom_friction,       // 10
-            data.hull_verts,          // 11
-            data.vertices,            // 12
-            data.original_vertices,   // 13
-            data.contact_pos,         // 14
-            data.contact_normal,      // 15
-            data.contact_penetration, // 16
-            data.contact_body_a,      // 17
-            data.contact_body_b,      // 18
-            data.contact_lambda_n,    // 19
-            data.atomic_counters,     // 20
-            data.body_aabb_min,       // 21
-            data.body_aabb_max,       // 22
-            data.collision_pairs,     // 23
+            data.geom_restitution,    // 11
+            data.hull_verts,          // 12
+            data.vertices,            // 13
+            data.original_vertices,   // 14
+            data.contact_pos,         // 15
+            data.contact_normal,      // 16
+            data.contact_penetration, // 17
+            data.contact_body_a,      // 18
+            data.contact_body_b,      // 19
+            data.contact_lambda_n,    // 20
+            data.atomic_counters,     // 21
+            data.body_aabb_min,       // 22
+            data.body_aabb_max,       // 23
+            data.collision_pairs,     // 24
         };
 
-        const pipe = try vk.createComputePipeline(shader, 24, &buffers, @sizeOf(PC));
+        const pipe = try vk.createComputePipeline(shader, 25, &buffers, @sizeOf(PC));
         return .{ .vk = vk, .pipe = pipe };
     }
 

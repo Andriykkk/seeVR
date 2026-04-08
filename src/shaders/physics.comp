@@ -25,29 +25,30 @@ layout(set=0, binding=7)  buffer BVertCount { uint  body_vert_count[]; };
 layout(set=0, binding=8)  buffer GBodyIdx   { uint  geom_body_idx[]; };
 layout(set=0, binding=9)  buffer GData      { float geom_data[]; };
 layout(set=0, binding=10) buffer GFriction  { float geom_friction[]; };
+layout(set=0, binding=11) buffer GRestit    { float geom_restitution[]; };
 
 // Hull vertices
-layout(set=0, binding=11) buffer HullVerts  { float hull_verts[]; };
+layout(set=0, binding=12) buffer HullVerts  { float hull_verts[]; };
 
 // Render vertices
-layout(set=0, binding=12) buffer Vertices   { float verts[]; };
-layout(set=0, binding=13) buffer OrigVerts   { float orig_verts[]; };
+layout(set=0, binding=13) buffer Vertices   { float verts[]; };
+layout(set=0, binding=14) buffer OrigVerts   { float orig_verts[]; };
 
 // Contacts
-layout(set=0, binding=14) buffer CPos       { float contact_pos[]; };
-layout(set=0, binding=15) buffer CNormal    { float contact_normal[]; };
-layout(set=0, binding=16) buffer CPen       { float contact_pen[]; };
-layout(set=0, binding=17) buffer CBodyA     { uint  contact_body_a[]; };
-layout(set=0, binding=18) buffer CBodyB     { uint  contact_body_b[]; };
-layout(set=0, binding=19) buffer CLambdaN   { float lambda_n[]; };
+layout(set=0, binding=15) buffer CPos       { float contact_pos[]; };
+layout(set=0, binding=16) buffer CNormal    { float contact_normal[]; };
+layout(set=0, binding=17) buffer CPen       { float contact_pen[]; };
+layout(set=0, binding=18) buffer CBodyA     { uint  contact_body_a[]; };
+layout(set=0, binding=19) buffer CBodyB     { uint  contact_body_b[]; };
+layout(set=0, binding=20) buffer CLambdaN   { float lambda_n[]; };
 
 // Counters: [0]=num_pairs, [1]=num_contacts
-layout(set=0, binding=20) buffer Counters   { uint  counters[]; };
+layout(set=0, binding=21) buffer Counters   { uint  counters[]; };
 
 // Broad phase
-layout(set=0, binding=21) buffer BAabbMin   { float body_aabb_min[]; };
-layout(set=0, binding=22) buffer BAabbMax   { float body_aabb_max[]; };
-layout(set=0, binding=23) buffer ColPairs   { uint  collision_pairs[]; };
+layout(set=0, binding=22) buffer BAabbMin   { float body_aabb_min[]; };
+layout(set=0, binding=23) buffer BAabbMax   { float body_aabb_max[]; };
+layout(set=0, binding=24) buffer ColPairs   { uint  collision_pairs[]; };
 
 const float BAUMGARTE = 0.2;
 const float SLOP = 0.005;
@@ -491,6 +492,23 @@ void step_solve() {
     if (gl_GlobalInvocationID.x != 0) return;
     uint nc = min(counters[1], MAX_CONTACTS);
 
+    // Pre-compute restitution bias from initial velocities (before PGS changes them)
+    float contact_bias[4000]; // matches MAX_CONTACTS
+    for (uint ci = 0; ci < nc; ci++) {
+        uint a = contact_body_a[ci];
+        uint b = contact_body_b[ci];
+        vec3 n = vec3(contact_normal[ci*3], contact_normal[ci*3+1], contact_normal[ci*3+2]);
+        vec3 cp = vec3(contact_pos[ci*3], contact_pos[ci*3+1], contact_pos[ci*3+2]);
+        vec3 ra = cp - get_pos(a);
+        vec3 rb = cp - get_pos(b);
+        vec3 va = get_vel(a) + cross(get_omega(a), ra);
+        vec3 vb = get_vel(b) + cross(get_omega(b), rb);
+        float vn = dot(vb - va, n);
+        float pen = contact_pen[ci];
+        float e = max(geom_restitution[a], geom_restitution[b]);
+        contact_bias[ci] = BAUMGARTE * max(pen - SLOP, 0.0) / dt + e * max(-vn, 0.0);
+    }
+
     for (int iter = 0; iter < PGS_ITERATIONS; iter++) {
         for (uint ci = 0; ci < nc; ci++) {
             uint a = contact_body_a[ci];
@@ -501,7 +519,6 @@ void step_solve() {
 
             vec3 n = vec3(contact_normal[ci*3], contact_normal[ci*3+1], contact_normal[ci*3+2]);
             vec3 cp = vec3(contact_pos[ci*3], contact_pos[ci*3+1], contact_pos[ci*3+2]);
-            float pen = contact_pen[ci];
             vec3 ra = cp - get_pos(a);
             vec3 rb = cp - get_pos(b);
 
@@ -515,8 +532,7 @@ void step_solve() {
                      + dot(ra_x_n, apply_inv_I(a, ra_x_n))
                      + dot(rb_x_n, apply_inv_I(b, rb_x_n));
 
-            float bias = BAUMGARTE * max(pen - SLOP, 0.0) / dt;
-            float d_ln = (-vn + bias) / k;
+            float d_ln = (-vn + contact_bias[ci]) / k;
             float old_ln = lambda_n[ci];
             float new_ln = max(old_ln + d_ln, 0.0);
             d_ln = new_ln - old_ln;
