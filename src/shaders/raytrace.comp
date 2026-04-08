@@ -18,19 +18,26 @@ layout(set=0, binding=0, rgba32f) uniform image2D rt_image;
 // Scene geometry
 layout(set=0, binding=1) buffer Vertices   { float verts[]; };
 layout(set=0, binding=2) buffer Indices    { uint  idx[]; };
-layout(set=0, binding=3) buffer Colors     { float colors[]; };
 
 // BVH
-layout(set=0, binding=4) buffer BvhMin     { float node_min[]; };
-layout(set=0, binding=5) buffer BvhMax     { float node_max[]; };
-layout(set=0, binding=6) buffer BvhLeft    { uint  node_left[]; };
-layout(set=0, binding=7) buffer BvhRight   { uint  node_right[]; };
-layout(set=0, binding=8) buffer BvhCount   { uint  node_count[]; };
-layout(set=0, binding=9) buffer BvhPrim    { uint  prim_idx[]; };
+layout(set=0, binding=3) buffer BvhMin     { float node_min[]; };
+layout(set=0, binding=4) buffer BvhMax     { float node_max[]; };
+layout(set=0, binding=5) buffer BvhLeft    { uint  node_left[]; };
+layout(set=0, binding=6) buffer BvhRight   { uint  node_right[]; };
+layout(set=0, binding=7) buffer BvhCount   { uint  node_count[]; };
+layout(set=0, binding=8) buffer BvhPrim    { uint  prim_idx[]; };
+
+// Material lookup
+layout(set=0, binding=9)  buffer TriGeom       { uint  tri_geom[]; };      // triangle → geom
+layout(set=0, binding=10) buffer GeomMaterial  { uint  geom_material[]; }; // geom → material
+layout(set=0, binding=11) buffer MatAlbedo     { float mat_albedo[]; };    // [mat*3] float3
+layout(set=0, binding=12) buffer MatRoughness  { float mat_roughness[]; }; // [mat] float
+layout(set=0, binding=13) buffer MatMetallic   { float mat_metallic[]; };  // [mat] float
+layout(set=0, binding=14) buffer MatEmission   { float mat_emission[]; };  // [mat*3] float3
 
 const float PI = 3.14159265;
-const int MAX_BOUNCES = 3;
-const int SAMPLES_PER_PIXEL = 4;
+const int MAX_BOUNCES = 16;
+const int SAMPLES_PER_PIXEL = 16;
 
 // ======================== RNG ========================
 
@@ -76,10 +83,10 @@ bool ray_aabb(vec3 ro, vec3 inv_d, vec3 bmin, vec3 bmax, float closest) {
 
 // ======================== BVH traversal ========================
 
-void trace(vec3 ro, vec3 rd, out float closest_t, out vec3 hit_normal, out vec3 hit_color) {
+void trace(vec3 ro, vec3 rd, out float closest_t, out vec3 hit_normal, out uint hit_tri) {
     closest_t = 1e10;
     hit_normal = vec3(0, 1, 0);
-    hit_color = vec3(0);
+    hit_tri = 0xFFFFFFFF;
 
     vec3 inv_d = 1.0 / rd;
 
@@ -112,7 +119,7 @@ void trace(vec3 ro, vec3 rd, out float closest_t, out vec3 hit_normal, out vec3 
                     vec3 n = normalize(cross(v1 - v0, v2 - v0));
                     if (dot(n, rd) > 0.0) n = -n;
                     hit_normal = n;
-                    hit_color = vec3(colors[i0*3], colors[i0*3+1], colors[i0*3+2]);
+                    hit_tri = ti;
                 }
             }
         } else {
@@ -144,6 +151,12 @@ vec3 sample_hemisphere(vec3 n, uint seed1, uint seed2) {
     vec3 tan2 = cross(n, tan1);
 
     return normalize(tan1 * sin_t * cos(phi) + n * cos_t + tan2 * sin_t * sin(phi));
+}
+
+// ======================== Fresnel (Schlick) ========================
+
+float schlick(float cos_theta, float r0) {
+    return r0 + (1.0 - r0) * pow(1.0 - cos_theta, 5.0);
 }
 
 // ======================== Main ========================
@@ -180,17 +193,30 @@ void main() {
 
         for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
             float t;
-            vec3 normal, albedo;
-            trace(ro, rd, t, normal, albedo);
+            vec3 normal;
+            uint hit_ti;
+            trace(ro, rd, t, normal, hit_ti);
 
             if (t >= 1e9) {
                 color += throughput * sky_color(rd);
                 break;
             }
 
-            vec3 hit = ro + rd * t;
-            throughput *= albedo;
+            // Look up material: triangle → geom → material
+            uint gi = tri_geom[hit_ti];
+            uint mi = geom_material[gi];
+            vec3 albedo = vec3(mat_albedo[mi*3], mat_albedo[mi*3+1], mat_albedo[mi*3+2]);
+            float roughness = mat_roughness[mi];
+            float metallic = mat_metallic[mi];
+            vec3 emission = vec3(mat_emission[mi*3], mat_emission[mi*3+1], mat_emission[mi*3+2]);
 
+            // Emission — add light, stop bouncing
+            color += throughput * emission;
+            if (emission.x + emission.y + emission.z > 0.0) break;
+
+            vec3 hit = ro + rd * t;
+
+            // Russian roulette (after first bounce)
             if (bounce > 0) {
                 float p = max(throughput.x, max(throughput.y, throughput.z));
                 if (rand_f(seed + uint(bounce) * 7u) > p) break;
@@ -198,7 +224,30 @@ void main() {
             }
 
             seed = pcg(seed);
-            rd = sample_hemisphere(normal, seed, seed + 1u);
+
+            // Bounce direction based on material
+            vec3 reflected = reflect(rd, normal);
+            vec3 diffuse_dir = sample_hemisphere(normal, seed, seed + 1u);
+
+            float cos_theta = max(dot(-rd, normal), 0.0);
+
+            if (metallic > 0.5) {
+                // Metal: specular reflection tinted by albedo
+                rd = normalize(mix(reflected, diffuse_dir, roughness * roughness));
+                throughput *= albedo;
+            } else {
+                // Dielectric: Fresnel decides reflect vs diffuse
+                float fresnel = schlick(cos_theta, 0.04);
+                if (rand_f(seed + 3u) < fresnel) {
+                    // Specular reflection (white for dielectrics)
+                    rd = normalize(mix(reflected, diffuse_dir, roughness * roughness));
+                } else {
+                    // Diffuse
+                    rd = diffuse_dir;
+                    throughput *= albedo;
+                }
+            }
+
             ro = hit + normal * 0.001;
         }
 

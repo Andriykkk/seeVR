@@ -13,6 +13,8 @@ const PC = extern struct {
     num_triangles: u32,
 };
 
+const NUM_BINDINGS = 15; // 1 image + 14 storage buffers
+
 pub const Raytracer = struct {
     vk: *Vulkan,
     pipeline: c.VkPipeline,
@@ -27,8 +29,8 @@ pub const Raytracer = struct {
     pub fn init(vk: *Vulkan, data: *const Data, rt_view: c.VkImageView, w: u32, h: u32, allocator: std.mem.Allocator) !Raytracer {
         const shader = try vk.getShader("src/shaders/raytrace.comp", .compute, allocator);
 
-        // 10 bindings: 0=storage image, 1-9=storage buffers
-        var bindings: [10]c.VkDescriptorSetLayoutBinding = undefined;
+        var bindings: [NUM_BINDINGS]c.VkDescriptorSetLayoutBinding = undefined;
+        // Binding 0: storage image
         bindings[0] = .{
             .binding = 0,
             .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -36,7 +38,8 @@ pub const Raytracer = struct {
             .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
             .pImmutableSamplers = null,
         };
-        for (1..10) |i| {
+        // Bindings 1..14: storage buffers
+        for (1..NUM_BINDINGS) |i| {
             bindings[i] = .{
                 .binding = @intCast(i),
                 .descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -50,7 +53,7 @@ pub const Raytracer = struct {
         if (c.vkCreateDescriptorSetLayout(vk.device, &c.VkDescriptorSetLayoutCreateInfo{
             .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = null, .flags = 0,
-            .bindingCount = 10, .pBindings = &bindings,
+            .bindingCount = NUM_BINDINGS, .pBindings = &bindings,
         }, null, &desc_layout) != c.VK_SUCCESS)
             return error.DescLayoutFailed;
 
@@ -74,10 +77,11 @@ pub const Raytracer = struct {
         }, null, &pipeline) != c.VK_SUCCESS)
             return error.ComputePipeFailed;
 
-        // Descriptor pool: 1 storage image + 9 storage buffers
+        // Descriptor pool
+        const num_buffers = NUM_BINDINGS - 1;
         const pool_sizes = [2]c.VkDescriptorPoolSize{
             .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1 },
-            .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 9 },
+            .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = num_buffers },
         };
         var desc_pool: c.VkDescriptorPool = null;
         if (c.vkCreateDescriptorPool(vk.device, &c.VkDescriptorPoolCreateInfo{
@@ -99,20 +103,30 @@ pub const Raytracer = struct {
             .imageLayout = c.VK_IMAGE_LAYOUT_GENERAL,
         };
 
-        const buffers = [9]Vulkan.Buffer{
-            data.vertices,        // 1
-            data.indices,         // 2
-            data.colors,          // 3
-            data.bvh_aabb_min,    // 4
-            data.bvh_aabb_max,    // 5
-            data.bvh_left,        // 6
-            data.bvh_right,       // 7
-            data.bvh_count,       // 8
-            data.bvh_prim_indices, // 9
+        // Buffers matching shader bindings 1-14:
+        //  1=vertices, 2=indices,
+        //  3-8=BVH (aabb_min, aabb_max, left, right, count, prim_indices),
+        //  9=tri_geom, 10=geom_material,
+        //  11-14=material (albedo, roughness, metallic, emission)
+        const buffers = [num_buffers]Vulkan.Buffer{
+            data.vertices,           // 1
+            data.indices,            // 2
+            data.bvh_aabb_min,       // 3
+            data.bvh_aabb_max,       // 4
+            data.bvh_left,           // 5
+            data.bvh_right,          // 6
+            data.bvh_count,          // 7
+            data.bvh_prim_indices,   // 8
+            data.tri_geom,           // 9
+            data.geom_material,      // 10
+            data.material_albedo,    // 11
+            data.material_roughness, // 12
+            data.material_metallic,  // 13
+            data.material_emission,  // 14
         };
 
-        var writes: [10]c.VkWriteDescriptorSet = undefined;
-        var buf_infos: [9]c.VkDescriptorBufferInfo = undefined;
+        var writes: [NUM_BINDINGS]c.VkWriteDescriptorSet = undefined;
+        var buf_infos: [num_buffers]c.VkDescriptorBufferInfo = undefined;
 
         // Binding 0: storage image
         writes[0] = .{
@@ -122,8 +136,8 @@ pub const Raytracer = struct {
             .pImageInfo = &image_info, .pBufferInfo = null, .pTexelBufferView = null,
         };
 
-        // Bindings 1-9: storage buffers
-        for (0..9) |i| {
+        // Bindings 1..14: storage buffers
+        for (0..num_buffers) |i| {
             buf_infos[i] = .{ .buffer = buffers[i].handle, .offset = 0, .range = c.VK_WHOLE_SIZE };
             writes[i + 1] = .{
                 .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .pNext = null,
@@ -132,7 +146,7 @@ pub const Raytracer = struct {
                 .pImageInfo = null, .pBufferInfo = &buf_infos[i], .pTexelBufferView = null,
             };
         }
-        c.vkUpdateDescriptorSets(vk.device, 10, &writes, 0, null);
+        c.vkUpdateDescriptorSets(vk.device, NUM_BINDINGS, &writes, 0, null);
 
         return .{
             .vk = vk, .pipeline = pipeline, .layout = pipe_layout,

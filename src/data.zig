@@ -15,6 +15,7 @@ pub const MAX_GEOMS: u32 = 256;
 pub const MAX_CONTACTS: u32 = 4_000;
 pub const MAX_COLLISION_PAIRS: u32 = 10_000;
 pub const MAX_HULL_VERTS: u32 = 10_000;
+pub const MAX_MATERIALS: u32 = 256;
 
 pub const Data = struct {
     vk: *Vulkan,
@@ -50,6 +51,13 @@ pub const Data = struct {
     geom_data: Buffer, // [MAX_GEOMS*8] float
     geom_friction: Buffer, // [MAX_GEOMS] float
     geom_restitution: Buffer, // [MAX_GEOMS] float
+    geom_material: Buffer, // [MAX_GEOMS] uint — index into material arrays
+
+    // ---- GPU Materials (for path tracing) ----
+    material_albedo: Buffer, // [MAX_MATERIALS] float3 — base color
+    material_roughness: Buffer, // [MAX_MATERIALS] float — 0=mirror, 1=diffuse
+    material_metallic: Buffer, // [MAX_MATERIALS] float — 0=dielectric, 1=metal
+    material_emission: Buffer, // [MAX_MATERIALS] float3 — emissive color/intensity
 
     // ---- GPU Hull data (shared, indexed by geom_data) ----
     hull_verts: Buffer, // [MAX_HULL_VERTS] float3 — local-space convex hull vertices
@@ -69,6 +77,9 @@ pub const Data = struct {
 
     // ---- GPU Counters ----
     atomic_counters: Buffer, // [4] uint — [0]=num_pairs, [1]=num_contacts
+
+    // ---- GPU Raytrace (raytrace only) ----
+    tri_geom: if (is_raytrace) Buffer else void, // [MAX_TRIANGLES] uint — geom index per triangle
 
     // ---- GPU BVH (raytrace only, void when raster) ----
     bvh_aabb_min: if (is_raytrace) Buffer else void,
@@ -113,6 +124,15 @@ pub const Data = struct {
     s_geom_restitution: []f32,
     s_geom_vert_start: []u32,
     s_geom_vert_count: []u32,
+    s_geom_tri_start: []u32,
+    s_geom_tri_count: []u32,
+
+    // ---- CPU staging — material ----
+    s_geom_material: []u32,
+    s_material_albedo: []f32,
+    s_material_roughness: []f32,
+    s_material_metallic: []f32,
+    s_material_emission: []f32,
 
     // ---- CPU staging — hull ----
     s_hull_verts: []f32,
@@ -122,6 +142,7 @@ pub const Data = struct {
     num_bodies: u32,
     num_geoms: u32,
     num_hull_verts: u32,
+    num_materials: u32,
 
     pub fn init(vk: *Vulkan, alloc: std.mem.Allocator) !Data {
         return Data{
@@ -150,6 +171,12 @@ pub const Data = struct {
             .geom_data = try vk.createBuffer(MAX_GEOMS * 8 * @sizeOf(f32), STORAGE),
             .geom_friction = try vk.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
             .geom_restitution = try vk.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
+            .geom_material = try vk.createBuffer(MAX_GEOMS * @sizeOf(u32), STORAGE),
+
+            .material_albedo = try vk.createBuffer(MAX_MATERIALS * @sizeOf([3]f32), STORAGE),
+            .material_roughness = try vk.createBuffer(MAX_MATERIALS * @sizeOf(f32), STORAGE),
+            .material_metallic = try vk.createBuffer(MAX_MATERIALS * @sizeOf(f32), STORAGE),
+            .material_emission = try vk.createBuffer(MAX_MATERIALS * @sizeOf([3]f32), STORAGE),
 
             .hull_verts = try vk.createBuffer(MAX_HULL_VERTS * @sizeOf([3]f32), STORAGE),
 
@@ -165,6 +192,8 @@ pub const Data = struct {
             .contact_lambda_n = try vk.createBuffer(MAX_CONTACTS * @sizeOf(f32), STORAGE),
 
             .atomic_counters = try vk.createBuffer(4 * @sizeOf(u32), STORAGE),
+
+            .tri_geom = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE) else {},
 
             .bvh_aabb_min = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE) else {},
             .bvh_aabb_max = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * 2 * @sizeOf([3]f32), STORAGE) else {},
@@ -203,6 +232,13 @@ pub const Data = struct {
             .s_geom_restitution = try alloc.alloc(f32, MAX_GEOMS),
             .s_geom_vert_start = try alloc.alloc(u32, MAX_GEOMS),
             .s_geom_vert_count = try alloc.alloc(u32, MAX_GEOMS),
+            .s_geom_tri_start = try alloc.alloc(u32, MAX_GEOMS),
+            .s_geom_tri_count = try alloc.alloc(u32, MAX_GEOMS),
+            .s_geom_material = try alloc.alloc(u32, MAX_GEOMS),
+            .s_material_albedo = try alloc.alloc(f32, MAX_MATERIALS * 3),
+            .s_material_roughness = try alloc.alloc(f32, MAX_MATERIALS),
+            .s_material_metallic = try alloc.alloc(f32, MAX_MATERIALS),
+            .s_material_emission = try alloc.alloc(f32, MAX_MATERIALS * 3),
             .s_hull_verts = try alloc.alloc(f32, MAX_HULL_VERTS * 3),
 
             .num_vertices = 0,
@@ -210,10 +246,26 @@ pub const Data = struct {
             .num_bodies = 0,
             .num_geoms = 0,
             .num_hull_verts = 0,
+            .num_materials = 0,
         };
     }
 
-    pub fn addBox(self: *Data, center: [3]f32, half: [3]f32, color: [3]f32, mass: f32, friction: f32, restitution: f32) !u32 {
+    /// Add a material for path tracing. Returns material index.
+    pub fn addMaterial(self: *Data, albedo: [3]f32, roughness: f32, metallic: f32, emission: [3]f32) u32 {
+        const mi = self.num_materials;
+        self.s_material_albedo[mi * 3 + 0] = albedo[0];
+        self.s_material_albedo[mi * 3 + 1] = albedo[1];
+        self.s_material_albedo[mi * 3 + 2] = albedo[2];
+        self.s_material_roughness[mi] = roughness;
+        self.s_material_metallic[mi] = metallic;
+        self.s_material_emission[mi * 3 + 0] = emission[0];
+        self.s_material_emission[mi * 3 + 1] = emission[1];
+        self.s_material_emission[mi * 3 + 2] = emission[2];
+        self.num_materials += 1;
+        return mi;
+    }
+
+    pub fn addBox(self: *Data, center: [3]f32, half: [3]f32, color: [3]f32, mass: f32, friction: f32, restitution: f32, material: u32) !u32 {
         const vs = self.num_vertices;
         const ts = self.num_triangles;
         const bi = self.num_bodies;
@@ -292,14 +344,17 @@ pub const Data = struct {
         };
         self.s_geom_friction[gi] = friction;
         self.s_geom_restitution[gi] = restitution;
+        self.s_geom_material[gi] = material;
         self.s_geom_vert_start[gi] = vs;
         self.s_geom_vert_count[gi] = 8;
+        self.s_geom_tri_start[gi] = ts;
+        self.s_geom_tri_count[gi] = 12;
         self.num_geoms += 1;
 
         return bi;
     }
 
-    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, mass: f32, friction: f32, restitution: f32) !u32 {
+    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, mass: f32, friction: f32, restitution: f32, material: u32) !u32 {
         const vs = self.num_vertices;
         const ts = self.num_triangles;
         const bi = self.num_bodies;
@@ -394,8 +449,11 @@ pub const Data = struct {
         };
         self.s_geom_friction[gi] = friction;
         self.s_geom_restitution[gi] = restitution;
+        self.s_geom_material[gi] = material;
         self.s_geom_vert_start[gi] = vs;
         self.s_geom_vert_count[gi] = num_v;
+        self.s_geom_tri_start[gi] = ts;
+        self.s_geom_tri_count[gi] = num_t;
         self.num_geoms += 1;
 
         return bi;
@@ -421,6 +479,13 @@ pub const Data = struct {
         try v.uploadSlice(self.geom_data, f32, self.s_geom_data[0 .. self.num_geoms * 8]);
         try v.uploadSlice(self.geom_friction, f32, self.s_geom_friction[0..self.num_geoms]);
         try v.uploadSlice(self.geom_restitution, f32, self.s_geom_restitution[0..self.num_geoms]);
+        try v.uploadSlice(self.geom_material, u32, self.s_geom_material[0..self.num_geoms]);
+        if (self.num_materials > 0) {
+            try v.uploadSlice(self.material_albedo, f32, self.s_material_albedo[0 .. self.num_materials * 3]);
+            try v.uploadSlice(self.material_roughness, f32, self.s_material_roughness[0..self.num_materials]);
+            try v.uploadSlice(self.material_metallic, f32, self.s_material_metallic[0..self.num_materials]);
+            try v.uploadSlice(self.material_emission, f32, self.s_material_emission[0 .. self.num_materials * 3]);
+        }
         try v.uploadSlice(self.hull_verts, f32, self.s_hull_verts[0 .. self.num_hull_verts * 3]);
 
         // Derive body vert start/count from first geom per body
@@ -431,6 +496,20 @@ pub const Data = struct {
         }
         try v.uploadSlice(self.body_vert_start, u32, self.s_body_vert_start[0..self.num_bodies]);
         try v.uploadSlice(self.body_vert_count, u32, self.s_body_vert_count[0..self.num_bodies]);
+
+        // Build tri_geom lookup (raytrace only): triangle index → geom index
+        if (comptime is_raytrace) {
+            var tri_geom_staging = try self.alloc.alloc(u32, self.num_triangles);
+            defer self.alloc.free(tri_geom_staging);
+            for (0..self.num_geoms) |gi| {
+                const ts = self.s_geom_tri_start[gi];
+                const tc = self.s_geom_tri_count[gi];
+                for (ts..ts + tc) |ti| {
+                    tri_geom_staging[ti] = @intCast(gi);
+                }
+            }
+            try v.uploadSlice(self.tri_geom, u32, tri_geom_staging[0..self.num_triangles]);
+        }
     }
 
     pub fn gpuMemoryBytes(self: *const Data) usize {
