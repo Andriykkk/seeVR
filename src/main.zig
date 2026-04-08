@@ -35,31 +35,31 @@ pub fn main() !void {
     var d = try Data.init(&vk_ctx, allocator);
     defer d.deinit();
 
-    // Materials                                              albedo               rough  metal  emission         ior
-    const mat_ground = d.addMaterial(.{ 0.35, 0.35, 0.30 }, 0.95, 0.0, .{ 0, 0, 0 }, 0); // matte concrete
-    const mat_red = d.addMaterial(.{ 0.85, 0.15, 0.15 }, 0.4, 0.0, .{ 0, 0, 0 }, 0); // glossy plastic
-    const mat_mirror = d.addMaterial(.{ 0.95, 0.95, 0.95 }, 0.02, 1.0, .{ 0, 0, 0 }, 0); // near-perfect mirror
-    const mat_gold = d.addMaterial(.{ 1.0, 0.76, 0.33 }, 0.15, 1.0, .{ 0, 0, 0 }, 0); // polished gold
-    const mat_rubber = d.addMaterial(.{ 0.35, 0.8, 0.35 }, 1.0, 0.0, .{ 0, 0, 0 }, 0); // matte rubber
-    const mat_copper = d.addMaterial(.{ 0.95, 0.64, 0.54 }, 0.25, 1.0, .{ 0, 0, 0 }, 0); // brushed copper
-    const mat_glass = d.addMaterial(.{ 0.95, 0.95, 1.0 }, 0.0, 0.0, .{ 0, 0, 0 }, 1.5); // clear glass
-    const mat_emissive = d.addMaterial(.{ 1.0, 0.9, 0.7 }, 1.0, 0.0, .{ 8, 7, 5 }, 0); // warm light
-    const mat_chrome = d.addMaterial(.{ 0.55, 0.56, 0.55 }, 0.1, 1.0, .{ 0, 0, 0 }, 0); // polished chrome
+    // Materials                                              albedo               rough  metal  emission         ior    density (kg/m³)
+    const mat_ground = d.addMaterial(.{ 0.35, 0.35, 0.30 }, 0.95, 0.0, .{ 0, 0, 0 }, 0, 0); // concrete, static
+    const mat_red = d.addMaterial(.{ 0.85, 0.15, 0.15 }, 0.4, 0.0, .{ 0, 0, 0 }, 0, 1200); // plastic ~1200
+    const mat_mirror = d.addMaterial(.{ 0.95, 0.95, 0.95 }, 0.02, 1.0, .{ 0, 0, 0 }, 0, 7800); // steel ~7800
+    const mat_gold = d.addMaterial(.{ 1.0, 0.76, 0.33 }, 0.15, 1.0, .{ 0, 0, 0 }, 0, 19300); // gold ~19300
+    const mat_rubber = d.addMaterial(.{ 0.35, 0.8, 0.35 }, 1.0, 0.0, .{ 0, 0, 0 }, 0, 1100); // rubber ~1100
+    const mat_copper = d.addMaterial(.{ 0.95, 0.64, 0.54 }, 0.25, 1.0, .{ 0, 0, 0 }, 0, 8900); // copper ~8900
+    const mat_glass = d.addMaterial(.{ 0.95, 0.95, 1.0 }, 0.0, 0.0, .{ 0, 0, 0 }, 1.5, 2500); // glass ~2500
+    const mat_emissive = d.addMaterial(.{ 1.0, 0.9, 0.7 }, 1.0, 0.0, .{ 8, 7, 5 }, 0, 500); // light fixture
+    const mat_chrome = d.addMaterial(.{ 0.55, 0.56, 0.55 }, 0.1, 1.0, .{ 0, 0, 0 }, 0, 7200); // chrome ~7200
 
-    //                                                                       mass  fric  rest  mat
-    // Ground (static)
-    _ = try d.addBox(.{ 0, -0.25, 0 }, .{ 10, 0.25, 10 }, .{ 0.35, 0.35, 0.30 }, 0, 0.5, 0.0, mat_ground);
-    // Stacked boxes — different materials
-    _ = try d.addBox(.{ 0, 1, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 0.85, 0.15, 0.15 }, 1, 0.5, 0.1, mat_red);
-    _ = try d.addBox(.{ 0.02, 2.5, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 0.95, 0.95, 0.95 }, 1, 0.5, 0.1, mat_mirror);
-    _ = try d.addBox(.{ -0.02, 4.0, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 1.0, 0.76, 0.33 }, 1, 0.5, 0.1, mat_gold);
-    _ = try d.addBox(.{ 0.01, 5.5, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 0.35, 0.8, 0.35 }, 1, 0.5, 0.1, mat_rubber);
+    //                                                                       fric  rest  mat
+    // Ground (static, density=0)
+    _ = try d.addBox(.{ 0, -0.25, 0 }, .{ 10, 0.25, 10 }, .{ 0.35, 0.35, 0.30 }, 0.5, 0.0, mat_ground);
+    // Stacked boxes
+    _ = try d.addBox(.{ 0, 1, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 0.85, 0.15, 0.15 }, 0.5, 0.1, mat_red);
+    _ = try d.addBox(.{ 0.02, 2.5, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 0.95, 0.95, 0.95 }, 0.5, 0.1, mat_mirror);
+    _ = try d.addBox(.{ -0.02, 4.0, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 1.0, 0.76, 0.33 }, 0.5, 0.1, mat_gold);
+    _ = try d.addBox(.{ 0.01, 5.5, 0 }, .{ 0.5, 0.5, 0.5 }, .{ 0.35, 0.8, 0.35 }, 0.5, 0.1, mat_rubber);
     // Side boxes
-    _ = try d.addBox(.{ 3, 1, 0 }, .{ 0.75, 0.75, 0.75 }, .{ 0.95, 0.64, 0.54 }, 1, 0.3, 0.3, mat_copper);
-    _ = try d.addBox(.{ -3, 2, 1 }, .{ 0.6, 0.6, 0.6 }, .{ 0.55, 0.56, 0.55 }, 1, 0.8, 0.0, mat_chrome);
+    _ = try d.addBox(.{ 3, 1, 0 }, .{ 0.75, 0.75, 0.75 }, .{ 0.95, 0.64, 0.54 }, 0.3, 0.3, mat_copper);
+    _ = try d.addBox(.{ -3, 2, 1 }, .{ 0.6, 0.6, 0.6 }, .{ 0.55, 0.56, 0.55 }, 0.8, 0.0, mat_chrome);
     // Spheres
-    _ = try d.addSphere(.{ 1.5, 3, 0 }, 0.4, .{ 0.8, 0.85, 1.0 }, 128, 1, 0.2, 0.97, mat_glass);
-    _ = try d.addSphere(.{ -1.0, 3, 0 }, 0.5, .{ 1.0, 0.9, 0.7 }, 128, 1, 0.6, 0.4, mat_emissive);
+    _ = try d.addSphere(.{ 1.5, 3, 0 }, 0.4, .{ 0.8, 0.85, 1.0 }, 128, 0.2, 0.97, mat_glass);
+    _ = try d.addSphere(.{ -1.0, 3, 0 }, 0.5, .{ 1.0, 0.9, 0.7 }, 128, 0.6, 0.4, mat_emissive);
 
     try d.upload();
 

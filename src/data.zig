@@ -136,6 +136,9 @@ pub const Data = struct {
     s_material_emission: []f32,
     s_material_ior: []f32,
 
+    // ---- CPU staging — material (physics-only, not uploaded to GPU) ----
+    s_material_density: []f32,
+
     // ---- CPU staging — hull ----
     s_hull_verts: []f32,
 
@@ -243,6 +246,7 @@ pub const Data = struct {
             .s_material_metallic = try alloc.alloc(f32, MAX_MATERIALS),
             .s_material_emission = try alloc.alloc(f32, MAX_MATERIALS * 3),
             .s_material_ior = try alloc.alloc(f32, MAX_MATERIALS),
+            .s_material_density = try alloc.alloc(f32, MAX_MATERIALS),
             .s_hull_verts = try alloc.alloc(f32, MAX_HULL_VERTS * 3),
 
             .num_vertices = 0,
@@ -255,7 +259,8 @@ pub const Data = struct {
     }
 
     /// Add a material for path tracing. Returns material index.
-    pub fn addMaterial(self: *Data, albedo: [3]f32, roughness: f32, metallic: f32, emission: [3]f32, ior: f32) u32 {
+    /// Add a material. density is kg/m³ (0 = static/infinite mass). Only used for physics, not uploaded to GPU.
+    pub fn addMaterial(self: *Data, albedo: [3]f32, roughness: f32, metallic: f32, emission: [3]f32, ior: f32, density: f32) u32 {
         const mi = self.num_materials;
         self.s_material_albedo[mi * 3 + 0] = albedo[0];
         self.s_material_albedo[mi * 3 + 1] = albedo[1];
@@ -266,11 +271,32 @@ pub const Data = struct {
         self.s_material_emission[mi * 3 + 1] = emission[1];
         self.s_material_emission[mi * 3 + 2] = emission[2];
         self.s_material_ior[mi] = ior;
+        self.s_material_density[mi] = density;
         self.num_materials += 1;
         return mi;
     }
 
-    pub fn addBox(self: *Data, center: [3]f32, half: [3]f32, color: [3]f32, mass: f32, friction: f32, restitution: f32, material: u32) !u32 {
+    /// Compute signed volume of a closed triangle mesh using the divergence theorem.
+    /// Sum of signed tetrahedron volumes (each triangle + origin).
+    fn meshVolume(tri_indices: []const u32, vert_data: []const f32, num_tris: u32) f32 {
+        var vol: f32 = 0;
+        for (0..num_tris) |ti| {
+            const a = tri_indices[ti * 3 + 0];
+            const b = tri_indices[ti * 3 + 1];
+            const cc = tri_indices[ti * 3 + 2];
+            const v0 = [3]f32{ vert_data[a * 3], vert_data[a * 3 + 1], vert_data[a * 3 + 2] };
+            const v1 = [3]f32{ vert_data[b * 3], vert_data[b * 3 + 1], vert_data[b * 3 + 2] };
+            const v2 = [3]f32{ vert_data[cc * 3], vert_data[cc * 3 + 1], vert_data[cc * 3 + 2] };
+            // Signed volume of tetrahedron (origin, v0, v1, v2) = dot(v0, cross(v1, v2)) / 6
+            const cx = v1[1] * v2[2] - v1[2] * v2[1];
+            const cy = v1[2] * v2[0] - v1[0] * v2[2];
+            const cz = v1[0] * v2[1] - v1[1] * v2[0];
+            vol += v0[0] * cx + v0[1] * cy + v0[2] * cz;
+        }
+        return @abs(vol) / 6.0;
+    }
+
+    pub fn addBox(self: *Data, center: [3]f32, half: [3]f32, color: [3]f32, friction: f32, restitution: f32, material: u32) !u32 {
         const vs = self.num_vertices;
         const ts = self.num_triangles;
         const bi = self.num_bodies;
@@ -304,8 +330,11 @@ pub const Data = struct {
         self.num_vertices += 8;
         self.num_triangles += 12;
 
-        // Body
+        // Body — mass from density * volume
         const b3 = bi * 3;
+        const density = self.s_material_density[material];
+        const volume = half[0] * 2 * half[1] * 2 * half[2] * 2;
+        const mass = density * volume;
         self.s_body_pos[b3..][0..3].* = center;
         self.s_body_quat[bi * 4 ..][0..4].* = .{ 0, 0, 0, 1 };
         self.s_body_vel[b3..][0..3].* = .{ 0, 0, 0 };
@@ -361,7 +390,7 @@ pub const Data = struct {
         return bi;
     }
 
-    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, mass: f32, friction: f32, restitution: f32, material: u32) !u32 {
+    pub fn addSphere(self: *Data, center: [3]f32, radius: f32, color: [3]f32, segments: u32, friction: f32, restitution: f32, material: u32) !u32 {
         const vs = self.num_vertices;
         const ts = self.num_triangles;
         const bi = self.num_bodies;
@@ -416,8 +445,12 @@ pub const Data = struct {
         }
         self.num_triangles += num_t;
 
-        // Body
+        // Body — mass from density * volume
         const b3 = bi * 3;
+        const density = self.s_material_density[material];
+        const pi_val: f32 = 3.14159265;
+        const volume = (4.0 / 3.0) * pi_val * radius * radius * radius;
+        const mass = density * volume;
         self.s_body_pos[b3..][0..3].* = center;
         self.s_body_quat[bi * 4 ..][0..4].* = .{ 0, 0, 0, 1 };
         self.s_body_vel[b3..][0..3].* = .{ 0, 0, 0 };
