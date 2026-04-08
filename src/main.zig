@@ -5,6 +5,7 @@ const Data = @import("data.zig").Data;
 const Scene = @import("scene.zig").Scene;
 const Camera = @import("camera.zig").Camera;
 const Physics = @import("physics.zig").Physics;
+const Profiler = @import("profiler.zig").Profiler;
 const build_options = @import("build_options");
 const Gui = if (build_options.enable_imgui) @import("gui.zig").Gui else void;
 const BVH = if (build_options.raytrace) @import("bvh.zig").BVH else void;
@@ -58,8 +59,8 @@ pub fn main() !void {
     _ = try d.addBox(.{ 3, 1, 0 }, .{ 0.75, 0.75, 0.75 }, .{ 0.95, 0.64, 0.54 }, 0.3, 0.3, mat_copper);
     _ = try d.addBox(.{ -3, 2, 1 }, .{ 0.6, 0.6, 0.6 }, .{ 0.55, 0.56, 0.55 }, 0.8, 0.0, mat_chrome);
     // Spheres
-    _ = try d.addSphere(.{ 1.5, 3, 0 }, 0.4, .{ 0.8, 0.85, 1.0 }, 128, 0.2, 0.97, mat_glass);
-    _ = try d.addSphere(.{ -1.0, 3, 0 }, 0.5, .{ 1.0, 0.9, 0.7 }, 128, 0.6, 0.4, mat_emissive);
+    _ = try d.addSphere(.{ 1.5, 3, 0 }, 0.4, .{ 0.8, 0.85, 1.0 }, 128 * 4, 0.2, 0.97, mat_glass);
+    _ = try d.addSphere(.{ -1.0, 3, 0 }, 0.5, .{ 1.0, 0.9, 0.7 }, 128 * 4, 0.6, 0.4, mat_emissive);
 
     try d.upload();
 
@@ -83,6 +84,19 @@ pub fn main() !void {
         d.num_geoms,
     });
 
+    // Profiler
+    var prof = Profiler.init();
+    const p_frame = prof.addSection("frame_total");
+    const p_poll = prof.addSection("poll_events");
+    const p_physics = prof.addSection("physics");
+    const p_bvh = prof.addSection("bvh_build");
+    const p_raytrace = prof.addSection("raytrace");
+    const p_begin_frame = prof.addSection("begin_frame");
+    const p_draw = prof.addSection("draw");
+    const p_gui = prof.addSection("gui");
+    const p_end_frame = prof.addSection("end_frame");
+    defer prof.printSummary();
+
     var camera = Camera.init(0, 5, 15, -90, -15);
     const aspect: f32 = @as(f32, @floatFromInt(WIDTH)) / @as(f32, @floatFromInt(HEIGHT));
     var last_time: f64 = c.glfwGetTime();
@@ -90,6 +104,8 @@ pub fn main() !void {
     var frame: u64 = 0;
 
     while (!scene.shouldClose()) {
+        prof.begin(p_frame);
+
         const now = c.glfwGetTime();
         const dt: f32 = @floatCast(now - last_time);
         last_time = now;
@@ -98,18 +114,36 @@ pub fn main() !void {
             gui.fps = fps_smooth;
         }
 
+        prof.begin(p_poll);
         scene.pollEvents();
         camera.update(window, dt);
+        prof.end(p_poll);
 
         // Physics
+        prof.begin(p_physics);
         try physics.step(d.num_bodies, 10, 1.0 / 60.0, .{ 0, -9.81, 0 });
+        prof.end(p_physics);
 
         if (comptime raytrace_mode) {
+            prof.begin(p_bvh);
             try bvh.build(d.num_triangles);
+            prof.end(p_bvh);
+
+            prof.begin(p_raytrace);
             try rt.render(camera.pos, camera.direction(), camera.right(), camera.up(), d.num_triangles);
+            prof.end(p_raytrace);
+
+            prof.begin(p_begin_frame);
             try scene.beginFrame();
+            prof.end(p_begin_frame);
+
+            prof.begin(p_draw);
             scene.blitRtImage();
+            prof.end(p_draw);
+
+            prof.begin(p_end_frame);
             try scene.endFrame();
+            prof.end(p_end_frame);
 
             frame += 1;
             if (frame % 60 == 0) {
@@ -121,16 +155,30 @@ pub fn main() !void {
             }
         } else {
             // Rasterize
+            prof.begin(p_begin_frame);
             const mvp = camera.mvp(aspect);
             try scene.beginFrame();
+            prof.end(p_begin_frame);
+
+            prof.begin(p_draw);
             scene.draw(&d, &mvp);
+            prof.end(p_draw);
+
             if (comptime Gui != void) {
+                prof.begin(p_gui);
                 const counters = physics.readCounters(&d) catch .{ 0, 0 };
                 gui.pairs = counters[0];
                 gui.contacts = counters[1];
                 gui.render(&d, scene.cmd_buffers[scene.current_frame]);
+                prof.end(p_gui);
             }
+
+            prof.begin(p_end_frame);
             try scene.endFrame();
+            prof.end(p_end_frame);
         }
+
+        prof.end(p_frame);
+        prof.endFrame();
     }
 }
