@@ -17,6 +17,11 @@ pub const MAX_COLLISION_PAIRS: u32 = 10_000;
 pub const MAX_HULL_VERTS: u32 = 10_000_000;
 pub const MAX_MATERIALS: u32 = 256;
 
+pub const WORKGROUP_SIZE: u32 = 256;
+pub const MAX_WORKGROUPS: u32 = (MAX_TRIANGLES + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+// Temp buffer sized for radix sort histogram (largest consumer): MAX_WORKGROUPS × 256 bins × 4 bytes
+pub const BVH_TEMP_SIZE: u32 = MAX_WORKGROUPS * 256;
+
 pub const Data = struct {
     vk: *Vulkan,
     alloc: std.mem.Allocator,
@@ -97,6 +102,7 @@ pub const Data = struct {
     bvh_centroids: if (is_raytrace) Buffer else void,
     bvh_flags: if (is_raytrace) Buffer else void,
     bvh_scene_bounds: if (is_raytrace) Buffer else void,
+    bvh_temp: if (is_raytrace) Buffer else void, // shared reduction temp buffer
 
     // ---- CPU staging — render ----
     s_vertices: []f32,
@@ -215,6 +221,7 @@ pub const Data = struct {
             .bvh_centroids = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf([3]f32), STORAGE) else {},
             .bvh_flags = if (is_raytrace) try vk.createBuffer(MAX_TRIANGLES * @sizeOf(u32), STORAGE) else {},
             .bvh_scene_bounds = if (is_raytrace) try vk.createBuffer(2 * @sizeOf([3]f32), STORAGE) else {},
+            .bvh_temp = if (is_raytrace) try vk.createBuffer(BVH_TEMP_SIZE * @sizeOf(u32), STORAGE) else {},
 
             .s_vertices = try alloc.alloc(f32, MAX_VERTICES * 3),
             .s_colors = try alloc.alloc(f32, MAX_VERTICES * 3),

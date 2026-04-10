@@ -24,6 +24,7 @@ layout(set = 0, binding = 12) buffer NodesCount    { uint  node_count[]; };
 layout(set = 0, binding = 13) buffer NodesParent   { uint  node_parent[]; };
 layout(set = 0, binding = 14) buffer PrimIndices   { uint  prim_idx[]; };
 layout(set = 0, binding = 15) buffer Flags         { uint  flags[]; };
+layout(set = 0, binding = 16) buffer Temp          { float temp[]; };
 
 // --- Helpers ---
 
@@ -76,19 +77,88 @@ void step_centroids() {
     prim_idx[i] = i;
 }
 
-// --- Step 1: Compute scene bounds (serial on thread 0) ---
+// --- Shared memory for tree reductions ---
 
-void step_bounds() {
-    if (gl_GlobalInvocationID.x != 0) return;
+shared vec3 s_min[256];
+shared vec3 s_max[256];
 
-    vec3 bmin = vec3(1e30), bmax = vec3(-1e30);
-    for (uint t = 0; t < num_tris; t++) {
-        vec3 c = vec3(centroids[t*3], centroids[t*3+1], centroids[t*3+2]);
-        bmin = min(bmin, c);
-        bmax = max(bmax, c);
+void reduce_tree() {
+    uint lid = gl_LocalInvocationID.x;
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            s_min[lid] = min(s_min[lid], s_min[lid + s]);
+            s_max[lid] = max(s_max[lid], s_max[lid + s]);
+        }
+        barrier();
     }
-    bounds[0] = bmin.x; bounds[1] = bmin.y; bounds[2] = bmin.z;
-    bounds[3] = bmax.x; bounds[4] = bmax.y; bounds[5] = bmax.z;
+}
+
+// --- Step 1: centroids → temp (first pass) ---
+
+void step_bounds_from_centroids() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (gid < num_tris) {
+        vec3 c = vec3(centroids[gid*3], centroids[gid*3+1], centroids[gid*3+2]);
+        s_min[lid] = c;
+        s_max[lid] = c;
+    } else {
+        s_min[lid] = vec3(1e30);
+        s_max[lid] = vec3(-1e30);
+    }
+    barrier();
+    reduce_tree();
+
+    if (lid == 0) {
+        uint g = gl_WorkGroupID.x;
+        temp[g*6+0] = s_min[0].x; temp[g*6+1] = s_min[0].y; temp[g*6+2] = s_min[0].z;
+        temp[g*6+3] = s_max[0].x; temp[g*6+4] = s_max[0].y; temp[g*6+5] = s_max[0].z;
+    }
+}
+
+// --- Step 8: temp → temp (middle passes, num_tris = number of partials to reduce) ---
+
+void step_bounds_reduce_temp() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (gid < num_tris) {
+        s_min[lid] = vec3(temp[gid*6+0], temp[gid*6+1], temp[gid*6+2]);
+        s_max[lid] = vec3(temp[gid*6+3], temp[gid*6+4], temp[gid*6+5]);
+    } else {
+        s_min[lid] = vec3(1e30);
+        s_max[lid] = vec3(-1e30);
+    }
+    barrier();
+    reduce_tree();
+
+    if (lid == 0) {
+        uint g = gl_WorkGroupID.x;
+        temp[g*6+0] = s_min[0].x; temp[g*6+1] = s_min[0].y; temp[g*6+2] = s_min[0].z;
+        temp[g*6+3] = s_max[0].x; temp[g*6+4] = s_max[0].y; temp[g*6+5] = s_max[0].z;
+    }
+}
+
+// --- Step 9: temp → bounds (final pass, 1 workgroup, num_tris = remaining partials) ---
+
+void step_bounds_final() {
+    uint lid = gl_LocalInvocationID.x;
+
+    if (lid < num_tris) {
+        s_min[lid] = vec3(temp[lid*6+0], temp[lid*6+1], temp[lid*6+2]);
+        s_max[lid] = vec3(temp[lid*6+3], temp[lid*6+4], temp[lid*6+5]);
+    } else {
+        s_min[lid] = vec3(1e30);
+        s_max[lid] = vec3(-1e30);
+    }
+    barrier();
+    reduce_tree();
+
+    if (lid == 0) {
+        bounds[0] = s_min[0].x; bounds[1] = s_min[0].y; bounds[2] = s_min[0].z;
+        bounds[3] = s_max[0].x; bounds[4] = s_max[0].y; bounds[5] = s_max[0].z;
+    }
 }
 
 // --- Step 2: Compute morton codes ---
@@ -247,13 +317,15 @@ void step_propagate() {
 
 void main() {
     switch (step) {
-        case 0: step_centroids();   break;
-        case 1: step_bounds();      break;
-        case 2: step_morton();      break;
-        case 3: step_radix();       break;
-        case 4: step_hierarchy();   break;
-        case 5: step_leaf_aabb();   break;
-        case 6: step_clear_flags(); break;
-        case 7: step_propagate();   break;
+        case 0: step_centroids();           break;
+        case 1: step_bounds_from_centroids(); break;
+        case 2: step_morton();              break;
+        case 3: step_radix();               break;
+        case 4: step_hierarchy();           break;
+        case 5: step_leaf_aabb();           break;
+        case 6: step_clear_flags();         break;
+        case 7: step_propagate();           break;
+        case 8: step_bounds_reduce_temp();  break;
+        case 9: step_bounds_final();        break;
     }
 }
