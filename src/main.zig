@@ -64,10 +64,23 @@ pub fn main() !void {
 
     try d.upload();
 
-    var physics = try Physics.init(&vk_ctx, &d, allocator);
+    // Profiler (must be before Physics.init so it can register sections)
+    var prof = Profiler.init();
+    const p_frame = prof.addSection("frame_total");
+    const p_poll = prof.addSection("poll_events");
+    const p_physics = prof.addSection("physics");
+    const p_bvh = prof.addSection("bvh_build");
+    const p_raytrace = prof.addSection("raytrace");
+    const p_begin_frame = prof.addSection("begin_frame");
+    const p_draw = prof.addSection("draw");
+    const p_gui = prof.addSection("gui");
+    const p_end_frame = prof.addSection("end_frame");
+    defer prof.printSummary();
+
+    var physics = try Physics.init(&vk_ctx, &d, allocator, &prof);
     defer physics.deinit();
 
-    var bvh = if (comptime BVH != void) try BVH.init(&vk_ctx, &d, allocator) else {};
+    var bvh = if (comptime BVH != void) try BVH.init(&vk_ctx, &d, allocator, &prof) else {};
     defer if (comptime BVH != void) bvh.deinit();
 
     var rt = if (comptime RT != void) try RT.init(&vk_ctx, &d, scene.rt_view, WIDTH, HEIGHT, allocator) else {};
@@ -83,19 +96,6 @@ pub fn main() !void {
         d.num_bodies,
         d.num_geoms,
     });
-
-    // Profiler
-    var prof = Profiler.init();
-    const p_frame = prof.addSection("frame_total");
-    const p_poll = prof.addSection("poll_events");
-    const p_physics = prof.addSection("physics");
-    const p_bvh = prof.addSection("bvh_build");
-    const p_raytrace = prof.addSection("raytrace");
-    const p_begin_frame = prof.addSection("begin_frame");
-    const p_draw = prof.addSection("draw");
-    const p_gui = prof.addSection("gui");
-    const p_end_frame = prof.addSection("end_frame");
-    defer prof.printSummary();
 
     var camera = Camera.init(0, 5, 15, -90, -15);
     const aspect: f32 = @as(f32, @floatFromInt(WIDTH)) / @as(f32, @floatFromInt(HEIGHT));
@@ -121,12 +121,12 @@ pub fn main() !void {
 
         // Physics
         prof.begin(p_physics);
-        try physics.step(d.num_bodies, 10, 1.0 / 60.0, .{ 0, -9.81, 0 });
+        try physics.step(d.num_bodies, d.num_vertices, 10, 1.0 / 60.0, .{ 0, -9.81, 0 }, &prof);
         prof.end(p_physics);
 
         if (comptime raytrace_mode) {
             prof.begin(p_bvh);
-            try bvh.build(d.num_triangles);
+            try bvh.build(d.num_triangles, &prof);
             prof.end(p_bvh);
 
             prof.begin(p_raytrace);

@@ -9,6 +9,7 @@ layout(push_constant) uniform PC {
     float gravity_x;
     float gravity_y;
     float gravity_z;
+    uint num_bodies;
 };
 
 // Body
@@ -594,19 +595,27 @@ void step_integrate() {
     body_quat[i*4]=qx; body_quat[i*4+1]=qy; body_quat[i*4+2]=qz; body_quat[i*4+3]=qw;
 }
 
-// Step 7: update render vertices (per body)
+// Step 7: update render vertices (count = num_vertices, dispatch over all verts evenly)
 void step_update_verts() {
-    uint b = gl_GlobalInvocationID.x;
-    if (b >= count) return;
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= count) return;
+
+    // Find which body owns this vertex via binary search on body_vert_start
+    uint lo = 0, hi = num_bodies;
+    while (lo + 1 < hi) {
+        uint mid = (lo + hi) / 2;
+        if (body_vert_start[mid] <= vid)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    uint b = lo;
+
     vec3 bp = get_pos(b);
     mat3 R = quat_to_mat(b);
-    uint start = body_vert_start[b];
-    uint vc = body_vert_count[b];
-    for (uint v = start; v < start + vc; v++) {
-        vec3 lp = vec3(orig_verts[v*3], orig_verts[v*3+1], orig_verts[v*3+2]);
-        vec3 wp = bp + R * lp;
-        verts[v*3] = wp.x; verts[v*3+1] = wp.y; verts[v*3+2] = wp.z;
-    }
+    vec3 lp = vec3(orig_verts[vid*3], orig_verts[vid*3+1], orig_verts[vid*3+2]);
+    vec3 wp = bp + R * lp;
+    verts[vid*3] = wp.x; verts[vid*3+1] = wp.y; verts[vid*3+2] = wp.z;
 }
 
 // Step 8: clear counters
