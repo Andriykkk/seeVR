@@ -29,7 +29,7 @@ pub const BVH = struct {
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator, prof: ?*Profiler) !BVH {
         const shader = try vk.getShader("src/shaders/bvh.comp", .compute, allocator);
 
-        const buffers = [17]Vulkan.Buffer{
+        const buffers = [18]Vulkan.Buffer{
             data.vertices, // 0
             data.indices, // 1
             data.bvh_centroids, // 2
@@ -46,10 +46,11 @@ pub const BVH = struct {
             data.bvh_parent, // 13
             data.bvh_prim_indices, // 14
             data.bvh_flags, // 15
-            data.bvh_temp, // 16
+            data.bvh_temp, // 16 (float view)
+            data.bvh_temp, // 17 (uint view, same buffer)
         };
 
-        const pipeline = try vk.createComputePipeline(shader, 17, &buffers, @sizeOf(PushConstants));
+        const pipeline = try vk.createComputePipeline(shader, 18, &buffers, @sizeOf(PushConstants));
 
         var prof_ids: [8]u32 = undefined;
         if (prof) |p| {
@@ -81,8 +82,10 @@ pub const BVH = struct {
             // Bounds: temp → final
             self.submitStep(queue, .{ .step = 9, .num_tris = bc, .pass_shift = 0 }, 1, prof.?, 1);
             self.submitStep(queue, .{ .step = 2, .num_tris = num_tris, .pass_shift = 0 }, groups, prof.?, 2);
-            for ([_]u32{ 0, 8, 16, 24 }) |shift| {
-                self.submitStep(queue, .{ .step = 3, .num_tris = num_tris, .pass_shift = shift }, 1, prof.?, 3);
+            for ([_]u32{ 0, 4, 8, 12, 16, 20, 24, 28 }) |shift| {
+                self.submitStep(queue, .{ .step = 3, .num_tris = num_tris, .pass_shift = shift }, groups, prof.?, 3);
+                self.submitStep(queue, .{ .step = 10, .num_tris = num_tris, .pass_shift = shift }, 1, prof.?, 3);
+                self.submitStep(queue, .{ .step = 11, .num_tris = num_tris, .pass_shift = shift }, groups, prof.?, 3);
             }
             self.submitStep(queue, .{ .step = 4, .num_tris = num_tris, .pass_shift = 0 }, groups, prof.?, 4);
             self.submitStep(queue, .{ .step = 5, .num_tris = num_tris, .pass_shift = 0 }, groups, prof.?, 5);
@@ -135,8 +138,12 @@ pub const BVH = struct {
             }
             push(cmd, self.pipeline.layout, .{ .step = 2, .num_tris = num_tris, .pass_shift = 0 }, groups);
             bar(cmd, &barrier);
-            for ([_]u32{ 0, 8, 16, 24 }) |shift| {
-                push(cmd, self.pipeline.layout, .{ .step = 3, .num_tris = num_tris, .pass_shift = shift }, 1);
+            for ([_]u32{ 0, 4, 8, 12, 16, 20, 24, 28 }) |shift| {
+                push(cmd, self.pipeline.layout, .{ .step = 3, .num_tris = num_tris, .pass_shift = shift }, groups);
+                bar(cmd, &barrier);
+                push(cmd, self.pipeline.layout, .{ .step = 10, .num_tris = num_tris, .pass_shift = shift }, 1);
+                bar(cmd, &barrier);
+                push(cmd, self.pipeline.layout, .{ .step = 11, .num_tris = num_tris, .pass_shift = shift }, groups);
                 bar(cmd, &barrier);
             }
             push(cmd, self.pipeline.layout, .{ .step = 4, .num_tris = num_tris, .pass_shift = 0 }, groups);

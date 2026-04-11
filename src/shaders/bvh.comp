@@ -25,6 +25,7 @@ layout(set = 0, binding = 13) buffer NodesParent   { uint  node_parent[]; };
 layout(set = 0, binding = 14) buffer PrimIndices   { uint  prim_idx[]; };
 layout(set = 0, binding = 15) buffer Flags         { uint  flags[]; };
 layout(set = 0, binding = 16) buffer Temp          { float temp[]; };
+layout(set = 0, binding = 17) buffer TempU         { uint  temp_u[]; };
 
 // --- Helpers ---
 
@@ -77,10 +78,12 @@ void step_centroids() {
     prim_idx[i] = i;
 }
 
-// --- Shared memory for tree reductions ---
+// --- Shared memory ---
 
 shared vec3 s_min[256];
 shared vec3 s_max[256];
+shared uint s_hist[256];
+shared uint s_scan[256];
 
 void reduce_tree() {
     uint lid = gl_LocalInvocationID.x;
@@ -179,35 +182,115 @@ void step_morton() {
     morton[i] = morton3d(n.x, n.y, n.z);
 }
 
-// --- Step 3: Radix sort pass (serial on thread 0, called 4 times) ---
+// --- 4-bit radix sort (16 bins, 8 passes) ---
+// Ping-pong: even pass_shift (0,8,16,24) reads morton/sort_idx → writes morton_temp/sort_temp
+//            odd  pass_shift (4,12,20,28) reads morton_temp/sort_temp → writes morton/sort_idx
+// temp_u layout for histogram: [digit * num_groups + group_id], digit in [0..15]
 
-void step_radix() {
-    if (gl_GlobalInvocationID.x != 0) return;
+// --- Step 3: Radix histogram (per-workgroup, 16 bins) ---
 
-    uint counts[256];
-    for (uint d = 0; d < 256; d++) counts[d] = 0;
+void step_radix_histogram() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint grp = gl_WorkGroupID.x;
+    uint num_groups = (num_tris + 255) / 256;
+    bool src_a = (pass_shift % 8 == 0); // even pass reads morton/sort_idx
 
-    bool src_main = (pass_shift == 0 || pass_shift == 16);
+    // Clear 16 bins (only first 16 threads needed, but all clear for simplicity)
+    if (lid < 16) s_hist[lid] = 0;
+    barrier();
 
-    for (uint t = 0; t < num_tris; t++) {
-        uint key = src_main ? morton[t] : morton_temp[t];
-        counts[(key >> pass_shift) & 0xFFu]++;
+    if (gid < num_tris) {
+        uint key = src_a ? morton[gid] : morton_temp[gid];
+        uint digit = (key >> pass_shift) & 0xFu;
+        atomicAdd(s_hist[digit], 1);
+    }
+    barrier();
+
+    // First 16 threads write 16 bins to global histogram
+    if (lid < 16) {
+        temp_u[lid * num_groups + grp] = s_hist[lid];
+    }
+}
+
+// --- Step 10: Radix prefix sum (1 workgroup, 256 threads) ---
+// Global exclusive scan over 16 × num_groups histogram entries
+// Produces: temp_u[d * num_groups + g] = total elements before (digit d, group g)
+
+void step_radix_prefix_sum() {
+    uint lid = gl_LocalInvocationID.x;
+    uint num_groups = (num_tris + 255) / 256;
+    uint total_entries = 16 * num_groups;
+
+    // Each thread sums its chunk of the flattened histogram [d0_g0, d0_g1, ..., d0_gN, d1_g0, ...]
+    uint chunk = (total_entries + 255) / 256;
+    uint my_start = lid * chunk;
+    uint my_end = min(my_start + chunk, total_entries);
+
+    uint local_sum = 0;
+    for (uint i = my_start; i < my_end; i++) {
+        local_sum += temp_u[i];
+    }
+    s_scan[lid] = local_sum;
+    barrier();
+
+    // Exclusive scan across 256 thread sums (serial, 256 iterations)
+    if (lid == 0) {
+        uint running = 0;
+        for (uint i = 0; i < 256; i++) {
+            uint val = s_scan[i];
+            s_scan[i] = running;
+            running += val;
+        }
+    }
+    barrier();
+
+    // Write back: each thread does exclusive scan within its chunk, adding thread prefix
+    uint prefix = s_scan[lid];
+    for (uint i = my_start; i < my_end; i++) {
+        uint val = temp_u[i];
+        temp_u[i] = prefix;
+        prefix += val;
+    }
+}
+
+// --- Step 11: Radix scatter (per-workgroup, stable, 16 bins) ---
+
+void step_radix_scatter() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint grp = gl_WorkGroupID.x;
+    uint num_groups = (num_tris + 255) / 256;
+    bool src_a = (pass_shift % 8 == 0);
+
+    uint key = 0;
+    uint si = 0;
+    uint my_digit = 16; // invalid sentinel
+    if (gid < num_tris) {
+        key = src_a ? morton[gid] : morton_temp[gid];
+        si = src_a ? sort_idx[gid] : sort_temp[gid];
+        my_digit = (key >> pass_shift) & 0xFu;
     }
 
-    uint offsets[256];
-    uint running = 0;
-    for (uint d = 0; d < 256; d++) {
-        offsets[d] = running;
-        running += counts[d];
-    }
+    // Share digits for stable local rank
+    s_scan[lid] = my_digit;
+    barrier();
 
-    for (uint t = 0; t < num_tris; t++) {
-        uint key = src_main ? morton[t] : morton_temp[t];
-        uint si  = src_main ? sort_idx[t] : sort_temp[t];
-        uint digit = (key >> pass_shift) & 0xFFu;
-        uint dest = offsets[digit]++;
-        if (src_main) { morton_temp[dest] = key; sort_temp[dest] = si; }
-        else          { morton[dest] = key; sort_idx[dest] = si; }
+    if (gid < num_tris) {
+        // Count threads before me with the same digit = my local rank
+        uint local_rank = 0;
+        for (uint j = 0; j < lid; j++) {
+            if (s_scan[j] == my_digit) local_rank++;
+        }
+
+        uint dest = temp_u[my_digit * num_groups + grp] + local_rank;
+        if (src_a) {
+            morton_temp[dest] = key;
+            sort_temp[dest] = si;
+        } else {
+            morton[dest] = key;
+            sort_idx[dest] = si;
+        }
     }
 }
 
@@ -317,15 +400,17 @@ void step_propagate() {
 
 void main() {
     switch (step) {
-        case 0: step_centroids();           break;
-        case 1: step_bounds_from_centroids(); break;
-        case 2: step_morton();              break;
-        case 3: step_radix();               break;
-        case 4: step_hierarchy();           break;
-        case 5: step_leaf_aabb();           break;
-        case 6: step_clear_flags();         break;
-        case 7: step_propagate();           break;
-        case 8: step_bounds_reduce_temp();  break;
-        case 9: step_bounds_final();        break;
+        case 0:  step_centroids();            break;
+        case 1:  step_bounds_from_centroids(); break;
+        case 2:  step_morton();               break;
+        case 3:  step_radix_histogram();      break;
+        case 4:  step_hierarchy();            break;
+        case 5:  step_leaf_aabb();            break;
+        case 6:  step_clear_flags();          break;
+        case 7:  step_propagate();            break;
+        case 8:  step_bounds_reduce_temp();   break;
+        case 9:  step_bounds_final();         break;
+        case 10: step_radix_prefix_sum();     break;
+        case 11: step_radix_scatter();        break;
     }
 }
