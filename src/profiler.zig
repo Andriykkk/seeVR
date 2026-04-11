@@ -93,6 +93,19 @@ pub const Profiler = struct {
         return @as(f64, @floatFromInt(s.total_ns / s.count)) / 1_000_000.0;
     }
 
+    /// Submit a GPU command buffer, wait for completion, and record the time under `section`.
+    pub fn submitAndTime(self: *Profiler, queue: c.VkQueue, cmd: c.VkCommandBuffer, section: u32) void {
+        self.begin(section);
+        _ = c.vkQueueSubmit(queue, 1, &c.VkSubmitInfo{
+            .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = null,
+            .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null,
+            .commandBufferCount = 1, .pCommandBuffers = &cmd,
+            .signalSemaphoreCount = 0, .pSignalSemaphores = null,
+        }, null);
+        _ = c.vkQueueWaitIdle(queue);
+        self.end(section);
+    }
+
     pub fn printSummary(self: *const Profiler) void {
         const elapsed_ns = now_ns() - self.start_time;
         const total_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
