@@ -50,6 +50,13 @@ layout(set=0, binding=21) buffer Counters   { uint  counters[]; };
 layout(set=0, binding=22) buffer BAabbMin   { float body_aabb_min[]; };
 layout(set=0, binding=23) buffer BAabbMax   { float body_aabb_max[]; };
 layout(set=0, binding=24) buffer ColPairs   { uint  collision_pairs[]; };
+layout(set=0, binding=25) buffer ATempMin  { float aabb_temp_min[]; };
+layout(set=0, binding=26) buffer ATempMax  { float aabb_temp_max[]; };
+layout(set=0, binding=27) buffer ATempBody { uint  aabb_temp_body[]; };
+
+shared vec3 s_aabb_min[256];
+shared vec3 s_aabb_max[256];
+shared uint s_aabb_bid[256];
 
 const float BAUMGARTE = 0.2;
 const float SLOP = 0.005;
@@ -625,6 +632,216 @@ void step_clear_counters() {
     counters[1] = 0;
 }
 
+// ======================== Parallel AABB cascade ========================
+
+// Flush a body's AABB: complete → body buffer, partial → temp slot
+void aabb_flush_body(uint body, vec3 bmin, vec3 bmax, uint wg,
+                     inout uint first_body, inout vec3 first_min, inout vec3 first_max,
+                     inout uint last_body, inout vec3 last_min, inout vec3 last_max,
+                     bool check_complete, uint wg_start, uint wg_end) {
+    bool complete = false;
+    if (check_complete) {
+        uint hs = uint(geom_data[body*8+0]);
+        uint hc = uint(geom_data[body*8+1]);
+        complete = (hs >= wg_start && hs + hc <= wg_end);
+    }
+
+    if (complete) {
+        body_aabb_min[body*3+0] = bmin.x; body_aabb_min[body*3+1] = bmin.y; body_aabb_min[body*3+2] = bmin.z;
+        body_aabb_max[body*3+0] = bmax.x; body_aabb_max[body*3+1] = bmax.y; body_aabb_max[body*3+2] = bmax.z;
+    } else if (first_body == 0xFFFFFFFFu) {
+        first_body = body;
+        first_min = bmin;
+        first_max = bmax;
+    } else {
+        // Previous last was a middle body → complete, write to body buffer
+        if (last_body != 0xFFFFFFFFu) {
+            body_aabb_min[last_body*3+0] = last_min.x; body_aabb_min[last_body*3+1] = last_min.y; body_aabb_min[last_body*3+2] = last_min.z;
+            body_aabb_max[last_body*3+0] = last_max.x; body_aabb_max[last_body*3+1] = last_max.y; body_aabb_max[last_body*3+2] = last_max.z;
+        }
+        last_body = body;
+        last_min = bmin;
+        last_max = bmax;
+    }
+}
+
+void aabb_write_temp(uint wg, uint first_body, vec3 first_min, vec3 first_max,
+                     uint last_body, vec3 last_min, vec3 last_max) {
+    uint s0 = wg * 2;
+    uint s1 = wg * 2 + 1;
+    aabb_temp_body[s0] = first_body;
+    if (first_body != 0xFFFFFFFFu) {
+        aabb_temp_min[s0*3+0] = first_min.x; aabb_temp_min[s0*3+1] = first_min.y; aabb_temp_min[s0*3+2] = first_min.z;
+        aabb_temp_max[s0*3+0] = first_max.x; aabb_temp_max[s0*3+1] = first_max.y; aabb_temp_max[s0*3+2] = first_max.z;
+    }
+    aabb_temp_body[s1] = last_body;
+    if (last_body != 0xFFFFFFFFu) {
+        aabb_temp_min[s1*3+0] = last_min.x; aabb_temp_min[s1*3+1] = last_min.y; aabb_temp_min[s1*3+2] = last_min.z;
+        aabb_temp_max[s1*3+0] = last_max.x; aabb_temp_max[s1*3+1] = last_max.y; aabb_temp_max[s1*3+2] = last_max.z;
+    }
+}
+
+// Step 9: hull verts → temp + body buffer (pass 1)
+void step_aabb_from_hull() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
+    uint wg_start = wg * 256;
+    uint wg_end = min(wg_start + 256, count);
+
+    if (gid < count) {
+        // Binary search for body owning hull vert gid
+        uint lo = 0, hi = num_bodies;
+        while (lo + 1 < hi) {
+            uint mid = (lo + hi) / 2;
+            if (uint(geom_data[mid*8+0]) <= gid)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        uint b = lo;
+
+        mat3 R = quat_to_mat(b);
+        vec3 p = get_pos(b);
+        vec3 wv = p + R * get_hull_vert(gid);
+
+        s_aabb_min[lid] = wv;
+        s_aabb_max[lid] = wv;
+        s_aabb_bid[lid] = b;
+    } else {
+        s_aabb_bid[lid] = 0xFFFFFFFFu;
+    }
+    barrier();
+
+    if (lid != 0) return;
+
+    uint first_body = 0xFFFFFFFFu;
+    vec3 first_min, first_max;
+    uint last_body = 0xFFFFFFFFu;
+    vec3 last_min, last_max;
+
+    uint cur_body = 0xFFFFFFFFu;
+    vec3 cur_min, cur_max;
+
+    for (uint i = 0; i < 256; i++) {
+        if (s_aabb_bid[i] == 0xFFFFFFFFu) continue;
+        if (s_aabb_bid[i] != cur_body) {
+            if (cur_body != 0xFFFFFFFFu)
+                aabb_flush_body(cur_body, cur_min, cur_max, wg,
+                                first_body, first_min, first_max,
+                                last_body, last_min, last_max,
+                                true, wg_start, wg_end);
+            cur_body = s_aabb_bid[i];
+            cur_min = s_aabb_min[i];
+            cur_max = s_aabb_max[i];
+        } else {
+            cur_min = min(cur_min, s_aabb_min[i]);
+            cur_max = max(cur_max, s_aabb_max[i]);
+        }
+    }
+    if (cur_body != 0xFFFFFFFFu)
+        aabb_flush_body(cur_body, cur_min, cur_max, wg,
+                        first_body, first_min, first_max,
+                        last_body, last_min, last_max,
+                        true, wg_start, wg_end);
+
+    aabb_write_temp(wg, first_body, first_min, first_max, last_body, last_min, last_max);
+}
+
+// Step 10: temp → temp (middle cascade passes)
+void step_aabb_reduce_temp() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
+
+    if (gid < count) {
+        s_aabb_bid[lid] = aabb_temp_body[gid];
+        if (s_aabb_bid[lid] != 0xFFFFFFFFu) {
+            s_aabb_min[lid] = vec3(aabb_temp_min[gid*3], aabb_temp_min[gid*3+1], aabb_temp_min[gid*3+2]);
+            s_aabb_max[lid] = vec3(aabb_temp_max[gid*3], aabb_temp_max[gid*3+1], aabb_temp_max[gid*3+2]);
+        }
+    } else {
+        s_aabb_bid[lid] = 0xFFFFFFFFu;
+    }
+    barrier();
+
+    if (lid != 0) return;
+
+    uint first_body = 0xFFFFFFFFu;
+    vec3 first_min, first_max;
+    uint last_body = 0xFFFFFFFFu;
+    vec3 last_min, last_max;
+
+    uint cur_body = 0xFFFFFFFFu;
+    vec3 cur_min, cur_max;
+
+    for (uint i = 0; i < 256; i++) {
+        if (s_aabb_bid[i] == 0xFFFFFFFFu) continue;
+        if (s_aabb_bid[i] != cur_body) {
+            if (cur_body != 0xFFFFFFFFu)
+                aabb_flush_body(cur_body, cur_min, cur_max, wg,
+                                first_body, first_min, first_max,
+                                last_body, last_min, last_max,
+                                false, 0, 0);
+            cur_body = s_aabb_bid[i];
+            cur_min = s_aabb_min[i];
+            cur_max = s_aabb_max[i];
+        } else {
+            cur_min = min(cur_min, s_aabb_min[i]);
+            cur_max = max(cur_max, s_aabb_max[i]);
+        }
+    }
+    if (cur_body != 0xFFFFFFFFu)
+        aabb_flush_body(cur_body, cur_min, cur_max, wg,
+                        first_body, first_min, first_max,
+                        last_body, last_min, last_max,
+                        false, 0, 0);
+
+    aabb_write_temp(wg, first_body, first_min, first_max, last_body, last_min, last_max);
+}
+
+// Step 11: temp → body buffer (final pass, 1 workgroup)
+void step_aabb_final() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (gid < count) {
+        s_aabb_bid[lid] = aabb_temp_body[gid];
+        if (s_aabb_bid[lid] != 0xFFFFFFFFu) {
+            s_aabb_min[lid] = vec3(aabb_temp_min[gid*3], aabb_temp_min[gid*3+1], aabb_temp_min[gid*3+2]);
+            s_aabb_max[lid] = vec3(aabb_temp_max[gid*3], aabb_temp_max[gid*3+1], aabb_temp_max[gid*3+2]);
+        }
+    } else {
+        s_aabb_bid[lid] = 0xFFFFFFFFu;
+    }
+    barrier();
+
+    if (lid != 0) return;
+
+    uint cur_body = 0xFFFFFFFFu;
+    vec3 cur_min, cur_max;
+
+    for (uint i = 0; i < 256; i++) {
+        if (s_aabb_bid[i] == 0xFFFFFFFFu) continue;
+        if (s_aabb_bid[i] != cur_body) {
+            if (cur_body != 0xFFFFFFFFu) {
+                body_aabb_min[cur_body*3+0] = cur_min.x; body_aabb_min[cur_body*3+1] = cur_min.y; body_aabb_min[cur_body*3+2] = cur_min.z;
+                body_aabb_max[cur_body*3+0] = cur_max.x; body_aabb_max[cur_body*3+1] = cur_max.y; body_aabb_max[cur_body*3+2] = cur_max.z;
+            }
+            cur_body = s_aabb_bid[i];
+            cur_min = s_aabb_min[i];
+            cur_max = s_aabb_max[i];
+        } else {
+            cur_min = min(cur_min, s_aabb_min[i]);
+            cur_max = max(cur_max, s_aabb_max[i]);
+        }
+    }
+    if (cur_body != 0xFFFFFFFFu) {
+        body_aabb_min[cur_body*3+0] = cur_min.x; body_aabb_min[cur_body*3+1] = cur_min.y; body_aabb_min[cur_body*3+2] = cur_min.z;
+        body_aabb_max[cur_body*3+0] = cur_max.x; body_aabb_max[cur_body*3+1] = cur_max.y; body_aabb_max[cur_body*3+2] = cur_max.z;
+    }
+}
+
 void main() {
     switch (step) {
         case 0: step_gravity();        break;
@@ -636,5 +853,8 @@ void main() {
         case 6: step_integrate();      break;
         case 7: step_update_verts();   break;
         case 8: step_clear_counters(); break;
+        case 9: step_aabb_from_hull();   break;
+        case 10: step_aabb_reduce_temp(); break;
+        case 11: step_aabb_final();       break;
     }
 }

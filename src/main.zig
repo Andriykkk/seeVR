@@ -121,7 +121,7 @@ pub fn main() !void {
 
         // Physics
         prof.begin(p_physics);
-        try physics.step(d.num_bodies, d.num_vertices, 10, 1.0 / 60.0, .{ 0, -9.81, 0 }, &prof);
+        try physics.step(d.num_bodies, d.num_vertices, d.num_hull_verts, 10, 1.0 / 60.0, .{ 0, -9.81, 0 }, &prof);
         prof.end(p_physics);
 
         if (comptime raytrace_mode) {

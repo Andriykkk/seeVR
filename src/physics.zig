@@ -34,7 +34,7 @@ pub const Physics = struct {
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator, prof: ?*Profiler) !Physics {
         const shader = try vk.getShader("src/shaders/physics.comp", .compute, allocator);
 
-        const buffers = [25]Vulkan.Buffer{
+        const buffers = [28]Vulkan.Buffer{
             data.body_pos,            // 0
             data.body_quat,           // 1
             data.body_vel,            // 2
@@ -60,9 +60,12 @@ pub const Physics = struct {
             data.body_aabb_min,       // 22
             data.body_aabb_max,       // 23
             data.collision_pairs,     // 24
+            data.aabb_temp_min,       // 25
+            data.aabb_temp_max,       // 26
+            data.aabb_temp_body,      // 27
         };
 
-        const pipe = try vk.createComputePipeline(shader, 25, &buffers, @sizeOf(PC));
+        const pipe = try vk.createComputePipeline(shader, 28, &buffers, @sizeOf(PC));
 
         var prof_ids: [9]u32 = undefined;
         if (prof) |p| {
@@ -72,7 +75,7 @@ pub const Physics = struct {
         return .{ .vk = vk, .pipe = pipe, .prof_ids = prof_ids };
     }
 
-    pub fn step(self: *Physics, num_bodies: u32, num_vertices: u32, substeps: u32, dt: f32, gravity: [3]f32, prof: ?*Profiler) !void {
+    pub fn step(self: *Physics, num_bodies: u32, num_vertices: u32, num_hull_verts: u32, substeps: u32, dt: f32, gravity: [3]f32, prof: ?*Profiler) !void {
         if (num_bodies == 0 or substeps == 0) return;
 
         const vk = self.vk;
@@ -86,12 +89,23 @@ pub const Physics = struct {
         const queue = if (vk.compute_queue != null) vk.compute_queue else vk.graphics_queue;
         const vert_groups = @max((num_vertices + 255) / 256, 1);
 
+        // Precompute AABB cascade sizes
+        const hull_groups = @max((num_hull_verts + 255) / 256, 1);
+
         if (prof != null) {
             // Profiling mode: one submit per step
             for (0..substeps) |_| {
                 self.submitStep(queue, .{ .step = 8, .count = 1, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, 1, prof.?, 8);
                 self.submitStep(queue, .{ .step = 0, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, groups, prof.?, 0);
-                self.submitStep(queue, .{ .step = 1, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, groups, prof.?, 1);
+                // AABB cascade
+                self.submitStep(queue, .{ .step = 9, .count = num_hull_verts, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = num_bodies }, hull_groups, prof.?, 1);
+                var entries: u32 = hull_groups * 2;
+                while (entries > 256) {
+                    const eg = (entries + 255) / 256;
+                    self.submitStep(queue, .{ .step = 10, .count = entries, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, eg, prof.?, 1);
+                    entries = eg * 2;
+                }
+                self.submitStep(queue, .{ .step = 11, .count = entries, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, 1, prof.?, 1);
                 self.submitStep(queue, .{ .step = 2, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, groups, prof.?, 2);
                 self.submitStep(queue, .{ .step = 3, .count = max_p, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, (max_p + 255) / 256, prof.?, 3);
                 self.submitStep(queue, .{ .step = 4, .count = max_c, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, (max_c + 255) / 256, prof.?, 4);
@@ -116,8 +130,20 @@ pub const Physics = struct {
                 bar(cmd, &barrier);
                 dispatch(cmd, self.pipe.layout, .{ .step = 0, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, groups);
                 bar(cmd, &barrier);
-                dispatch(cmd, self.pipe.layout, .{ .step = 1, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, groups);
+                // AABB cascade
+                dispatch(cmd, self.pipe.layout, .{ .step = 9, .count = num_hull_verts, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = num_bodies }, hull_groups);
                 bar(cmd, &barrier);
+                {
+                    var entries: u32 = hull_groups * 2;
+                    while (entries > 256) {
+                        const eg = (entries + 255) / 256;
+                        dispatch(cmd, self.pipe.layout, .{ .step = 10, .count = entries, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, eg);
+                        bar(cmd, &barrier);
+                        entries = eg * 2;
+                    }
+                    dispatch(cmd, self.pipe.layout, .{ .step = 11, .count = entries, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, 1);
+                    bar(cmd, &barrier);
+                }
                 dispatch(cmd, self.pipe.layout, .{ .step = 2, .count = num_bodies, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, groups);
                 bar(cmd, &barrier);
                 dispatch(cmd, self.pipe.layout, .{ .step = 3, .count = max_p, .dt = sub_dt, .gravity_x = gx, .gravity_y = gy, .gravity_z = gz, .num_bodies = 0 }, (max_p + 255) / 256);

@@ -18,6 +18,7 @@ pub const MAX_HULL_VERTS: u32 = 10_000_000;
 pub const MAX_MATERIALS: u32 = 256;
 
 pub const WORKGROUP_SIZE: u32 = 256;
+pub const MAX_HULL_WG: u32 = (MAX_HULL_VERTS + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
 pub const MAX_WORKGROUPS: u32 = (MAX_TRIANGLES + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
 // Temp buffer sized for radix sort histogram (largest consumer): MAX_WORKGROUPS × 256 bins × 4 bytes
 pub const BVH_TEMP_SIZE: u32 = MAX_WORKGROUPS * 256;
@@ -72,6 +73,9 @@ pub const Data = struct {
     body_aabb_min: Buffer, // [MAX_BODIES] float3
     body_aabb_max: Buffer, // [MAX_BODIES] float3
     collision_pairs: Buffer, // [MAX_COLLISION_PAIRS*2] uint
+    aabb_temp_min: Buffer, // [MAX_HULL_WG*2] float3 — partial AABB reduce
+    aabb_temp_max: Buffer, // [MAX_HULL_WG*2] float3
+    aabb_temp_body: Buffer, // [MAX_HULL_WG*2] uint — body index per partial
 
     // ---- GPU Contacts ----
     contact_pos: Buffer, // [MAX_CONTACTS] float3
@@ -195,6 +199,9 @@ pub const Data = struct {
             .body_aabb_min = try vk.createBuffer(MAX_BODIES * @sizeOf([3]f32), STORAGE),
             .body_aabb_max = try vk.createBuffer(MAX_BODIES * @sizeOf([3]f32), STORAGE),
             .collision_pairs = try vk.createBuffer(MAX_COLLISION_PAIRS * 2 * @sizeOf(u32), STORAGE),
+            .aabb_temp_min = try vk.createBuffer(MAX_HULL_WG * 2 * @sizeOf([3]f32), STORAGE),
+            .aabb_temp_max = try vk.createBuffer(MAX_HULL_WG * 2 * @sizeOf([3]f32), STORAGE),
+            .aabb_temp_body = try vk.createBuffer(MAX_HULL_WG * 2 * @sizeOf(u32), STORAGE),
 
             .contact_pos = try vk.createBuffer(MAX_CONTACTS * @sizeOf([3]f32), STORAGE),
             .contact_normal = try vk.createBuffer(MAX_CONTACTS * @sizeOf([3]f32), STORAGE),
