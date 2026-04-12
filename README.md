@@ -1,74 +1,102 @@
 # GPU-Accelerated Physics Engine
 
-A high-performance physics engine for robotics and VR simulations, built entirely on GPU using Taichi.
+A real-time rigid body physics engine with all simulation and rendering running on the GPU via Vulkan compute shaders, written in Zig.
 
-![Example Simulation](example1.png)
+![Example Simulation](examples/example2.png)
 
 ## Overview
 
 This project implements a realistic physics simulation system designed for:
-- **Robotics** - Accurate collision detection and physics for robotic manipulation (1mm precision)
+- **Robotics** - Accurate collision detection and physics for robotic manipulation
 - **VR Applications** - Real-time interactive physics simulations
 - **Research** - Experimenting with GPU-accelerated physics algorithms
 
-## Current Features
+## Features
 
-- **GPU-First Architecture** - All physics computations run on GPU using Taichi
-- **Path Tracing Renderer** - Real-time visualization with BVH acceleration
-- **Rigid Body Dynamics** - Full 6-DOF physics with rotation and translation
+- **GPU-First Architecture** - All physics and rendering run as Vulkan compute shaders
+- **Rigid Body Dynamics** - Full 6-DOF physics with quaternion rotation
 - **Collision Detection**
-  - Broad phase (N² for now, BVH planned)
-  - Narrow phase with SAT (Separating Axis Theorem)
-  - Sphere, Box, and Plane primitives
-- **Contact Solver** - Sequential impulse solver with Baumgarte stabilization
-- **Mesh Loading** - OBJ file support with GPU-side transformation (for now without collisions)
+  - Broad phase with AABB (parallel cascaded reduce)
+  - Narrow phase with GJK + EPA
+  - Box and Sphere primitives with convex hull support
+- **Contact Solver** - PGS (Projected Gauss-Seidel) with Baumgarte stabilization, friction, and restitution
+- **Per-material properties** - Friction, restitution, density, albedo, roughness, metallic, emission, IOR
+- **Rendering Modes**
+  - Rasterization (default)
+  - Path tracing with BVH acceleration (LBVH with radix sort)
+- **ImGui overlay** - Real-time debug UI (optional)
 
-## Future Roadmap
+## Building
 
-### Performance
-- [ ] Faster collision detection algorithms
-- [ ] GPU BVH for broad phase
-- [ ] Parallel constraint solver
+### Dependencies
 
-### Realism
-- [ ] Per-material properties (friction, restitution, density)
-- [ ] Soft body dynamics
-- [ ] Improved contact modeling
+- Zig compiler
+- Vulkan SDK
+- GLFW
+- shaderc (runtime shader compilation)
 
-### Complex Geometry
-- [ ] CoACD integration for convex decomposition
-- [ ] Multi-level collision accuracy (single hull → decomposed → SDF)
-- [ ] Signed Distance Fields (SDF) for exact non-convex collision
+### Build & Run
 
-## Technical Details
+```bash
+# Default: raster mode with ImGui
+zig build run
 
-**Physics Solver**: Sequential impulse method with contact constraint resolution
-**Rendering**: GPU path tracer with LBVH acceleration structure
-**Language**: Python + Taichi (JIT-compiled to GPU kernels)
-**Target**: Real-time performance for VR (60+ FPS)
+# Path tracing mode
+zig build run -Dmode=raytrace
+
+# Without ImGui
+zig build run -Dimgui=false
+
+# Release build
+zig build run -Doptimize=ReleaseFast
+```
+
+## Controls
+
+- **WASD** - Move camera
+- **Mouse** - Look around
 
 ## Project Structure
 
 ```
-kernels/
-  ├── data.py           # GPU data structures
-  ├── physics.py        # Collision detection and dynamics
-  ├── bvh.py            # BVH construction (LBVH)
-  ├── raytracing.py     # Path tracing renderer
-  └── mesh_processor.py # Collision strategy selector
-main.py                 # Scene setup and main loop
+src/
+  ├── main.zig          # Scene setup and main loop
+  ├── data.zig          # GPU buffer management and scene data
+  ├── physics.zig       # Physics pipeline dispatch
+  ├── bvh.zig           # BVH construction dispatch
+  ├── raytracer.zig     # Path tracer dispatch
+  ├── vulkan.zig        # Vulkan context and helpers
+  ├── scene.zig         # Swapchain, render pass, drawing
+  ├── camera.zig        # FPS camera
+  ├── profiler.zig      # CPU/GPU timing profiler
+  ├── gui.zig           # ImGui integration
+  └── shaders/
+      ├── physics.comp  # Physics compute shader (gravity, AABB, broadphase, GJK/EPA, PGS, integration)
+      ├── bvh.comp      # LBVH build (centroids, morton codes, radix sort, tree construction)
+      └── raytrace.comp # Path tracer (BVH traversal, PBR materials, glass/metal/diffuse)
+build.zig               # Build configuration
 ```
 
-## Running
+## Technical Details
 
-```bash
-python main.py [--raytrace - instead of rasterizing it will render using path tracing]  
-```
+- **Physics Solver**: PGS with 30 iterations, 10 substeps at 60Hz
+- **Rendering**: Vulkan rasterization or GPU path tracer with 16 SPP, 16 bounces
+- **BVH**: Linear BVH built per-frame via parallel radix sort on Morton codes
+- **Profiling**: Built-in per-step GPU profiler with min/avg/max/recent timing
 
-Controls:
-- Mouse + Drag: Rotate camera
-- Scroll: Zoom
-- Arrow keys: Pan camera
+## TODO
+
+### Optimization
+- [ ] Parallel PGS solver (currently single-threaded on GPU)
+- [ ] Broad phase acceleration (sort-and-sweep or BVH instead of N^2)
+- [ ] GPU timestamp queries instead of CPU-side submit+wait profiling
+
+### Features
+- [ ] Mesh loading (OBJ/glTF) with convex decomposition for collision
+- [ ] Soft body dynamics (FEM or position-based dynamics)
+- [ ] Fluid simulation (SPH or FLIP)
+- [ ] Joints and constraints (hinge, slider, fixed)
+- [ ] Scene serialization (save/load)
 
 ## License
 
