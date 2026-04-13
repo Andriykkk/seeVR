@@ -43,8 +43,6 @@ pub fn main() !void {
     const mat_gold = d.addMaterial(.{ 1.0, 0.76, 0.33 }, 0.15, 1.0, .{ 0, 0, 0 }, 0, 19300); // gold ~19300
     const mat_rubber = d.addMaterial(.{ 0.35, 0.8, 0.35 }, 1.0, 0.0, .{ 0, 0, 0 }, 0, 1100); // rubber ~1100
     const mat_copper = d.addMaterial(.{ 0.95, 0.64, 0.54 }, 0.25, 1.0, .{ 0, 0, 0 }, 0, 8900); // copper ~8900
-    const mat_glass = d.addMaterial(.{ 0.95, 0.95, 1.0 }, 0.0, 0.0, .{ 0, 0, 0 }, 1.5, 2500); // glass ~2500
-    const mat_emissive = d.addMaterial(.{ 1.0, 0.9, 0.7 }, 1.0, 0.0, .{ 8, 7, 5 }, 0, 500); // light fixture
     const mat_chrome = d.addMaterial(.{ 0.55, 0.56, 0.55 }, 0.1, 1.0, .{ 0, 0, 0 }, 0, 7200); // chrome ~7200
 
     //                                                                       fric  rest  mat
