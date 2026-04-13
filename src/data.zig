@@ -17,6 +17,11 @@ pub const MAX_COLLISION_PAIRS: u32 = 10_000;
 pub const MAX_HULL_VERTS: u32 = 10_000_000;
 pub const MAX_MATERIALS: u32 = 256;
 
+pub const SUPPORT_NUM_AXES: u32 = 3;
+pub const SUPPORT_NUM_BINS: u32 = 64;
+pub const SUPPORT_LOOKUP_THRESHOLD: u32 = 32;
+pub const SUPPORT_ENTRY_SIZE: u32 = SUPPORT_NUM_AXES * SUPPORT_NUM_BINS; // 192 per geom
+
 pub const WORKGROUP_SIZE: u32 = 256;
 pub const MAX_HULL_WG: u32 = (MAX_HULL_VERTS + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
 pub const MAX_WORKGROUPS: u32 = (MAX_TRIANGLES + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
@@ -50,13 +55,20 @@ pub const Data = struct {
     geom_local_pos: Buffer, // [MAX_GEOMS] float3
     geom_local_quat: Buffer, // [MAX_GEOMS] float4
     // geom_data layout per geom (8 floats):
-    //   [0]=hull_vert_start [1]=hull_vert_count
-    //   [2]=hull_norm_start [3]=hull_norm_count
-    //   [4]=hull_edge_start [5]=hull_edge_count
-    //   [6]=reserved        [7]=reserved
+    //   [0]=hull_vert_start  [1]=hull_vert_count
+    //   [2]=unused            [3]=unused
+    //   [4]=unused            [5]=unused
+    //   [6]=unused            [7]=unused
     geom_data: Buffer, // [MAX_GEOMS*8] float
     geom_friction: Buffer, // [MAX_GEOMS] float
     geom_restitution: Buffer, // [MAX_GEOMS] float
+
+    // ---- GPU Support lookup (for fast support function) ----
+    // Per geom: offset into support_lookup buffer. 0 = no lookup (use brute force).
+    // Nonzero value N means lookup data starts at support_lookup[N].
+    // Lookup stores hull vert indices for 3 axes × 64 bins = 192 uints per geom.
+    support_lookup_offset: Buffer, // [MAX_GEOMS] uint
+    support_lookup: Buffer, // [MAX_GEOMS * SUPPORT_ENTRY_SIZE] uint — vert indices
     geom_material: Buffer, // [MAX_GEOMS] uint — index into material arrays
 
     // ---- GPU Materials (for path tracing) ----
@@ -152,6 +164,11 @@ pub const Data = struct {
     // ---- CPU staging — hull ----
     s_hull_verts: []f32,
 
+    // ---- CPU staging — support lookup ----
+    s_support_lookup_offset: []u32,
+    s_support_lookup: []u32,
+    num_support_entries: u32, // total entries allocated in lookup buffer
+
     num_vertices: u32,
     num_triangles: u32,
     num_bodies: u32,
@@ -187,6 +204,8 @@ pub const Data = struct {
             .geom_friction = try vk.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
             .geom_restitution = try vk.createBuffer(MAX_GEOMS * @sizeOf(f32), STORAGE),
             .geom_material = try vk.createBuffer(MAX_GEOMS * @sizeOf(u32), STORAGE),
+            .support_lookup_offset = try vk.createBuffer(MAX_GEOMS * @sizeOf(u32), STORAGE),
+            .support_lookup = try vk.createBuffer(MAX_GEOMS * SUPPORT_ENTRY_SIZE * @sizeOf(u32), STORAGE),
 
             .material_albedo = try vk.createBuffer(MAX_MATERIALS * @sizeOf([3]f32), STORAGE),
             .material_roughness = try vk.createBuffer(MAX_MATERIALS * @sizeOf(f32), STORAGE),
@@ -262,6 +281,9 @@ pub const Data = struct {
             .s_material_ior = try alloc.alloc(f32, MAX_MATERIALS),
             .s_material_density = try alloc.alloc(f32, MAX_MATERIALS),
             .s_hull_verts = try alloc.alloc(f32, MAX_HULL_VERTS * 3),
+            .s_support_lookup_offset = try alloc.alloc(u32, MAX_GEOMS),
+            .s_support_lookup = try alloc.alloc(u32, MAX_GEOMS * SUPPORT_ENTRY_SIZE),
+            .num_support_entries = 0,
 
             .num_vertices = 0,
             .num_triangles = 0,
@@ -272,7 +294,64 @@ pub const Data = struct {
         };
     }
 
-    /// Add a material for path tracing. Returns material index.
+    /// Build support lookup table for a geom if its hull vert count exceeds the threshold.
+    /// Called after hull verts are set. Uses local-space hull verts.
+    fn buildSupportLookup(self: *Data, gi: u32, hull_start: u32, hull_count: u32) void {
+        if (hull_count <= SUPPORT_LOOKUP_THRESHOLD) {
+            self.s_support_lookup_offset[gi] = 0; // 0 = brute force
+            return;
+        }
+
+        // Reserve slot starting at index 1 (0 is reserved for "no lookup")
+        const entry_start = if (self.num_support_entries == 0) @as(u32, 1) else self.num_support_entries;
+        self.s_support_lookup_offset[gi] = entry_start;
+
+        // 3 axes with fixed perpendicular vectors (local space):
+        // Axis X: perp1=(0,1,0) perp2=(0,0,1) → angle = atan2(d.z, d.y)
+        // Axis Y: perp1=(1,0,0) perp2=(0,0,1) → angle = atan2(d.z, d.x)
+        // Axis Z: perp1=(1,0,0) perp2=(0,1,0) → angle = atan2(d.y, d.x)
+        const perps = [3][2][3]f32{
+            .{ .{ 0, 1, 0 }, .{ 0, 0, 1 } }, // X axis
+            .{ .{ 1, 0, 0 }, .{ 0, 0, 1 } }, // Y axis
+            .{ .{ 1, 0, 0 }, .{ 0, 1, 0 } }, // Z axis
+        };
+
+        for (0..SUPPORT_NUM_AXES) |ax| {
+            const p1 = perps[ax][0];
+            const p2 = perps[ax][1];
+
+            for (0..SUPPORT_NUM_BINS) |bin| {
+                const angle: f32 = @as(f32, @floatFromInt(bin)) / @as(f32, @floatFromInt(SUPPORT_NUM_BINS)) * 2.0 * std.math.pi;
+                const cos_a = @cos(angle);
+                const sin_a = @sin(angle);
+                // Direction on the great circle
+                const dx = cos_a * p1[0] + sin_a * p2[0];
+                const dy = cos_a * p1[1] + sin_a * p2[1];
+                const dz = cos_a * p1[2] + sin_a * p2[2];
+
+                // Brute force find best hull vert for this direction
+                var best_dot: f32 = -1e10;
+                var best_idx: u32 = 0;
+                for (0..hull_count) |vi| {
+                    const v = @as(u32, @intCast(vi));
+                    const vx = self.s_hull_verts[(hull_start + v) * 3 + 0];
+                    const vy = self.s_hull_verts[(hull_start + v) * 3 + 1];
+                    const vz = self.s_hull_verts[(hull_start + v) * 3 + 2];
+                    const d = dx * vx + dy * vy + dz * vz;
+                    if (d > best_dot) {
+                        best_dot = d;
+                        best_idx = v;
+                    }
+                }
+
+                const slot = entry_start + @as(u32, @intCast(ax)) * SUPPORT_NUM_BINS + @as(u32, @intCast(bin));
+                self.s_support_lookup[slot] = best_idx;
+            }
+        }
+
+        self.num_support_entries = entry_start + SUPPORT_ENTRY_SIZE;
+    }
+
     /// Add a material. density is kg/m³ (0 = static/infinite mass). Only used for physics, not uploaded to GPU.
     pub fn addMaterial(self: *Data, albedo: [3]f32, roughness: f32, metallic: f32, emission: [3]f32, ior: f32, density: f32) u32 {
         const mi = self.num_materials;
@@ -399,6 +478,7 @@ pub const Data = struct {
         self.s_geom_vert_count[gi] = 8;
         self.s_geom_tri_start[gi] = ts;
         self.s_geom_tri_count[gi] = 12;
+        self.buildSupportLookup(gi, hv, 8);
         self.num_geoms += 1;
 
         return bi;
@@ -510,6 +590,7 @@ pub const Data = struct {
         self.s_geom_vert_count[gi] = num_v;
         self.s_geom_tri_start[gi] = ts;
         self.s_geom_tri_count[gi] = num_t;
+        self.buildSupportLookup(gi, hv, num_v);
         self.num_geoms += 1;
 
         return bi;
@@ -544,6 +625,10 @@ pub const Data = struct {
             try v.uploadSlice(self.material_ior, f32, self.s_material_ior[0..self.num_materials]);
         }
         try v.uploadSlice(self.hull_verts, f32, self.s_hull_verts[0 .. self.num_hull_verts * 3]);
+        try v.uploadSlice(self.support_lookup_offset, u32, self.s_support_lookup_offset[0..self.num_geoms]);
+        if (self.num_support_entries > 0) {
+            try v.uploadSlice(self.support_lookup, u32, self.s_support_lookup[0..self.num_support_entries]);
+        }
 
         // Derive body vert start/count from first geom per body
         for (0..self.num_geoms) |gi| {

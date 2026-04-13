@@ -53,6 +53,11 @@ layout(set=0, binding=24) buffer ColPairs   { uint  collision_pairs[]; };
 layout(set=0, binding=25) buffer ATempMin  { float aabb_temp_min[]; };
 layout(set=0, binding=26) buffer ATempMax  { float aabb_temp_max[]; };
 layout(set=0, binding=27) buffer ATempBody { uint  aabb_temp_body[]; };
+layout(set=0, binding=28) buffer SLOffset  { uint  support_offset[]; };
+layout(set=0, binding=29) buffer SLookup   { uint  support_lookup[]; };
+
+const uint SUPPORT_NUM_AXES = 3;
+const uint SUPPORT_NUM_BINS = 64;
 
 shared vec3 s_aabb_min[256];
 shared vec3 s_aabb_max[256];
@@ -63,9 +68,6 @@ const float SLOP = 0.005;
 const int PGS_ITERATIONS = 30;
 const int MAX_CONTACTS = 4000;
 const int MAX_PAIRS = 10000;
-const int GJK_MAX_ITER = 32;
-const int EPA_MAX_ITER = 32;
-const int EPA_MAX_FACES = 64;
 
 // ======================== Helpers ========================
 
@@ -110,15 +112,51 @@ vec3 support(uint bi, vec3 d) {
     uint vs, vc;
     get_hull_info(bi, vs, vc);
 
+    uint lk_off = support_offset[bi];
+
+    if (lk_off == 0) {
+        // Brute force — small hull (boxes etc.)
+        float best = -1e10;
+        vec3 best_v = vec3(0);
+        for (uint i = 0; i < vc; i++) {
+            vec3 v = get_hull_vert(vs + i);
+            float dd = dot(v, local_d);
+            if (dd > best) {
+                best = dd;
+                best_v = v;
+            }
+        }
+        return p + R * best_v;
+    }
+
+    // Lookup — 3 axes × 2 neighbors = 6 candidates
+    // Axis 0 (X): perp1=(0,1,0) perp2=(0,0,1)
+    // Axis 1 (Y): perp1=(1,0,0) perp2=(0,0,1)
+    // Axis 2 (Z): perp1=(1,0,0) perp2=(0,1,0)
+    float angles[3] = float[3](
+        atan(local_d.z, local_d.y),   // X axis
+        atan(local_d.z, local_d.x),   // Y axis
+        atan(local_d.y, local_d.x)    // Z axis
+    );
+
     float best = -1e10;
     vec3 best_v = vec3(0);
-    for (uint i = 0; i < vc; i++) {
-        vec3 v = get_hull_vert(vs + i);
-        float dd = dot(v, local_d);
-        if (dd > best) {
-            best = dd;
-            best_v = v;
-        }
+    for (uint ax = 0; ax < SUPPORT_NUM_AXES; ax++) {
+        float a = angles[ax];
+        if (a < 0.0) a += 6.2831853;
+        float bin_f = a / 6.2831853 * float(SUPPORT_NUM_BINS);
+        uint b0 = uint(bin_f) % SUPPORT_NUM_BINS;
+        uint b1 = (b0 + 1) % SUPPORT_NUM_BINS;
+
+        uint idx0 = support_lookup[lk_off + ax * SUPPORT_NUM_BINS + b0];
+        vec3 v0 = get_hull_vert(vs + idx0);
+        float d0 = dot(v0, local_d);
+        if (d0 > best) { best = d0; best_v = v0; }
+
+        uint idx1 = support_lookup[lk_off + ax * SUPPORT_NUM_BINS + b1];
+        vec3 v1 = get_hull_vert(vs + idx1);
+        float d1 = dot(v1, local_d);
+        if (d1 > best) { best = d1; best_v = v1; }
     }
     return p + R * best_v;
 }
@@ -128,240 +166,196 @@ vec3 mink_support(uint a, uint b, vec3 d) {
     return support(a, d) - support(b, -d);
 }
 
-// ======================== GJK ========================
+// ======================== MPR (Minkowski Portal Refinement) ========================
+// Direct port from Genesis/libccd
 
-// Triple product: (a x b) x c = b*dot(c,a) - a*dot(c,b)
-vec3 triple_cross(vec3 a, vec3 b, vec3 c) {
-    return b * dot(c, a) - a * dot(c, b);
+const float CCD_EPS = 1e-6;
+const float CCD_TOLERANCE = 1e-6;
+const int CCD_ITERATIONS = 50;
+
+// Portal direction: normal of triangle (v1, v2, v3)
+vec3 mpr_portal_dir(vec3 v1, vec3 v2, vec3 v3) {
+    return normalize(cross(v2 - v1, v3 - v1));
 }
 
-// GJK: returns true if overlapping, fills simplex points and count
-bool gjk(uint a, uint b, out vec3 simp[4], out int simp_count) {
-    vec3 d = get_pos(b) - get_pos(a);
-    if (dot(d,d) < 1e-10) d = vec3(1, 0, 0);
+bool mpr_portal_encapsules_origin(vec3 v1, vec3 direction) {
+    return dot(v1, direction) > -CCD_EPS;
+}
 
-    simp[0] = mink_support(a, b, d);
-    d = -simp[0];
-    simp_count = 1;
+bool mpr_portal_can_encapsule_origin(vec3 v4, vec3 direction) {
+    return dot(v4, direction) > -CCD_EPS;
+}
 
-    for (int iter = 0; iter < GJK_MAX_ITER; iter++) {
-        vec3 A = mink_support(a, b, d);
-        if (dot(A, d) < 0.0) return false; // no intersection
+bool mpr_portal_reach_tolerance(vec3 v1, vec3 v2, vec3 v3, vec3 v4, vec3 direction) {
+    float dv1 = dot(v1, direction);
+    float dv2 = dot(v2, direction);
+    float dv3 = dot(v3, direction);
+    float dv4 = dot(v4, direction);
+    float dot1 = min(min(dv4 - dv1, dv4 - dv2), dv4 - dv3);
+    return dot1 < CCD_TOLERANCE + CCD_EPS * max(1.0, dot1);
+}
 
-        simp[simp_count] = A;
-        simp_count++;
+// Expand portal: exact copy of Genesis mpr_expand_portal
+void mpr_expand_portal(inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3, vec3 v4) {
+    vec3 v4v0 = cross(v4, v0);
+    float d = dot(v1, v4v0);
 
-        if (simp_count == 2) {
-            // Line case
-            vec3 AB = simp[0] - simp[1];
-            vec3 AO = -simp[1];
-            d = triple_cross(AB, AO, AB);
-            if (dot(d,d) < 1e-10) d = cross(AB, vec3(1,0,0));
-            if (dot(d,d) < 1e-10) d = cross(AB, vec3(0,1,0));
+    if (d > 0.0) {
+        d = dot(v2, v4v0);
+        if (d > 0.0) {
+            v1 = v4;
+        } else {
+            v3 = v4;
         }
-        else if (simp_count == 3) {
-            // Triangle case
-            vec3 A2 = simp[2]; // newest
-            vec3 B2 = simp[1];
-            vec3 C2 = simp[0];
-            vec3 AB = B2 - A2;
-            vec3 AC = C2 - A2;
-            vec3 AO = -A2;
-            vec3 abc = cross(AB, AC);
-
-            if (dot(cross(abc, AC), AO) > 0.0) {
-                if (dot(AC, AO) > 0.0) {
-                    simp[0] = C2; simp[1] = A2; simp_count = 2;
-                    d = triple_cross(AC, AO, AC);
-                } else {
-                    simp[0] = B2; simp[1] = A2; simp_count = 2;
-                    d = triple_cross(AB, AO, AB);
-                }
-            } else if (dot(cross(AB, abc), AO) > 0.0) {
-                simp[0] = B2; simp[1] = A2; simp_count = 2;
-                d = triple_cross(AB, AO, AB);
-            } else {
-                if (dot(abc, AO) > 0.0) {
-                    d = abc;
-                } else {
-                    // Flip winding
-                    vec3 tmp = simp[0]; simp[0] = simp[1]; simp[1] = tmp;
-                    d = -abc;
-                }
-            }
+    } else {
+        d = dot(v3, v4v0);
+        if (d > 0.0) {
+            v2 = v4;
+        } else {
+            v1 = v4;
         }
-        else if (simp_count == 4) {
-            // Tetrahedron case
-            vec3 A3 = simp[3]; // newest
-            vec3 B3 = simp[2];
-            vec3 C3 = simp[1];
-            vec3 D3 = simp[0];
-            vec3 AO = -A3;
+    }
+}
 
-            vec3 AB = B3 - A3;
-            vec3 AC = C3 - A3;
-            vec3 AD = D3 - A3;
+// Discover portal: exact port of Genesis mpr_discover_portal
+// Returns: -1 = separated, 0 = portal found, 1 = touching, 2 = segment
+int mpr_discover_portal(uint a, uint b, inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3) {
+    // v0 = center_a - center_b
+    v0 = get_pos(a) - get_pos(b);
+    if (abs(v0.x) < CCD_EPS && abs(v0.y) < CCD_EPS && abs(v0.z) < CCD_EPS)
+        v0.x += 10.0 * CCD_EPS;
 
-            vec3 abc = cross(AB, AC);
-            vec3 acd = cross(AC, AD);
-            vec3 adb = cross(AD, AB);
+    // v1: support in direction -v0
+    vec3 dir = normalize(-v0);
+    v1 = mink_support(a, b, dir);
 
-            // Check which face the origin is outside of
-            if (dot(abc, AO) > 0.0) {
-                simp[0] = C3; simp[1] = B3; simp[2] = A3; simp_count = 3;
-                d = abc;
-            } else if (dot(acd, AO) > 0.0) {
-                simp[0] = D3; simp[1] = C3; simp[2] = A3; simp_count = 3;
-                d = acd;
-            } else if (dot(adb, AO) > 0.0) {
-                simp[0] = B3; simp[1] = D3; simp[2] = A3; simp_count = 3;
-                d = adb;
-            } else {
-                return true; // origin inside tetrahedron
-            }
+    float d = dot(v1, dir);
+    if (d < CCD_EPS) return -1; // separated
+
+    // v2: support perpendicular to v0,v1
+    dir = cross(v0, v1);
+    if (dot(dir, dir) < CCD_EPS) {
+        // v0 and v1 collinear
+        if (abs(v1.x) < CCD_EPS && abs(v1.y) < CCD_EPS && abs(v1.z) < CCD_EPS)
+            return 1; // touching
+        return 2; // segment
+    }
+    dir = normalize(dir);
+    v2 = mink_support(a, b, dir);
+    d = dot(v2, dir);
+    if (d < CCD_EPS) return -1; // separated
+
+    // v3: portal normal direction
+    vec3 va = v1 - v0;
+    vec3 vb = v2 - v0;
+    dir = normalize(cross(va, vb));
+
+    // Ensure normal points away from v0 (toward origin)
+    if (dot(dir, v0) > 0.0) {
+        // Swap v1 and v2
+        vec3 tmp = v1; v1 = v2; v2 = tmp;
+        dir = -dir;
+    }
+
+    // Find v3, retrying if origin is outside the triangle
+    int num_trials = 0;
+    while (num_trials < 15) {
+        vec3 v3c = mink_support(a, b, dir);
+        d = dot(v3c, dir);
+        if (d < CCD_EPS) return -1; // separated
+
+        // Check: is origin on correct side of edge v1-v3c?
+        va = cross(v1, v3c);
+        d = dot(va, v0);
+        if (d < -CCD_EPS) {
+            v2 = v3c;
+            va = v1 - v0;
+            vb = v2 - v0;
+            dir = normalize(cross(va, vb));
+            num_trials++;
+            continue;
         }
+
+        // Check: is origin on correct side of edge v3c-v2?
+        va = cross(v3c, v2);
+        d = dot(va, v0);
+        if (d < -CCD_EPS) {
+            v1 = v3c;
+            va = v1 - v0;
+            vb = v2 - v0;
+            dir = normalize(cross(va, vb));
+            num_trials++;
+            continue;
+        }
+
+        // v3 is good
+        v3 = v3c;
+        return 0;
+    }
+    return -1; // failed
+}
+
+// Refine portal: exact port of Genesis mpr_refine_portal
+// Returns: 0 = encapsulated (colliding), -1 = not colliding
+int mpr_refine_portal(uint a, uint b, inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3) {
+    for (int iter = 0; iter < CCD_ITERATIONS; iter++) {
+        vec3 dir = mpr_portal_dir(v1, v2, v3);
+
+        if (mpr_portal_encapsules_origin(v1, dir))
+            return 0; // encapsulated
+
+        vec3 v4 = mink_support(a, b, dir);
+
+        if (!mpr_portal_can_encapsule_origin(v4, dir) ||
+            mpr_portal_reach_tolerance(v1, v2, v3, v4, dir))
+            return -1; // not colliding
+
+        mpr_expand_portal(v0, v1, v2, v3, v4);
+    }
+    return 1; // max iterations
+}
+
+// Find penetration: exact port of Genesis mpr_find_penetration
+bool mpr_find_penetration(uint a, uint b, inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3,
+                          out vec3 normal, out float depth) {
+    for (int iter = 0; iter < CCD_ITERATIONS; iter++) {
+        vec3 dir = mpr_portal_dir(v1, v2, v3);
+        vec3 v4 = mink_support(a, b, dir);
+
+        if (mpr_portal_reach_tolerance(v1, v2, v3, v4, dir) || iter >= CCD_ITERATIONS - 1) {
+            depth = dot(dir, v1);
+            normal = dir;
+            return true;
+        }
+
+        mpr_expand_portal(v0, v1, v2, v3, v4);
     }
     return false;
 }
 
-// ======================== EPA ========================
+// Main MPR entry: exact port of Genesis func_mpr_contact_from_centers
+bool mpr(uint a, uint b, out vec3 normal, out float depth) {
+    vec3 v0, v1, v2, v3;
+    int res = mpr_discover_portal(a, b, v0, v1, v2, v3);
 
-struct EPAFace {
-    uint a, b, c;  // indices into polytope verts
-    vec3 n;        // outward normal
-    float dist;    // distance to origin
-};
-
-// EPA: given GJK simplex containing origin, find penetration normal + depth
-bool epa(uint ba, uint bb, vec3 simp[4], out vec3 normal, out float depth) {
-    // Polytope vertices (start with GJK tetrahedron)
-    vec3 pverts[64];
-    pverts[0] = simp[0];
-    pverts[1] = simp[1];
-    pverts[2] = simp[2];
-    pverts[3] = simp[3];
-    int nv = 4;
-
-    // Faces (triangles) — store as flat arrays
-    uint fa[EPA_MAX_FACES], fb[EPA_MAX_FACES], fc[EPA_MAX_FACES];
-    vec3 fn[EPA_MAX_FACES];
-    float fd[EPA_MAX_FACES];
-    int nf = 0;
-
-    // Initial 4 faces of tetrahedron (outward-facing)
-    // Ensure normals point away from origin
-    uint init_faces[12] = uint[12](0,1,2, 0,3,1, 0,2,3, 1,3,2);
-    for (int i = 0; i < 4; i++) {
-        uint ia = init_faces[i*3], ib = init_faces[i*3+1], ic = init_faces[i*3+2];
-        vec3 n = normalize(cross(pverts[ib] - pverts[ia], pverts[ic] - pverts[ia]));
-        if (dot(n, pverts[ia]) < 0.0) {
-            n = -n;
-            uint tmp = ib; ib = ic; ic = tmp;
-        }
-        fa[nf] = ia; fb[nf] = ib; fc[nf] = ic;
-        fn[nf] = n;
-        fd[nf] = dot(n, pverts[ia]);
-        nf++;
+    if (res == 1) {
+        // Touching — penetration = 0
+        normal = normalize(v0);
+        depth = 0.0;
+        return true;
     }
-
-    for (int iter = 0; iter < EPA_MAX_ITER; iter++) {
-        // Find closest face to origin
-        int closest = 0;
-        float min_dist = fd[0];
-        for (int i = 1; i < nf; i++) {
-            if (fd[i] < min_dist) {
-                min_dist = fd[i];
-                closest = i;
-            }
-        }
-
-        normal = fn[closest];
-        depth = fd[closest];
-
-        // Get new support point along closest face normal
-        vec3 p = mink_support(ba, bb, normal);
-        float d = dot(p, normal);
-
-        if (d - depth < 1e-4 || nv >= 63) {
-            // Converged or out of space
-            return true;
-        }
-
-        // Add new vertex
-        uint pi = uint(nv);
-        pverts[nv] = p;
-        nv++;
-
-        // Remove faces visible from new point, collect horizon edges
-        vec3 edges_a[64], edges_b[64];
-        int ne = 0;
-
-        int new_nf = 0;
-        for (int i = 0; i < nf; i++) {
-            if (dot(fn[i], p - pverts[fa[i]]) > 0.0) {
-                // Face visible — remove it, add its edges to horizon
-                uint ea_ = fa[i], eb_ = fb[i], ec_ = fc[i];
-                // Add 3 edges (check for duplicates = shared edges removed)
-                uint face_edges[6] = uint[6](ea_, eb_, eb_, ec_, ec_, ea_);
-                for (int e = 0; e < 3; e++) {
-                    uint e0 = face_edges[e*2], e1 = face_edges[e*2+1];
-                    bool found = false;
-                    for (int k = 0; k < ne; k++) {
-                        // If reverse edge exists, both are internal — remove
-                        if (edges_a[k] == pverts[e1] && edges_b[k] == pverts[e0]) {
-                            // Swap comparison by index instead
-                        }
-                    }
-                    // Simpler: just add, dedup below
-                    if (ne < 64) {
-                        edges_a[ne] = vec3(float(e0), float(e1), 0);
-                        ne++;
-                    }
-                }
-            } else {
-                // Keep face
-                fa[new_nf] = fa[i]; fb[new_nf] = fb[i]; fc[new_nf] = fc[i];
-                fn[new_nf] = fn[i]; fd[new_nf] = fd[i];
-                new_nf++;
-            }
-        }
-        nf = new_nf;
-
-        // Deduplicate horizon edges (remove pairs that appear in both directions)
-        bool removed[64];
-        for (int i = 0; i < ne; i++) removed[i] = false;
-        for (int i = 0; i < ne; i++) {
-            if (removed[i]) continue;
-            uint e0 = uint(edges_a[i].x), e1 = uint(edges_a[i].y);
-            for (int j = i+1; j < ne; j++) {
-                if (removed[j]) continue;
-                uint f0 = uint(edges_a[j].x), f1 = uint(edges_a[j].y);
-                if (e0 == f1 && e1 == f0) {
-                    removed[i] = true;
-                    removed[j] = true;
-                    break;
-                }
-            }
-        }
-
-        // Create new faces from horizon edges to new point
-        for (int i = 0; i < ne; i++) {
-            if (removed[i]) continue;
-            if (nf >= EPA_MAX_FACES) break;
-            uint e0 = uint(edges_a[i].x), e1 = uint(edges_a[i].y);
-            vec3 n = normalize(cross(pverts[e1] - pverts[e0], p - pverts[e0]));
-            if (dot(n, pverts[e0]) < 0.0) {
-                n = -n;
-                uint tmp = e0; e0 = e1; e1 = tmp;
-            }
-            fa[nf] = e0; fb[nf] = e1; fc[nf] = pi;
-            fn[nf] = n;
-            fd[nf] = dot(n, pverts[e0]);
-            nf++;
-        }
+    if (res == 2) {
+        // Segment case
+        depth = length(v1);
+        normal = normalize(v1);
+        return true;
     }
+    if (res != 0) return false; // separated
 
-    return true;
+    res = mpr_refine_portal(a, b, v0, v1, v2, v3);
+    if (res < 0) return false; // not colliding
+
+    return mpr_find_penetration(a, b, v0, v1, v2, v3, normal, depth);
 }
 
 // ======================== Contact generation ========================
@@ -463,7 +457,7 @@ void step_broad_phase() {
     }
 }
 
-// Step 3: narrow phase — GJK + EPA on broad phase pairs
+// Step 3: narrow phase — MPR on broad phase pairs
 void step_narrow_phase() {
     uint pi = gl_GlobalInvocationID.x;
     uint num_pairs = min(counters[0], MAX_PAIRS);
@@ -472,19 +466,11 @@ void step_narrow_phase() {
     uint a = collision_pairs[pi*2];
     uint b = collision_pairs[pi*2+1];
 
-    vec3 simp[4];
-    int simp_count;
-
-    if (gjk(a, b, simp, simp_count)) {
-        // Ensure we have a tetrahedron for EPA
-        if (simp_count < 4) return;
-
-        vec3 normal;
-        float depth;
-        if (epa(a, b, simp, normal, depth)) {
-            if (depth > 0.0) {
-                generate_contacts(a, b, normal, depth);
-            }
+    vec3 normal;
+    float depth;
+    if (mpr(a, b, normal, depth)) {
+        if (depth > 0.0) {
+            generate_contacts(a, b, normal, depth);
         }
     }
 }

@@ -115,19 +115,98 @@ pub const Profiler = struct {
         std.debug.print("Frames: {}  Total: {d:.2}s  Avg FPS: {d:.1}\n\n", .{
             self.frame_count, total_s, fps,
         });
-        std.debug.print("Section                  avg(ms)  min(ms)  max(ms)  recent    calls\n", .{});
-        std.debug.print("------------------------ -------- -------- -------- -------- --------\n", .{});
+        std.debug.print("{s:<24} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8}\n", .{
+            "Section", "avg(ms)", "min(ms)", "max(ms)", "recent", "calls",
+        });
+        std.debug.print("{s:-<24} {s:->8} {s:->8} {s:->8} {s:->8} {s:->8}\n", .{
+            "", "", "", "", "", "",
+        });
 
+        // Group sections: top-level first, then sub-sections with group totals
+        var cur_group: ?[]const u8 = null;
+        var group_total_ns: u64 = 0;
+        var parent_ns: u64 = 0;
+        var parent_name: []const u8 = "";
+
+        // First pass: print top-level sections
         for (0..self.num_sections) |i| {
             const s = &self.sections[i];
             if (s.count == 0) continue;
             const name = s.name[0..s.name_len];
+            if (name.len > 0 and name[0] == ' ') continue; // skip sub-sections
             const avg = self.avgMs(@intCast(i));
             const recent = self.recentAvgMs(@intCast(i));
             const min_ms = @as(f64, @floatFromInt(s.min_ns)) / 1_000_000.0;
             const max_ms = @as(f64, @floatFromInt(s.max_ns)) / 1_000_000.0;
             std.debug.print("{s:<24} {d:>8.3} {d:>8.3} {d:>8.3} {d:>8.3} {d:>8}\n", .{
                 name, avg, min_ms, max_ms, recent, s.count,
+            });
+        }
+
+        // Second pass: print sub-section groups with totals
+        std.debug.print("\n", .{});
+        for (0..self.num_sections) |i| {
+            const s = &self.sections[i];
+            if (s.count == 0) continue;
+            const name = s.name[0..s.name_len];
+            if (name.len < 3 or name[0] != ' ' or name[1] != ' ') continue;
+
+            // Extract group prefix (e.g. "phys" from "  phys/gravity")
+            const inner = name[2..];
+            var slash_pos: usize = 0;
+            for (inner, 0..) |ch, j| {
+                if (ch == '/') { slash_pos = j; break; }
+            }
+            const group = if (slash_pos > 0) inner[0..slash_pos] else inner;
+
+            // Check if group changed
+            const group_changed = if (cur_group) |cg| !std.mem.eql(u8, cg, group) else true;
+            if (group_changed) {
+                // Print previous group summary
+                if (cur_group != null) {
+                    const overhead_ns = if (parent_ns > group_total_ns) parent_ns - group_total_ns else 0;
+                    const overhead_ms = @as(f64, @floatFromInt(overhead_ns)) / 1_000_000.0;
+                    if (parent_ns > 0) {
+                        const sum_ms = @as(f64, @floatFromInt(group_total_ns)) / 1_000_000.0;
+                        std.debug.print("  {s:<22} sum: {d:.3}ms  parent: {d:.3}ms  overhead: {d:.3}ms\n\n", .{
+                            parent_name, sum_ms, @as(f64, @floatFromInt(parent_ns)) / 1_000_000.0, overhead_ms,
+                        });
+                    }
+                }
+                cur_group = group;
+                group_total_ns = 0;
+                parent_ns = 0;
+                parent_name = "";
+                // Find parent section
+                for (0..self.num_sections) |j| {
+                    const ps = &self.sections[j];
+                    if (ps.count == 0) continue;
+                    const pn = ps.name[0..ps.name_len];
+                    if (pn.len > 0 and pn[0] == ' ') continue;
+                    if (std.mem.startsWith(u8, pn, group)) {
+                        parent_ns = ps.total_ns;
+                        parent_name = pn;
+                        break;
+                    }
+                }
+            }
+
+            group_total_ns += s.total_ns;
+            const avg = self.avgMs(@intCast(i));
+            const recent = self.recentAvgMs(@intCast(i));
+            const min_ms = @as(f64, @floatFromInt(s.min_ns)) / 1_000_000.0;
+            const max_ms = @as(f64, @floatFromInt(s.max_ns)) / 1_000_000.0;
+            std.debug.print("{s:<24} {d:>8.3} {d:>8.3} {d:>8.3} {d:>8.3} {d:>8}\n", .{
+                name, avg, min_ms, max_ms, recent, s.count,
+            });
+        }
+        // Final group summary
+        if (cur_group != null and parent_ns > 0) {
+            const overhead_ns = if (parent_ns > group_total_ns) parent_ns - group_total_ns else 0;
+            const overhead_ms = @as(f64, @floatFromInt(overhead_ns)) / 1_000_000.0;
+            const sum_ms = @as(f64, @floatFromInt(group_total_ns)) / 1_000_000.0;
+            std.debug.print("  {s:<22} sum: {d:.3}ms  parent: {d:.3}ms  overhead: {d:.3}ms\n", .{
+                parent_name, sum_ms, @as(f64, @floatFromInt(parent_ns)) / 1_000_000.0, overhead_ms,
             });
         }
         std.debug.print("\n", .{});

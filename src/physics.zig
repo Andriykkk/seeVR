@@ -34,7 +34,7 @@ pub const Physics = struct {
     pub fn init(vk: *Vulkan, data: *const Data, allocator: std.mem.Allocator, prof: ?*Profiler) !Physics {
         const shader = try vk.getShader("src/shaders/physics.comp", .compute, allocator);
 
-        const buffers = [28]Vulkan.Buffer{
+        const buffers = [30]Vulkan.Buffer{
             data.body_pos,            // 0
             data.body_quat,           // 1
             data.body_vel,            // 2
@@ -63,9 +63,11 @@ pub const Physics = struct {
             data.aabb_temp_min,       // 25
             data.aabb_temp_max,       // 26
             data.aabb_temp_body,      // 27
+            data.support_lookup_offset, // 28
+            data.support_lookup,      // 29
         };
 
-        const pipe = try vk.createComputePipeline(shader, 28, &buffers, @sizeOf(PC));
+        const pipe = try vk.createComputePipeline(shader, 30, &buffers, @sizeOf(PC));
 
         var prof_ids: [9]u32 = undefined;
         if (prof) |p| {
