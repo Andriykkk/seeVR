@@ -109,7 +109,10 @@ pub fn main() !void {
         const now = c.glfwGetTime();
         const dt: f32 = @floatCast(now - last_time);
         last_time = now;
-        if (dt > 0) fps_smooth = 0.95 * fps_smooth + 0.05 * (1.0 / dt);
+        if (dt > 0) {
+            const alpha: f32 = if (frame < 10) 1.0 else 0.1;
+            fps_smooth = (1.0 - alpha) * fps_smooth + alpha * (1.0 / dt);
+        }
         if (comptime Gui != void) {
             gui.fps = fps_smooth;
         }

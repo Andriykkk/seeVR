@@ -65,7 +65,7 @@ shared uint s_aabb_bid[256];
 
 const float BAUMGARTE = 0.2;
 const float SLOP = 0.005;
-const int PGS_ITERATIONS = 30;
+const int PGS_ITERATIONS = 4;
 const int MAX_CONTACTS = 4000;
 const int MAX_PAIRS = 10000;
 
