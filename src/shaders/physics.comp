@@ -161,19 +161,20 @@ vec3 support(uint bi, vec3 d) {
     return p + R * best_v;
 }
 
-// Minkowski difference support: supportA(d) - supportB(-d)
-vec3 mink_support(uint a, uint b, vec3 d) {
-    return support(a, d) - support(b, -d);
+// Minkowski difference support tracking individual points on A and B
+void mink_support_pts(uint a, uint b, vec3 d, out vec3 v, out vec3 sa, out vec3 sb) {
+    sa = support(a, d);
+    sb = support(b, -d);
+    v = sa - sb;
 }
 
 // ======================== MPR (Minkowski Portal Refinement) ========================
-// Direct port from Genesis/libccd
+// Direct port from Genesis/libccd — tracks surface points on A and B
 
 const float CCD_EPS = 1e-6;
 const float CCD_TOLERANCE = 1e-6;
 const int CCD_ITERATIONS = 50;
 
-// Portal direction: normal of triangle (v1, v2, v3)
 vec3 mpr_portal_dir(vec3 v1, vec3 v2, vec3 v3) {
     return normalize(cross(v2 - v1, v3 - v1));
 }
@@ -195,132 +196,162 @@ bool mpr_portal_reach_tolerance(vec3 v1, vec3 v2, vec3 v3, vec3 v4, vec3 directi
     return dot1 < CCD_TOLERANCE + CCD_EPS * max(1.0, dot1);
 }
 
-// Expand portal: exact copy of Genesis mpr_expand_portal
-void mpr_expand_portal(inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3, vec3 v4) {
+// Expand portal — also swaps the tracked surface points
+void mpr_expand_portal(inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3, vec3 v4,
+                       inout vec3 s1a, inout vec3 s2a, inout vec3 s3a, vec3 s4a,
+                       inout vec3 s1b, inout vec3 s2b, inout vec3 s3b, vec3 s4b) {
     vec3 v4v0 = cross(v4, v0);
     float d = dot(v1, v4v0);
 
     if (d > 0.0) {
         d = dot(v2, v4v0);
         if (d > 0.0) {
-            v1 = v4;
+            v1 = v4; s1a = s4a; s1b = s4b;
         } else {
-            v3 = v4;
+            v3 = v4; s3a = s4a; s3b = s4b;
         }
     } else {
         d = dot(v3, v4v0);
         if (d > 0.0) {
-            v2 = v4;
+            v2 = v4; s2a = s4a; s2b = s4b;
         } else {
-            v1 = v4;
+            v1 = v4; s1a = s4a; s1b = s4b;
         }
     }
 }
 
-// Discover portal: exact port of Genesis mpr_discover_portal
-// Returns: -1 = separated, 0 = portal found, 1 = touching, 2 = segment
-int mpr_discover_portal(uint a, uint b, inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3) {
-    // v0 = center_a - center_b
-    v0 = get_pos(a) - get_pos(b);
+// Compute contact position from simplex using barycentric coords (Genesis mpr_find_pos)
+vec3 mpr_find_pos(vec3 v0, vec3 v1, vec3 v2, vec3 v3,
+                  vec3 s0a, vec3 s1a, vec3 s2a, vec3 s3a,
+                  vec3 s0b, vec3 s1b, vec3 s2b, vec3 s3b) {
+    // Compute barycentric coordinates of origin projected onto tetrahedron
+    float b0 = dot(cross(v1, v2), v3);
+    float b1 = -dot(cross(v0, v2), v3);
+    float b2 = dot(cross(v0, v1), v3);
+    float b3 = -dot(cross(v0, v1), v2);
+
+    float sum = b0 + b1 + b2 + b3;
+    if (abs(sum) < CCD_EPS) {
+        // Fallback: use portal direction projection
+        vec3 dir = mpr_portal_dir(v1, v2, v3);
+        b0 = 0.0;
+        b1 = dot(cross(v2, v3), dir);
+        b2 = dot(cross(v3, v1), dir);
+        b3 = dot(cross(v1, v2), dir);
+        sum = b0 + b1 + b2 + b3;
+    }
+
+    vec3 p1 = b0 * s0a + b1 * s1a + b2 * s2a + b3 * s3a;
+    vec3 p2 = b0 * s0b + b1 * s1b + b2 * s2b + b3 * s3b;
+    return 0.5 / sum * (p1 + p2);
+}
+
+// Discover portal tracking surface points
+int mpr_discover_portal(uint a, uint b,
+                        inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3,
+                        inout vec3 s0a, inout vec3 s1a, inout vec3 s2a, inout vec3 s3a,
+                        inout vec3 s0b, inout vec3 s1b, inout vec3 s2b, inout vec3 s3b) {
+    s0a = get_pos(a);
+    s0b = get_pos(b);
+    v0 = s0a - s0b;
     if (abs(v0.x) < CCD_EPS && abs(v0.y) < CCD_EPS && abs(v0.z) < CCD_EPS)
         v0.x += 10.0 * CCD_EPS;
 
-    // v1: support in direction -v0
     vec3 dir = normalize(-v0);
-    v1 = mink_support(a, b, dir);
+    mink_support_pts(a, b, dir, v1, s1a, s1b);
 
     float d = dot(v1, dir);
-    if (d < CCD_EPS) return -1; // separated
+    if (d < CCD_EPS) return -1;
 
-    // v2: support perpendicular to v0,v1
     dir = cross(v0, v1);
     if (dot(dir, dir) < CCD_EPS) {
-        // v0 and v1 collinear
         if (abs(v1.x) < CCD_EPS && abs(v1.y) < CCD_EPS && abs(v1.z) < CCD_EPS)
-            return 1; // touching
-        return 2; // segment
+            return 1;
+        return 2;
     }
     dir = normalize(dir);
-    v2 = mink_support(a, b, dir);
+    mink_support_pts(a, b, dir, v2, s2a, s2b);
     d = dot(v2, dir);
-    if (d < CCD_EPS) return -1; // separated
+    if (d < CCD_EPS) return -1;
 
-    // v3: portal normal direction
     vec3 va = v1 - v0;
     vec3 vb = v2 - v0;
     dir = normalize(cross(va, vb));
 
-    // Ensure normal points away from v0 (toward origin)
     if (dot(dir, v0) > 0.0) {
-        // Swap v1 and v2
-        vec3 tmp = v1; v1 = v2; v2 = tmp;
+        vec3 tmp;
+        tmp = v1; v1 = v2; v2 = tmp;
+        tmp = s1a; s1a = s2a; s2a = tmp;
+        tmp = s1b; s1b = s2b; s2b = tmp;
         dir = -dir;
     }
 
-    // Find v3, retrying if origin is outside the triangle
     int num_trials = 0;
     while (num_trials < 15) {
-        vec3 v3c = mink_support(a, b, dir);
+        vec3 v3c, s3ca, s3cb;
+        mink_support_pts(a, b, dir, v3c, s3ca, s3cb);
         d = dot(v3c, dir);
-        if (d < CCD_EPS) return -1; // separated
+        if (d < CCD_EPS) return -1;
 
-        // Check: is origin on correct side of edge v1-v3c?
         va = cross(v1, v3c);
         d = dot(va, v0);
         if (d < -CCD_EPS) {
-            v2 = v3c;
-            va = v1 - v0;
-            vb = v2 - v0;
+            v2 = v3c; s2a = s3ca; s2b = s3cb;
+            va = v1 - v0; vb = v2 - v0;
             dir = normalize(cross(va, vb));
             num_trials++;
             continue;
         }
 
-        // Check: is origin on correct side of edge v3c-v2?
         va = cross(v3c, v2);
         d = dot(va, v0);
         if (d < -CCD_EPS) {
-            v1 = v3c;
-            va = v1 - v0;
-            vb = v2 - v0;
+            v1 = v3c; s1a = s3ca; s1b = s3cb;
+            va = v1 - v0; vb = v2 - v0;
             dir = normalize(cross(va, vb));
             num_trials++;
             continue;
         }
 
-        // v3 is good
-        v3 = v3c;
+        v3 = v3c; s3a = s3ca; s3b = s3cb;
         return 0;
     }
-    return -1; // failed
+    return -1;
 }
 
-// Refine portal: exact port of Genesis mpr_refine_portal
-// Returns: 0 = encapsulated (colliding), -1 = not colliding
-int mpr_refine_portal(uint a, uint b, inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3) {
+// Refine portal tracking surface points
+int mpr_refine_portal(uint a, uint b,
+                      inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3,
+                      inout vec3 s1a, inout vec3 s2a, inout vec3 s3a,
+                      inout vec3 s1b, inout vec3 s2b, inout vec3 s3b) {
     for (int iter = 0; iter < CCD_ITERATIONS; iter++) {
         vec3 dir = mpr_portal_dir(v1, v2, v3);
 
         if (mpr_portal_encapsules_origin(v1, dir))
-            return 0; // encapsulated
+            return 0;
 
-        vec3 v4 = mink_support(a, b, dir);
+        vec3 v4, s4a, s4b;
+        mink_support_pts(a, b, dir, v4, s4a, s4b);
 
         if (!mpr_portal_can_encapsule_origin(v4, dir) ||
             mpr_portal_reach_tolerance(v1, v2, v3, v4, dir))
-            return -1; // not colliding
+            return -1;
 
-        mpr_expand_portal(v0, v1, v2, v3, v4);
+        mpr_expand_portal(v0, v1, v2, v3, v4, s1a, s2a, s3a, s4a, s1b, s2b, s3b, s4b);
     }
-    return 1; // max iterations
+    return 1;
 }
 
-// Find penetration: exact port of Genesis mpr_find_penetration
-bool mpr_find_penetration(uint a, uint b, inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3,
+// Find penetration tracking surface points
+bool mpr_find_penetration(uint a, uint b,
+                          inout vec3 v0, inout vec3 v1, inout vec3 v2, inout vec3 v3,
+                          inout vec3 s1a, inout vec3 s2a, inout vec3 s3a,
+                          inout vec3 s1b, inout vec3 s2b, inout vec3 s3b,
                           out vec3 normal, out float depth) {
     for (int iter = 0; iter < CCD_ITERATIONS; iter++) {
         vec3 dir = mpr_portal_dir(v1, v2, v3);
-        vec3 v4 = mink_support(a, b, dir);
+        vec3 v4, s4a, s4b;
+        mink_support_pts(a, b, dir, v4, s4a, s4b);
 
         if (mpr_portal_reach_tolerance(v1, v2, v3, v4, dir) || iter >= CCD_ITERATIONS - 1) {
             depth = dot(dir, v1);
@@ -328,34 +359,43 @@ bool mpr_find_penetration(uint a, uint b, inout vec3 v0, inout vec3 v1, inout ve
             return true;
         }
 
-        mpr_expand_portal(v0, v1, v2, v3, v4);
+        mpr_expand_portal(v0, v1, v2, v3, v4, s1a, s2a, s3a, s4a, s1b, s2b, s3b, s4b);
     }
     return false;
 }
 
-// Main MPR entry: exact port of Genesis func_mpr_contact_from_centers
-bool mpr(uint a, uint b, out vec3 normal, out float depth) {
+// Main MPR entry — returns normal, depth, and contact position
+bool mpr(uint a, uint b, out vec3 normal, out float depth, out vec3 contact_pt) {
     vec3 v0, v1, v2, v3;
-    int res = mpr_discover_portal(a, b, v0, v1, v2, v3);
+    vec3 s0a, s1a, s2a, s3a;
+    vec3 s0b, s1b, s2b, s3b;
+
+    int res = mpr_discover_portal(a, b, v0, v1, v2, v3,
+                                  s0a, s1a, s2a, s3a, s0b, s1b, s2b, s3b);
 
     if (res == 1) {
-        // Touching — penetration = 0
         normal = normalize(v0);
         depth = 0.0;
+        contact_pt = 0.5 * (s1a + s1b);
         return true;
     }
     if (res == 2) {
-        // Segment case
         depth = length(v1);
         normal = normalize(v1);
+        contact_pt = 0.5 * (s1a + s1b);
         return true;
     }
-    if (res != 0) return false; // separated
+    if (res != 0) return false;
 
-    res = mpr_refine_portal(a, b, v0, v1, v2, v3);
-    if (res < 0) return false; // not colliding
+    res = mpr_refine_portal(a, b, v0, v1, v2, v3, s1a, s2a, s3a, s1b, s2b, s3b);
+    if (res < 0) return false;
 
-    return mpr_find_penetration(a, b, v0, v1, v2, v3, normal, depth);
+    bool found = mpr_find_penetration(a, b, v0, v1, v2, v3,
+                                       s1a, s2a, s3a, s1b, s2b, s3b, normal, depth);
+    if (found) {
+        contact_pt = mpr_find_pos(v0, v1, v2, v3, s0a, s1a, s2a, s3a, s0b, s1b, s2b, s3b);
+    }
+    return found;
 }
 
 // ======================== Contact generation ========================
@@ -371,32 +411,6 @@ void add_contact(vec3 cp, vec3 n, float pen, uint ba, uint bb) {
     }
 }
 
-void generate_contacts(uint a, uint b, vec3 normal, float pen) {
-    mat3 Rb = quat_to_mat(b);
-    vec3 pb = get_pos(b);
-    mat3 Ra = quat_to_mat(a);
-    vec3 pa = get_pos(a);
-
-    uint a_vs, a_vc, b_vs, b_vc;
-    get_hull_info(a, a_vs, a_vc);
-    get_hull_info(b, b_vs, b_vc);
-
-    // Find A's support plane along normal
-    float a_max = -1e10;
-    for (uint i = 0; i < a_vc; i++) {
-        vec3 wv = pa + Ra * get_hull_vert(a_vs + i);
-        a_max = max(a_max, dot(wv, normal));
-    }
-
-    // Vertices of B behind A's support plane → contact points
-    for (uint i = 0; i < b_vc; i++) {
-        vec3 wv = pb + Rb * get_hull_vert(b_vs + i);
-        float depth = a_max - dot(wv, normal);
-        if (depth > -0.01) {
-            add_contact(wv + normal * (depth * 0.5), normal, max(depth, 0.0), a, b);
-        }
-    }
-}
 
 // ======================== Steps ========================
 
@@ -468,9 +482,10 @@ void step_narrow_phase() {
 
     vec3 normal;
     float depth;
-    if (mpr(a, b, normal, depth)) {
+    vec3 contact_pt;
+    if (mpr(a, b, normal, depth, contact_pt)) {
         if (depth > 0.0) {
-            generate_contacts(a, b, normal, depth);
+            add_contact(contact_pt, normal, depth, a, b);
         }
     }
 }
